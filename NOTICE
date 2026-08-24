@@ -1,0 +1,10 @@
+antigravity-proxy
+
+This repository is an adapted, headless extraction of proxy/account-rotation ideas and wire
+compatibility work from Antigravity Manager by Draculabo.
+
+License: Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+Source license preserved in LICENSE.
+
+Do not commit real account exports, OAuth tokens, refresh tokens, config files containing API
+keys, encrypted account stores, or master keys.
