@@ -181,12 +181,19 @@ async function run(parsed: ParsedArgs): Promise<void> {
 
   if (primary === 'accounts' && secondary === 'import') {
     const input = await readImportPayload(options);
-    writeJson(
-      await requestAdmin(options, '/admin/accounts/import', {
-        method: 'POST',
-        body: input,
-      }),
-    );
+    const result = (await requestAdmin(options, '/admin/accounts/import', {
+      method: 'POST',
+      body: input,
+    })) as {
+      imported?: number;
+      skipped?: number;
+      errors?: unknown[];
+    };
+    writeJson({
+      imported: result.imported ?? 0,
+      skipped: result.skipped ?? 0,
+      errorCount: Array.isArray(result.errors) ? result.errors.length : 0,
+    });
     return;
   }
 
