@@ -8,6 +8,5 @@
     "noEmit": false
   },
   "include": ["src/**/*.ts"],
-  "include": ["src/**/*.ts"],
   "exclude": ["src/tests/**", "vitest.config.ts"]
 }

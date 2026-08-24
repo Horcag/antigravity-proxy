@@ -3,6 +3,7 @@ import 'reflect-metadata';
 import fs from 'node:fs';
 import process from 'node:process';
 import { ConfigManager } from '@/modules/config/ipc/manager';
+import { CloudAccountRepo } from '@/modules/cloud-account/persistence/cloudHandler';
 import { bootstrapNestServer, stopNestServer } from '@/server/main';
 
 interface ParsedArgs {
@@ -135,8 +136,14 @@ async function serve(): Promise<void> {
   }
   writeJson(result);
 
+  let isShuttingDown = false;
   const shutdown = async () => {
+    if (isShuttingDown) {
+      return;
+    }
+    isShuttingDown = true;
     await stopNestServer();
+    CloudAccountRepo.close();
     process.exit(0);
   };
   process.on('SIGINT', () => {

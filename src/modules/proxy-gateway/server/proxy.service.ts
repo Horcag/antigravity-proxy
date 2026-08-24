@@ -401,7 +401,6 @@ export class ProxyService {
 
       let hasUsableEvent = false;
       let terminated = false;
-      let idleTimer: StreamIdleTimer;
 
       const cleanup = (): void => {
         idleTimer.clear();
@@ -538,7 +537,7 @@ export class ProxyService {
         failStream(cleanError);
       };
 
-      idleTimer = this.createStreamIdleTimer(upstreamStream, 'Claude-SSE', () => {
+      const idleTimer = this.createStreamIdleTimer(upstreamStream, 'Claude-SSE', () => {
         failStream(new Error('Upstream stream idle timeout after 300s'));
       });
 
@@ -744,7 +743,6 @@ export class ProxyService {
       const decoder = new TextDecoder();
       let receivedData = false;
       let terminated = false;
-      let idleTimer: StreamIdleTimer;
       const failStream = (error: Error): void => {
         if (terminated) {
           return;
@@ -753,7 +751,7 @@ export class ProxyService {
         idleTimer.clear();
         subscriber.error(error);
       };
-      idleTimer = this.createStreamIdleTimer(upstreamStream, 'Gemini-SSE', () => {
+      const idleTimer = this.createStreamIdleTimer(upstreamStream, 'Gemini-SSE', () => {
         failStream(new Error('Upstream stream idle timeout after 300s'));
       });
 

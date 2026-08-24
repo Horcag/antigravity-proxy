@@ -158,8 +158,8 @@ export async function getNestServerStatus(): Promise<{
     try {
       const accountLeaseService = app.get(AccountLeaseService);
       activeAccounts = accountLeaseService.getAccountCount();
-    } catch (e) {
-      // AccountLeaseService might not be available
+    } catch {
+      // AccountLeaseService might not be available.
     }
   }
 

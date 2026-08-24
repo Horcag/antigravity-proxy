@@ -7,7 +7,7 @@ import {
   FALLBACK_VERSION,
   resolveLocalInstalledVersion,
 } from '@/modules/proxy-gateway/server/request-user-agent';
-import { isEmpty, isNumber, isString, isUndefined } from 'lodash-es';
+import { isEmpty, isNumber, isString } from 'lodash-es';
 import { v4 } from 'uuid';
 import { logger } from '@/shared/logging/logger';
 import {
@@ -335,37 +335,6 @@ function parseCreditAmount(value: string | number | undefined): number {
   }
 
   return 0;
-}
-
-function toAiCredits(
-  payload: Partial<{
-    credits: unknown;
-    remainingCredits: unknown;
-    expiryDate: unknown;
-    expirationDate: unknown;
-  }>,
-): { credits: number; expiryDate: string } | null {
-  const creditsValue =
-    isNumber(payload.credits) || isString(payload.credits)
-      ? payload.credits
-      : isNumber(payload.remainingCredits) || isString(payload.remainingCredits)
-        ? payload.remainingCredits
-        : undefined;
-
-  if (isUndefined(creditsValue)) {
-    return null;
-  }
-
-  const expiryDate = isString(payload.expiryDate)
-    ? payload.expiryDate
-    : isString(payload.expirationDate)
-      ? payload.expirationDate
-      : '';
-
-  return {
-    credits: parseCreditAmount(creditsValue),
-    expiryDate,
-  };
 }
 
 function extractAiCreditsFromProjectContext(
