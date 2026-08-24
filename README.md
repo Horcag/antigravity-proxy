@@ -98,7 +98,7 @@ exporter directly over SSH:
 
 ```powershell
 npm run package
-npm run --silent export:cloud-accounts:stdout |
+npm run --silent export:cloud-accounts:tokens:stdout |
   ssh your-wsl-host 'sudo /usr/local/sbin/antigravity-proxy-import'
 ```
 
