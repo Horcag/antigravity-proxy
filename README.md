@@ -48,7 +48,7 @@ under `/etc/antigravity-proxy/antigravity-proxy.env`:
 cd /home/nikit/projects/antigravity-proxy
 npm install
 npm run build
-sudo ./scripts/install-systemd.sh
+sudo env IMPORT_SUDO_USER="$USER" ./scripts/install-systemd.sh
 ```
 
 Environment file:
@@ -99,7 +99,7 @@ exporter directly over SSH:
 ```powershell
 npm run package
 npm run --silent export:cloud-accounts:tokens:stdout |
-  ssh your-wsl-host 'sudo /usr/local/sbin/antigravity-proxy-import'
+  ssh your-wsl-host 'sudo -n /usr/local/sbin/antigravity-proxy-import'
 ```
 
 The exporter launches its packaged Electron main process without a window so the original

@@ -5,6 +5,7 @@ install_dir="${INSTALL_DIR:-/opt/antigravity-proxy}"
 data_dir="${DATA_DIR:-/var/lib/antigravity-proxy}"
 env_file="${ENV_FILE:-/etc/antigravity-proxy/antigravity-proxy.env}"
 user_name="${SERVICE_USER:-antigravity-proxy}"
+import_sudo_user="${IMPORT_SUDO_USER:-}"
 
 if [ ! -x /usr/bin/node ]; then
   echo "Node.js 22 must be installed system-wide at /usr/bin/node." >&2
@@ -37,6 +38,17 @@ sudo cp -R dist package.json package-lock.json node_modules "$install_dir"/
 sudo npm --prefix "$install_dir" prune --omit=dev --ignore-scripts
 sudo chown -R root:root "$install_dir"
 sudo install -m 0755 scripts/import-accounts-stdin.sh /usr/local/sbin/antigravity-proxy-import
+if [ -n "$import_sudo_user" ]; then
+  if ! id "$import_sudo_user" >/dev/null 2>&1; then
+    echo "IMPORT_SUDO_USER does not exist: $import_sudo_user" >&2
+    exit 1
+  fi
+  sudo tee /etc/sudoers.d/antigravity-proxy-import >/dev/null <<EOF
+$import_sudo_user ALL=(root) NOPASSWD: /usr/local/sbin/antigravity-proxy-import
+EOF
+  sudo chmod 0440 /etc/sudoers.d/antigravity-proxy-import
+  sudo visudo -cf /etc/sudoers.d/antigravity-proxy-import >/dev/null
+fi
 
 sudo tee /etc/systemd/system/antigravity-proxy.service >/dev/null <<EOF
 [Unit]
