@@ -15,7 +15,7 @@ fi
 sudo useradd --system --home-dir "$data_dir" --shell /usr/sbin/nologin "$user_name" 2>/dev/null || true
 sudo install -d -m 0755 "$install_dir"
 sudo install -d -m 0700 -o "$user_name" -g "$user_name" "$data_dir"
-sudo install -d -m 0750 /etc/antigravity-proxy
+sudo install -d -m 0750 -o root -g "$user_name" /etc/antigravity-proxy
 
 if [ ! -f "$env_file" ]; then
   proxy_key="$(node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))")"
