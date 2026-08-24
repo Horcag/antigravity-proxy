@@ -3,6 +3,23 @@ import { DEFAULT_PROXY_CONFIG } from '@/modules/config/types';
 import { bootstrapNestServer } from '@/server/main';
 
 describe('remote binding security', () => {
+  it.each(['0.0.0.0', '::', '192.168.1.10'])(
+    'rejects unsafe bind host %s by default',
+    async (host) => {
+      await expect(
+        bootstrapNestServer({
+          ...DEFAULT_PROXY_CONFIG,
+          host,
+          api_key: 'proxy-key',
+          admin_api_key: 'admin-key',
+        }),
+      ).resolves.toMatchObject({
+        success: false,
+        reason: 'invalid-config',
+      });
+    },
+  );
+
   it('rejects non-loopback binding without separate proxy and admin keys', async () => {
     await expect(
       bootstrapNestServer({

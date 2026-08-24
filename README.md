@@ -34,6 +34,8 @@ Current surface:
 ```bash
 npm install
 npm run build
+npm run type-check
+npm run lint
 npm test
 ```
 
@@ -54,6 +56,11 @@ Environment file:
 ```bash
 sudo cat /etc/antigravity-proxy/antigravity-proxy.env
 ```
+
+Before importing accounts, set `AG_PROXY_OAUTH_CLIENT_ID` and
+`AG_PROXY_OAUTH_CLIENT_SECRET` in that file from an OAuth client you are authorized to use. These
+values are intentionally not committed to this repository; without them, expired access tokens
+cannot be renewed from refresh tokens.
 
 State directory:
 
@@ -78,18 +85,26 @@ sudo ./scripts/uninstall-systemd.sh
 ## Secure Migration
 
 Export accounts from Antigravity Manager with tokens, then import without committing the export.
-The service must be running because import goes through the admin API:
+The service must be running because import goes through the admin API. The installed helper reads
+the export from stdin and runs under the restricted service account:
 
 ```bash
-set -a
-. /etc/antigravity-proxy/antigravity-proxy.env
-set +a
-node dist/cli.js accounts import \
-  --url http://127.0.0.1:8045 \
-  --admin-key "$AG_PROXY_ADMIN_API_KEY" \
-  < ./cloud-accounts-export.json
+sudo /usr/local/sbin/antigravity-proxy-import < ./cloud-accounts-export.json
 shred -u ./cloud-accounts-export.json 2>/dev/null || rm -f ./cloud-accounts-export.json
 ```
+
+For a zero-file cutover, run these commands from the old AntigravityManager checkout and pipe the
+exporter directly over SSH:
+
+```powershell
+npm run package
+npm run --silent export:cloud-accounts:stdout |
+  ssh your-wsl-host 'sudo /usr/local/sbin/antigravity-proxy-import'
+```
+
+The exporter launches its packaged Electron main process without a window so the original
+safeStorage/DPAPI key remains available. Do not insert `tee` or another file-writing command into
+the pipeline.
 
 The import command validates the export schema and stores tokens encrypted. It does not keep the
 plaintext JSON.
@@ -124,7 +139,7 @@ curl http://127.0.0.1:8045/v1/chat/completions \
 Default bind is loopback. To expose on a Tailscale address, set the bind host explicitly and keep
 both API keys secret:
 
-```json
+```bash
 AG_PROXY_HOST=100.110.245.111
 AG_PROXY_PORT=8045
 AG_PROXY_API_KEY=replace-with-32-byte-random-secret
@@ -132,3 +147,7 @@ AG_PROXY_ADMIN_API_KEY=replace-with-different-32-byte-random-secret
 ```
 
 Do not bind to `0.0.0.0` unless a host firewall restricts access.
+Wildcard binds (`0.0.0.0` and `::`) are rejected. Other non-Tailscale addresses are rejected unless
+`AG_PROXY_ALLOW_NON_TAILSCALE_BIND=true` is set explicitly. For the WSL2 deployment, keeping the
+service on `127.0.0.1` and publishing it through Windows Tailscale forwarding/firewall is the
+recommended path.

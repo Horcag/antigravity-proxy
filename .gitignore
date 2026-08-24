@@ -2,6 +2,12 @@ node_modules/
 dist/
 coverage/
 data/
+*.db
+*.db-shm
+*.db-wal
+.master-key
+accounts-export*.json
+cloud-accounts-export*.json
 *.log
 *.tmp
 .env

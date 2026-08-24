@@ -52,7 +52,12 @@ export function encryptJson(value: unknown): string {
   const plaintext = Buffer.from(JSON.stringify(value), 'utf8');
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return [ENVELOPE_VERSION, iv.toString('base64'), tag.toString('base64'), ciphertext.toString('base64')].join(':');
+  return [
+    ENVELOPE_VERSION,
+    iv.toString('base64'),
+    tag.toString('base64'),
+    ciphertext.toString('base64'),
+  ].join(':');
 }
 
 export function decryptJson<T>(envelope: string): T {

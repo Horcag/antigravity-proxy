@@ -33,6 +33,21 @@ function isAddressInUseError(error: unknown): boolean {
   return Reflect.get(error, 'code') === 'EADDRINUSE';
 }
 
+function isLoopbackHost(host: string): boolean {
+  return host === 'localhost' || host === '::1' || host.startsWith('127.');
+}
+
+function isTailscaleHost(host: string): boolean {
+  const ipv4Parts = host.split('.').map((part) => Number(part));
+  if (
+    ipv4Parts.length === 4 &&
+    ipv4Parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)
+  ) {
+    return ipv4Parts[0] === 100 && ipv4Parts[1] >= 64 && ipv4Parts[1] <= 127;
+  }
+  return host.toLowerCase().startsWith('fd7a:115c:a1e0:');
+}
+
 async function cleanupFailedServerStart() {
   if (!app) {
     return;
@@ -63,8 +78,27 @@ export async function bootstrapNestServer(config: ProxyConfig): Promise<NestServ
 
   setServerConfig(config);
 
-  const isLoopback = host === 'localhost' || host === '::1' || host.startsWith('127.');
+  if (host === '0.0.0.0' || host === '::') {
+    return {
+      success: false,
+      reason: 'invalid-config',
+      port,
+      message: 'Wildcard binding is disabled; use loopback or an explicit Tailscale address',
+    };
+  }
+
+  const isLoopback = isLoopbackHost(host);
   if (!isLoopback) {
+    const allowNonTailscaleBind = process.env.AG_PROXY_ALLOW_NON_TAILSCALE_BIND === 'true';
+    if (!isTailscaleHost(host) && !allowNonTailscaleBind) {
+      return {
+        success: false,
+        reason: 'invalid-config',
+        port,
+        message:
+          'Non-loopback binding must use a Tailscale address unless AG_PROXY_ALLOW_NON_TAILSCALE_BIND=true',
+      };
+    }
     if (!config.api_key || !config.admin_api_key) {
       return {
         success: false,
@@ -87,9 +121,6 @@ export async function bootstrapNestServer(config: ProxyConfig): Promise<NestServ
     app = await NestFactory.create<NestFastifyApplication>(AppModule, new FastifyAdapter(), {
       logger: ['error', 'warn', 'log'],
     });
-
-    // Enable CORS
-    app.enableCors();
 
     await app.listen(port, host);
     currentPort = port;

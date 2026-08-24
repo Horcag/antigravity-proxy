@@ -1,8 +1,8 @@
 import { isEmpty, isString } from 'lodash-es';
 import { logger } from '@/shared/logging/logger';
 
-const CLIENT_ID = '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com';
-const CLIENT_SECRET = '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';
+const DEFAULT_OAUTH_CLIENT_ID_ENV = 'AG_PROXY_OAUTH_CLIENT_ID';
+const DEFAULT_OAUTH_CLIENT_SECRET_ENV = 'AG_PROXY_OAUTH_CLIENT_SECRET';
 const OAUTH_CLIENTS_ENV = 'ANTIGRAVITY_OAUTH_CLIENTS';
 const ACTIVE_OAUTH_CLIENT_ENV = 'ANTIGRAVITY_OAUTH_CLIENT_KEY';
 const DEFAULT_OAUTH_CLIENT_KEY = 'antigravity_enterprise';
@@ -46,15 +46,22 @@ function getClientByKey(
 }
 
 function buildOAuthClientRegistry(): OAuthClientRegistry {
-  const clients: OAuthClientConfig[] = [
-    {
+  const clients: OAuthClientConfig[] = [];
+  const defaultClientId = process.env[DEFAULT_OAUTH_CLIENT_ID_ENV]?.trim();
+  const defaultClientSecret = process.env[DEFAULT_OAUTH_CLIENT_SECRET_ENV]?.trim();
+  if (defaultClientId && defaultClientSecret) {
+    clients.push({
       key: normalizeOAuthClientKey(DEFAULT_OAUTH_CLIENT_KEY),
-      label: 'Antigravity Enterprise',
-      client_id: CLIENT_ID,
-      client_secret: CLIENT_SECRET,
-      is_builtin: true,
-    },
-  ];
+      label: 'Configured Antigravity OAuth client',
+      client_id: defaultClientId,
+      client_secret: defaultClientSecret,
+      is_builtin: false,
+    });
+  } else if (defaultClientId || defaultClientSecret) {
+    logger.warn(
+      `[OAuthClientRegistryService] Both ${DEFAULT_OAUTH_CLIENT_ID_ENV} and ${DEFAULT_OAUTH_CLIENT_SECRET_ENV} are required`,
+    );
+  }
 
   const rawExtraClients = process.env[OAUTH_CLIENTS_ENV];
   if (isString(rawExtraClients) && !isEmpty(rawExtraClients.trim())) {
