@@ -177,18 +177,19 @@ export class ProxyService {
     attemptIndex: number,
     maxRetries: number,
     label: string,
-    shouldSkipBackoff: boolean,
   ): Promise<void> {
-    await this.retryPolicy.waitBeforeRetry(attemptIndex, maxRetries, label, shouldSkipBackoff);
+    await this.retryPolicy.waitBeforeRetry(attemptIndex, maxRetries, label);
   }
 
-  private async prepareGraceRetry(
-    retryState: ProxyTokenRetryState,
-    token: CloudAccount,
-    error: unknown,
-    label: string,
-  ): Promise<boolean> {
-    return this.retryPolicy.prepareGraceRetry(retryState, token, error, label);
+  private getModelRetryBudget(model: string): number {
+    const accountCount = this.accountLeaseService.getModelCapableAccountCount(model);
+    if (accountCount === 0) {
+      throw new AccountPoolUnavailableException(
+        `No account advertises a compatible upstream model for ${model}`,
+        HttpStatus.SERVICE_UNAVAILABLE,
+      );
+    }
+    return accountCount;
   }
 
   // --- Anthropic Handlers ---
@@ -215,17 +216,20 @@ export class ProxyService {
 
     // Retry loop
     let lastError: unknown = null;
-    const maxRetries = 3;
+    const maxRetries = this.getModelRetryBudget(targetModel);
     const retryState = this.createTokenRetryState();
 
     for (let i = 0; i < maxRetries; i++) {
-      await this.waitBeforeRetry(i, maxRetries, 'Anthropic', retryState.graceRetryToken !== null);
+      await this.waitBeforeRetry(i, maxRetries, 'Anthropic');
 
       const token = await this.selectRetryToken(retryState, targetModel, sessionKey);
       if (!token) {
+        if (lastError) {
+          throw lastError;
+        }
         throw new AccountPoolUnavailableException(
-          'No healthy account is available',
-          HttpStatus.SERVICE_UNAVAILABLE,
+          'All model-capable accounts are exhausted or rate limited',
+          HttpStatus.TOO_MANY_REQUESTS,
         );
       }
       const effectiveTargetModel = this.accountLeaseService.resolveDynamicModelForAccount(
@@ -374,10 +378,14 @@ export class ProxyService {
         }
 
         lastError = effectiveError;
-        if (await this.prepareGraceRetry(retryState, token, lastError, 'Anthropic')) {
-          continue;
+        const shouldRetry = await this.applyUpstreamPenalty(
+          token.id,
+          effectiveTargetModel,
+          lastError,
+        );
+        if (!shouldRetry) {
+          throw lastError;
         }
-        await this.applyUpstreamPenalty(token.id, effectiveTargetModel, lastError);
       }
     }
     throw lastError || new Error('Request failed after retries');
@@ -571,16 +579,19 @@ export class ProxyService {
     );
 
     let lastError: unknown = null;
-    const maxRetries = 3;
+    const maxRetries = this.getModelRetryBudget(targetModel);
     const retryState = this.createTokenRetryState();
 
     for (let i = 0; i < maxRetries; i++) {
-      await this.waitBeforeRetry(i, maxRetries, 'Gemini', retryState.graceRetryToken !== null);
+      await this.waitBeforeRetry(i, maxRetries, 'Gemini');
 
       const token = await this.selectRetryToken(retryState, targetModel);
       if (!token) {
+        if (lastError) {
+          throw lastError;
+        }
         throw new AccountPoolUnavailableException(
-          'All available accounts are exhausted or rate limited',
+          'All model-capable accounts are exhausted or rate limited',
           HttpStatus.TOO_MANY_REQUESTS,
         );
       }
@@ -637,10 +648,14 @@ export class ProxyService {
           lastError = err;
         }
 
-        if (await this.prepareGraceRetry(retryState, token, lastError, 'Gemini')) {
-          continue;
+        const shouldRetry = await this.applyUpstreamPenalty(
+          token.id,
+          effectiveTargetModel,
+          lastError,
+        );
+        if (!shouldRetry) {
+          throw lastError;
         }
-        await this.applyUpstreamPenalty(token.id, effectiveTargetModel, lastError);
       }
     }
 
@@ -659,7 +674,7 @@ export class ProxyService {
     );
 
     let lastError: unknown = null;
-    const maxRetries = 3;
+    const maxRetries = this.getModelRetryBudget(targetModel);
     const retryState = this.createTokenRetryState();
 
     for (let i = 0; i < maxRetries; i++) {
@@ -667,13 +682,15 @@ export class ProxyService {
         i,
         maxRetries,
         'Gemini stream',
-        retryState.graceRetryToken !== null,
       );
 
       const token = await this.selectRetryToken(retryState, targetModel);
       if (!token) {
+        if (lastError) {
+          throw lastError;
+        }
         throw new AccountPoolUnavailableException(
-          'All available accounts are exhausted or rate limited',
+          'All model-capable accounts are exhausted or rate limited',
           HttpStatus.TOO_MANY_REQUESTS,
         );
       }
@@ -729,10 +746,14 @@ export class ProxyService {
           lastError = err;
         }
 
-        if (await this.prepareGraceRetry(retryState, token, lastError, 'Gemini stream')) {
-          continue;
+        const shouldRetry = await this.applyUpstreamPenalty(
+          token.id,
+          effectiveTargetModel,
+          lastError,
+        );
+        if (!shouldRetry) {
+          throw lastError;
         }
-        await this.applyUpstreamPenalty(token.id, effectiveTargetModel, lastError);
       }
     }
 
@@ -893,7 +914,7 @@ export class ProxyService {
 
     // Retry loop for account selection
     let lastError: unknown = null;
-    const maxRetries = 3;
+    const maxRetries = this.getModelRetryBudget(targetModel);
     const retryState = this.createTokenRetryState();
 
     for (let i = 0; i < maxRetries; i++) {
@@ -901,14 +922,16 @@ export class ProxyService {
         i,
         maxRetries,
         'OpenAI-compatible',
-        retryState.graceRetryToken !== null,
       );
 
       // 1. Get Token
       const token = await this.selectRetryToken(retryState, targetModel, sessionKey);
       if (!token) {
+        if (lastError) {
+          throw lastError;
+        }
         throw new AccountPoolUnavailableException(
-          'All available accounts are exhausted or rate limited',
+          'All model-capable accounts are exhausted or rate limited',
           HttpStatus.TOO_MANY_REQUESTS,
         );
       }
@@ -952,6 +975,9 @@ export class ProxyService {
               responsesConfiguration,
             );
           } catch (streamError) {
+            if (this.retryPolicy.shouldFailoverImmediately(streamError)) {
+              throw streamError;
+            }
             this.logger.warn(
               `Stream path failed for model=${request.model}; falling back to non-stream generation: ${
                 streamError instanceof Error ? streamError.message : String(streamError)
@@ -1043,10 +1069,14 @@ export class ProxyService {
           lastError = err;
         }
 
-        if (await this.prepareGraceRetry(retryState, token, lastError, 'OpenAI-compatible')) {
-          continue;
+        const shouldRetry = await this.applyUpstreamPenalty(
+          token.id,
+          effectiveTargetModel,
+          lastError,
+        );
+        if (!shouldRetry) {
+          throw lastError;
         }
-        await this.applyUpstreamPenalty(token.id, effectiveTargetModel, lastError);
       }
     }
     throw lastError || new Error('Request failed after retries');
@@ -2776,13 +2806,15 @@ export class ProxyService {
     accountId: string,
     model: string,
     error: unknown,
-  ): Promise<void> {
-    if (this.isModelNotFoundError(error)) {
+  ): Promise<boolean> {
+    const modelWasNotFound = this.isModelNotFoundError(error);
+    if (modelWasNotFound && !model.toLowerCase().includes('-image')) {
       // Quota metadata can advertise ids the generation API rejects; mark the
       // id so the in-flight retry loop and later requests reroute to a sibling.
       this.accountLeaseService.markModelUnrequestable(model);
     }
-    await this.retryPolicy.applyUpstreamPenalty(accountId, model, error);
+    const shouldRetry = await this.retryPolicy.applyUpstreamPenalty(accountId, model, error);
+    return modelWasNotFound || shouldRetry;
   }
 
   private isModelNotFoundError(error: unknown): boolean {
@@ -2796,10 +2828,6 @@ export class ProxyService {
     }
     const message = error instanceof Error ? error.message : String(error ?? '');
     return message.includes(notFoundMarker);
-  }
-
-  private resolveGraceRetryDelay(error: unknown): number | null {
-    return this.retryPolicy.resolveGraceRetryDelay(error);
   }
 
   private classifyUpstreamFailure(errorMessage: string): ProxyUpstreamFailureClassification {

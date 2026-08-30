@@ -190,25 +190,41 @@ export class AccountLeaseService implements OnModuleInit {
         return null;
       }
 
-      const filteredAccountPool = modelCapableAccountPool.filter(
-        ([accountId]) => !excludedAccountIds.has(accountId),
-      );
-      const candidateAccountPool =
-        filteredAccountPool.length > 0 ? filteredAccountPool : modelCapableAccountPool;
-
-      if (filteredAccountPool.length === 0 && excludedAccountIds.size > 0) {
-        this.logger.warn(
-          'Exclusion filter removed all accounts; retrying with the full account pool',
-        );
+      const requestableAccountPool = model
+        ? modelCapableAccountPool.filter(([accountId]) =>
+            this.modelPolicy.isModelRequestableForAccount(accountId, model),
+          )
+        : modelCapableAccountPool;
+      if (requestableAccountPool.length === 0) {
+        this.logger.warn(`All compatible account/model pairs are temporarily unavailable: ${model}`);
+        return null;
       }
 
-      if (candidateAccountPool.length === 0) {
-        this.logger.warn('No eligible account found after exclusion filtering');
+      const rateLimitEligiblePool = model
+        ? requestableAccountPool.filter(([accountId]) => {
+            const effectiveModel = this.modelPolicy.resolveDynamicModelForAccount(
+              accountId,
+              model,
+              false,
+            );
+            return !this.rateLimitTracker.isRateLimited(accountId, effectiveModel);
+          })
+        : requestableAccountPool;
+      if (rateLimitEligiblePool.length === 0) {
+        this.logger.warn(`All model-capable accounts are rate limited: ${model ?? 'unknown'}`);
+        return null;
+      }
+
+      const filteredAccountPool = rateLimitEligiblePool.filter(
+        ([accountId]) => !excludedAccountIds.has(accountId),
+      );
+      if (filteredAccountPool.length === 0 && excludedAccountIds.size > 0) {
+        this.logger.warn('All eligible accounts were already attempted for this request');
         return null;
       }
 
       const selectedTokenEntry = await this.selectionPolicy.selectCandidate({
-        allTokens: candidateAccountPool,
+        allTokens: filteredAccountPool,
         sessionKey,
         model,
         now,
@@ -329,6 +345,10 @@ export class AccountLeaseService implements OnModuleInit {
 
   getAccountCount(): number {
     return this.tokens.size;
+  }
+
+  getModelCapableAccountCount(model?: string): number {
+    return this.selectModelCapableAccounts(Array.from(this.tokens.entries()), model).length;
   }
 
   private normalizeRefreshedOauthClientKey(

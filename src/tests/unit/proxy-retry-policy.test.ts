@@ -97,7 +97,8 @@ describe('ProxyRetryPolicy', () => {
   it('routes structured upstream errors to account lease upstream error handling', async () => {
     const { policy, accountLeaseService } = createPolicy();
 
-    await policy.applyUpstreamPenalty(
+    await expect(
+      policy.applyUpstreamPenalty(
       'acc-1',
       'gemini-3-flash',
       new UpstreamRequestError({
@@ -106,7 +107,8 @@ describe('ProxyRetryPolicy', () => {
         headers: { retryAfter: '30' },
         body: 'quota exhausted',
       }),
-    );
+      ),
+    ).resolves.toBe(true);
 
     expect(accountLeaseService.recordParityError).toHaveBeenCalledOnce();
     expect(accountLeaseService.markFromUpstreamError).toHaveBeenCalledWith({
@@ -147,6 +149,9 @@ describe('ProxyRetryPolicy', () => {
           }),
         ]),
       );
+      expect(proxyModelAvailabilityStore.isAvailable('acc-image', 'gemini-3-pro-image')).toBe(
+        false,
+      );
       proxyModelAvailabilityStore.clearAccount('acc-image');
     },
   );
@@ -158,5 +163,33 @@ describe('ProxyRetryPolicy', () => {
 
     expect(accountLeaseService.recordParityError).toHaveBeenCalledOnce();
     expect(accountLeaseService.markAsRateLimited).toHaveBeenCalledWith('acc-1');
+  });
+
+  it('does not rotate accounts for a non-retryable upstream client error', async () => {
+    const { policy, accountLeaseService } = createPolicy();
+
+    await expect(
+      policy.applyUpstreamPenalty(
+        'acc-1',
+        'gemini-3-flash',
+        new UpstreamRequestError({ message: 'invalid request', status: 400 }),
+      ),
+    ).resolves.toBe(false);
+    expect(accountLeaseService.markFromUpstreamError).not.toHaveBeenCalled();
+  });
+
+  it('switches accounts immediately for structured quota failures', () => {
+    const { policy } = createPolicy();
+
+    expect(
+      policy.shouldFailoverImmediately(
+        new UpstreamRequestError({ message: 'quota exhausted', status: 429 }),
+      ),
+    ).toBe(true);
+    expect(
+      policy.shouldFailoverImmediately(
+        new UpstreamRequestError({ message: 'transient transport error', status: 500 }),
+      ),
+    ).toBe(false);
   });
 });
