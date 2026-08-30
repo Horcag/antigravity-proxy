@@ -3,6 +3,7 @@ import { DEFAULT_PROXY_CONFIG, ProxyConfig } from '@/modules/config/types';
 import { setServerConfig } from '../../server/server-config';
 import { AccountLeaseService } from '../../modules/proxy-gateway/server/account-lease.service';
 import { GoogleAPIService } from '@/modules/cloud-account/services/GoogleAPIService';
+import { proxyModelAvailabilityStore } from '@/modules/proxy-gateway/server/proxy-model-availability-store';
 
 function createProxyConfig(overrides: Partial<ProxyConfig>): ProxyConfig {
   return {
@@ -84,6 +85,114 @@ describe('AccountLeaseService parity scheduling replay', () => {
 
     const resolved = service.resolveDynamicModelForAccount('acc-1', 'gemini-3-pro');
     expect(resolved).toBe('gemini-3.1-pro-low');
+  });
+
+  it('resolves a stable image capability alias to the advertised upstream image model', async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    (service as any).tokens = new Map([
+      [
+        'acc-image',
+        {
+          account_id: 'acc-image',
+          email: 'acc-image@test.dev',
+          access_token: 'token-image',
+          refresh_token: 'refresh-image',
+          token_type: 'Bearer',
+          expires_in: 3600,
+          expiry_timestamp: nowSec + 3600,
+          project_id: 'project-image',
+          model_quotas: { 'gemini-3.1-flash-image': 99 },
+          model_limits: {},
+          model_reset_times: {},
+          model_forwarding_rules: {},
+        },
+      ],
+    ]);
+
+    expect(service.getModelCapableAccountCount('gemini-3-pro-image')).toBe(1);
+    await expect(service.getNextToken({ model: 'gemini-3-pro-image' })).resolves.toEqual(
+      expect.objectContaining({ id: 'acc-image' }),
+    );
+    expect(service.resolveDynamicModelForAccount('acc-image', 'gemini-3-pro-image')).toBe(
+      'gemini-3.1-flash-image',
+    );
+  });
+
+  it('offers every compatible account once so failover is not capped at three accounts', async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    (service as any).tokens = new Map(
+      Array.from({ length: 5 }, (_, index) => {
+        const accountId = `acc-${index + 1}`;
+        return [
+          accountId,
+          {
+            account_id: accountId,
+            email: `${accountId}@test.dev`,
+            access_token: `token-${accountId}`,
+            refresh_token: `refresh-${accountId}`,
+            token_type: 'Bearer',
+            expires_in: 3600,
+            expiry_timestamp: nowSec + 3600,
+            project_id: `project-${accountId}`,
+            model_quotas: { 'gemini-3.1-flash-image': 99 },
+            model_limits: {},
+            model_reset_times: {},
+            model_forwarding_rules: {},
+          },
+        ];
+      }),
+    );
+
+    expect(service.getModelCapableAccountCount('gemini-3-pro-image')).toBe(5);
+    const attemptedAccountIds: string[] = [];
+    for (let index = 0; index < 5; index++) {
+      const token = await service.getNextToken({
+        model: 'gemini-3-pro-image',
+        excludeAccountIds: attemptedAccountIds,
+      });
+      expect(token).not.toBeNull();
+      attemptedAccountIds.push(token!.id);
+    }
+
+    expect(new Set(attemptedAccountIds).size).toBe(5);
+    await expect(
+      service.getNextToken({
+        model: 'gemini-3-pro-image',
+        excludeAccountIds: attemptedAccountIds,
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it('skips an account after an effective image model is marked unavailable', async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const tokenData = (accountId: string) => ({
+      account_id: accountId,
+      email: `${accountId}@test.dev`,
+      access_token: `token-${accountId}`,
+      refresh_token: `refresh-${accountId}`,
+      token_type: 'Bearer',
+      expires_in: 3600,
+      expiry_timestamp: nowSec + 3600,
+      project_id: `project-${accountId}`,
+      model_quotas: { 'gemini-3.1-flash-image': 99 },
+      model_limits: {},
+      model_reset_times: {},
+      model_forwarding_rules: {},
+    });
+    (service as any).tokens = new Map([
+      ['acc-image-1', tokenData('acc-image-1')],
+      ['acc-image-2', tokenData('acc-image-2')],
+    ]);
+    proxyModelAvailabilityStore.mark(
+      'acc-image-1',
+      'gemini-3.1-flash-image',
+      'quota_exhausted',
+    );
+
+    await expect(service.getNextToken({ model: 'gemini-3-pro-image' })).resolves.toEqual(
+      expect.objectContaining({ id: 'acc-image-2' }),
+    );
+    proxyModelAvailabilityStore.clearAccount('acc-image-1');
   });
 
   it('keeps original model when dynamic rewrite is not applicable', () => {
@@ -377,7 +486,7 @@ describe('AccountLeaseService parity scheduling replay', () => {
     expect(otherModel?.id).toBe('acc-1');
   });
 
-  it('falls back to excluded pool when retry exclusions would empty all candidates', async () => {
+  it('does not retry an account already attempted by the same request', async () => {
     setServerConfig(
       createProxyConfig({
         parity_enabled: false,
@@ -404,6 +513,6 @@ describe('AccountLeaseService parity scheduling replay', () => {
     ]);
 
     const token = await service.getNextToken({ excludeAccountIds: ['acc-1'] });
-    expect(token?.id).toBe('acc-1');
+    expect(token).toBeNull();
   });
 });

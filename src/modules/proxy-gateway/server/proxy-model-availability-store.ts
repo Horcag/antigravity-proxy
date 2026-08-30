@@ -68,6 +68,35 @@ export class ProxyModelAvailabilityStore {
     }
   }
 
+  isAvailable(accountId: string, modelId: string, now = Date.now()): boolean {
+    return this.getActiveEntry(accountId, modelId, now) === null;
+  }
+
+  isCapabilityAvailable(accountId: string, modelId: string, now = Date.now()): boolean {
+    const entry = this.getActiveEntry(accountId, modelId, now);
+    return (
+      entry === null ||
+      (entry.reason !== 'model_not_supported' && entry.reason !== 'model_forbidden')
+    );
+  }
+
+  private getActiveEntry(
+    accountId: string,
+    modelId: string,
+    now: number,
+  ): ProxyModelAvailability | null {
+    const key = createKey(accountId, modelId);
+    const entry = this.entries.get(key);
+    if (!entry) {
+      return null;
+    }
+    if (entry.unavailableUntil <= now) {
+      this.entries.delete(key);
+      return null;
+    }
+    return entry;
+  }
+
   getSnapshot(): ProxyModelAvailability[] {
     const now = Date.now();
     for (const [key, entry] of this.entries) {

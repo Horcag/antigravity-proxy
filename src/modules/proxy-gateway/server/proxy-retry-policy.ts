@@ -1,17 +1,12 @@
 import { isString } from 'lodash-es';
 import { CloudAccount } from '@/modules/cloud-account/types';
 import { calculateRetryDelay, sleep } from '../antigravity/retry-utils';
-import {
-  GRACE_RETRY_BUFFER_MS,
-  parseRetryDelayMilliseconds,
-  shouldGraceRetry,
-} from './rate-limit-tracker';
+import { parseRetryDelayMilliseconds } from './rate-limit-tracker';
 import { UpstreamRequestError } from './clients/upstream-error';
 import { proxyModelAvailabilityStore } from './proxy-model-availability-store';
 
 export interface ProxyTokenRetryState {
   attemptedAccountIds: Set<string>;
-  graceRetryToken: CloudAccount | null;
 }
 
 export interface ProxyRetryAccountLeaseService {
@@ -52,7 +47,6 @@ export class ProxyRetryPolicy {
   createTokenRetryState(): ProxyTokenRetryState {
     return {
       attemptedAccountIds: new Set<string>(),
-      graceRetryToken: null,
     };
   }
 
@@ -61,13 +55,6 @@ export class ProxyRetryPolicy {
     model: string,
     sessionKey?: string,
   ): Promise<CloudAccount | null> {
-    const graceRetryToken = retryState.graceRetryToken;
-    retryState.graceRetryToken = null;
-
-    if (graceRetryToken) {
-      return graceRetryToken;
-    }
-
     const token = await this.accountLeaseService.getNextToken({
       sessionKey,
       excludeAccountIds: Array.from(retryState.attemptedAccountIds),
@@ -85,9 +72,8 @@ export class ProxyRetryPolicy {
     attemptIndex: number,
     maxRetries: number,
     label: string,
-    shouldSkipBackoff: boolean,
   ): Promise<void> {
-    if (attemptIndex === 0 || shouldSkipBackoff) {
+    if (attemptIndex === 0) {
       return;
     }
 
@@ -98,26 +84,14 @@ export class ProxyRetryPolicy {
     await sleep(delay);
   }
 
-  async prepareGraceRetry(
-    retryState: ProxyTokenRetryState,
-    token: CloudAccount,
-    error: unknown,
-    label: string,
-  ): Promise<boolean> {
-    const graceRetryDelay = this.resolveGraceRetryDelay(error);
-    if (graceRetryDelay === null) {
-      return false;
-    }
-
-    this.logger.log(
-      `${label} grace retry on same account ${token.id}, waiting ${graceRetryDelay}ms`,
+  shouldFailoverImmediately(error: unknown): boolean {
+    return (
+      error instanceof UpstreamRequestError &&
+      (error.status === 401 || error.status === 403 || error.status === 429)
     );
-    await sleep(graceRetryDelay);
-    retryState.graceRetryToken = token;
-    return true;
   }
 
-  async applyUpstreamPenalty(accountId: string, model: string, error: unknown): Promise<void> {
+  async applyUpstreamPenalty(accountId: string, model: string, error: unknown): Promise<boolean> {
     this.accountLeaseService.recordParityError();
 
     if (error instanceof UpstreamRequestError) {
@@ -125,11 +99,11 @@ export class ProxyRetryPolicy {
       const isImageModel = model.toLowerCase().includes('-image');
       if (isImageModel && status === 404) {
         proxyModelAvailabilityStore.mark(accountId, model, 'model_not_supported');
-        return;
+        return true;
       }
       if (isImageModel && status === 403) {
         proxyModelAvailabilityStore.mark(accountId, model, 'model_forbidden');
-        return;
+        return true;
       }
       if (status === 429) {
         const retryDelayMs = parseRetryDelayMilliseconds(
@@ -147,51 +121,50 @@ export class ProxyRetryPolicy {
       }
       if (status === 401 || status === 403) {
         this.accountLeaseService.markAsForbidden(accountId);
-        return;
+        return true;
       }
 
-      await this.accountLeaseService.markFromUpstreamError({
-        accountIdOrEmail: accountId,
-        status,
-        retryAfter: error.headers?.retryAfter,
-        body: error.body,
-        model,
-      });
-      return;
+      const retryable =
+        status === 408 ||
+        status === 429 ||
+        status === 500 ||
+        status === 502 ||
+        status === 503 ||
+        status === 504 ||
+        this.classifyUpstreamFailure(
+          [error.message, error.body].filter(isString).join('\n'),
+        ).retry;
+      if (retryable) {
+        await this.accountLeaseService.markFromUpstreamError({
+          accountIdOrEmail: accountId,
+          status,
+          retryAfter: error.headers?.retryAfter,
+          body: error.body,
+          model,
+        });
+      }
+      return retryable;
     }
 
     if (!(error instanceof Error)) {
-      return;
+      return false;
     }
 
     this.logger.warn(`Upstream request failed for account ${accountId}: ${error.message}`);
     const penaltyDecision = this.classifyUpstreamFailure(error.message);
     if (!penaltyDecision.retry) {
-      return;
+      return false;
     }
 
     if (penaltyDecision.markAsForbidden) {
       this.accountLeaseService.markAsForbidden(accountId);
-      return;
+      return true;
     }
 
     if (penaltyDecision.markAsRateLimited) {
       this.accountLeaseService.markAsRateLimited(accountId);
     }
-  }
-
-  resolveGraceRetryDelay(error: unknown): number | null {
-    if (!(error instanceof UpstreamRequestError) || error.status !== 429) {
-      return null;
-    }
-
-    const errorText = [error.body, error.message].filter(isString).join('\n');
-    const retryDelayMs = parseRetryDelayMilliseconds(errorText);
-    if (retryDelayMs === null || !shouldGraceRetry(retryDelayMs)) {
-      return null;
-    }
-
-    return retryDelayMs + GRACE_RETRY_BUFFER_MS;
+    return true;
   }
 
   classifyUpstreamFailure(errorMessage: string): ProxyUpstreamFailureClassification {

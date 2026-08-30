@@ -655,7 +655,7 @@ function buildContents(
           toolIdToSignature.set(block.id, finalSig);
           part.thoughtSignature = finalSig;
           part.thought_signature = finalSig;
-        } else if (isThinkingEnabled && isGeminiFlashModel(mappedModel)) {
+        } else if (isGeminiFlashModel(mappedModel)) {
           part.thoughtSignature = 'skip_thought_signature_validator';
           part.thought_signature = 'skip_thought_signature_validator';
         }

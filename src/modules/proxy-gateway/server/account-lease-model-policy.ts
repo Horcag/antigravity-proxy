@@ -1,6 +1,7 @@
 import { isNumber } from 'lodash-es';
 import { getPublicModelIdForDisplayName } from '../antigravity/ModelMapping';
 import { type AccountLeaseTokenData, normalizeModelId } from './account-lease-token-types';
+import { proxyModelAvailabilityStore } from './proxy-model-availability-store';
 
 interface AccountLeaseModelLogger {
   log(message: string): void;
@@ -42,6 +43,8 @@ const GEMINI_PRO_FAMILY = new Set([
 
 const GEMINI_PRO_IMAGE_FAMILY = new Set(['gemini-3-pro-image', 'gemini-3.1-pro-image']);
 const GEMINI_FLASH_IMAGE_FAMILY = new Set(['gemini-3-flash-image', 'gemini-3.1-flash-image']);
+
+const IMAGE_MODEL_CAPABILITY_PATTERN = /(?:^|-)image(?:-|$)/;
 
 const TIERED_MODEL_SUFFIXES = ['extra-low', 'high', 'medium', 'low'] as const;
 const TIER_PREFERENCE = ['high', 'medium', 'low', 'extra-low'] as const;
@@ -211,13 +214,19 @@ export class AccountLeaseModelPolicy {
     return candidates;
   }
 
-  resolveDynamicModelForAccount(accountId: string, mappedModel: string): string {
+  resolveDynamicModelForAccount(
+    accountId: string,
+    mappedModel: string,
+    logRewrite = true,
+  ): string {
     const tokenData = this.options.getTokenCache().get(accountId);
     const unrequestableSibling = this.resolveUnrequestableSibling(mappedModel, tokenData);
     if (unrequestableSibling) {
-      this.options.logger.log(
-        `[Unrequestable-Model-Rewrite] account=${accountId} ${mappedModel} -> ${unrequestableSibling}`,
-      );
+      if (logRewrite) {
+        this.options.logger.log(
+          `[Unrequestable-Model-Rewrite] account=${accountId} ${mappedModel} -> ${unrequestableSibling}`,
+        );
+      }
       return unrequestableSibling;
     }
 
@@ -226,6 +235,7 @@ export class AccountLeaseModelPolicy {
     }
 
     const availableModels = this.filterRequestableModels(
+      accountId,
       this.getAvailableModelsFromToken(tokenData),
     );
     if (availableModels.size === 0) {
@@ -242,7 +252,7 @@ export class AccountLeaseModelPolicy {
       return mappedModel;
     }
 
-    if (resolvedModel !== normalizedMappedModel) {
+    if (logRewrite && resolvedModel !== normalizedMappedModel) {
       this.options.logger.log(
         `[Dynamic-Model-Rewrite] account=${accountId} ${mappedModel} -> ${resolvedModel}`,
       );
@@ -256,11 +266,17 @@ export class AccountLeaseModelPolicy {
       return 'unknown';
     }
 
-    const availableModels = this.filterRequestableModels(
-      this.getAvailableModelsFromToken(tokenData),
+    const advertisedModels = this.getAvailableModelsFromToken(tokenData);
+    if (advertisedModels.size === 0) {
+      return 'unknown';
+    }
+
+    const availableModels = this.filterCapabilityModels(
+      accountId,
+      advertisedModels,
     );
     if (availableModels.size === 0) {
-      return 'unknown';
+      return 'unavailable';
     }
 
     const normalizedMappedModel = normalizeModelId(mappedModel)?.toLowerCase();
@@ -273,18 +289,48 @@ export class AccountLeaseModelPolicy {
       : 'unavailable';
   }
 
+  isModelRequestableForAccount(accountId: string, mappedModel: string): boolean {
+    const tokenData = this.options.getTokenCache().get(accountId);
+    if (!tokenData) {
+      return true;
+    }
+    const advertisedModels = this.getAvailableModelsFromToken(tokenData);
+    if (advertisedModels.size === 0) {
+      return true;
+    }
+    const requestableModels = this.filterRequestableModels(accountId, advertisedModels);
+    const normalizedMappedModel = normalizeModelId(mappedModel)?.toLowerCase();
+    return Boolean(
+      normalizedMappedModel &&
+        this.resolveAvailableModel(tokenData, normalizedMappedModel, requestableModels),
+    );
+  }
+
   /**
    * Drop upstream-rejected ids from a candidate set so no selection path
    * (forwarding rules, display presets, dynamic candidates, tiered family)
    * can land on a model the generation API refuses to serve.
    */
-  private filterRequestableModels(models: Set<string>): Set<string> {
-    if (this.unrequestableModels.size === 0) {
-      return models;
-    }
+  private filterRequestableModels(accountId: string, models: Set<string>): Set<string> {
     const filtered = new Set<string>();
     for (const modelId of models) {
-      if (!this.unrequestableModels.has(modelId)) {
+      if (
+        !this.unrequestableModels.has(modelId) &&
+        proxyModelAvailabilityStore.isAvailable(accountId, modelId)
+      ) {
+        filtered.add(modelId);
+      }
+    }
+    return filtered;
+  }
+
+  private filterCapabilityModels(accountId: string, models: Set<string>): Set<string> {
+    const filtered = new Set<string>();
+    for (const modelId of models) {
+      if (
+        !this.unrequestableModels.has(modelId) &&
+        proxyModelAvailabilityStore.isCapabilityAvailable(accountId, modelId)
+      ) {
         filtered.add(modelId);
       }
     }
@@ -325,12 +371,62 @@ export class AccountLeaseModelPolicy {
       return normalizedMappedModel;
     }
 
+    const imageCapabilityModel = this.resolveImageCapabilityModel(
+      normalizedMappedModel,
+      availableModels,
+    );
+    if (imageCapabilityModel) {
+      return imageCapabilityModel;
+    }
+
     const tieredFamilyModel = this.resolveTieredFamilyModel(normalizedMappedModel, availableModels);
     if (tieredFamilyModel) {
       return tieredFamilyModel;
     }
 
     return null;
+  }
+
+  /**
+   * Public image aliases outlive upstream preset ids. Resolve the requested image
+   * capability against models the leased account currently advertises instead of
+   * treating an upstream rename as account exhaustion.
+   */
+  private resolveImageCapabilityModel(
+    normalizedMappedModel: string,
+    availableModels: Set<string>,
+  ): string | null {
+    if (!IMAGE_MODEL_CAPABILITY_PATTERN.test(normalizedMappedModel)) {
+      return null;
+    }
+
+    const candidates = [...availableModels].filter((modelId) =>
+      IMAGE_MODEL_CAPABILITY_PATTERN.test(modelId),
+    );
+    if (candidates.length === 0) {
+      return null;
+    }
+
+    const requestedClass = this.imageModelClass(normalizedMappedModel);
+    candidates.sort((left, right) => {
+      const leftClassMatch = this.imageModelClass(left) === requestedClass ? 1 : 0;
+      const rightClassMatch = this.imageModelClass(right) === requestedClass ? 1 : 0;
+      if (leftClassMatch !== rightClassMatch) {
+        return rightClassMatch - leftClassMatch;
+      }
+      return right.localeCompare(left, undefined, { numeric: true });
+    });
+    return candidates[0] ?? null;
+  }
+
+  private imageModelClass(modelId: string): 'pro' | 'flash' | 'other' {
+    if (/(?:^|-)pro-image(?:-|$)/.test(modelId)) {
+      return 'pro';
+    }
+    if (/(?:^|-)flash-image(?:-|$)/.test(modelId)) {
+      return 'flash';
+    }
+    return 'other';
   }
 
   private resolveDisplayPresetForAccount(
