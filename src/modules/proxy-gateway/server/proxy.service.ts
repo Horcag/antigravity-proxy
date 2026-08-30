@@ -1,7 +1,7 @@
 import { HttpStatus, Injectable, Logger, Inject } from '@nestjs/common';
 import { isEmpty, isFunction, isNil, isNumber, isPlainObject, isString } from 'lodash-es';
 import { AccountLeaseService } from './account-lease.service';
-import { GeminiClient } from './clients/gemini.client';
+import { GeminiClient, unwrapInternalGeminiResponse } from './clients/gemini.client';
 import { UpstreamRequestError } from './clients/upstream-error';
 import { AccountPoolUnavailableException, OpenAIProtocolException } from './openai-protocol-error';
 import { v4 as uuidv4 } from 'uuid';
@@ -432,12 +432,13 @@ export class ProxyService {
         }
 
         try {
-          const json = JSON.parse(dataStr);
-          const upstreamError = this.getUpstreamStreamError(json);
+          const rawPayload = JSON.parse(dataStr);
+          const upstreamError = this.getUpstreamStreamError(rawPayload);
           if (upstreamError) {
             failStream(upstreamError, true);
             return;
           }
+          const json = unwrapInternalGeminiResponse(rawPayload);
 
           const candidate = json?.candidates?.[0];
           const parts = candidate?.content?.parts;
@@ -963,9 +964,6 @@ export class ProxyService {
               token.token.upstream_proxy_url,
               extraHeaders,
             );
-            this.logger.log(
-              `Upstream response snippet after stream fallback: ${JSON.stringify(response).substring(0, 500)}`,
-            );
             const claudeResponse = transformResponse(response, signatureContext);
             const openaiResponse = this.convertClaudeToOpenAIResponse(
               claudeResponse,
@@ -984,14 +982,8 @@ export class ProxyService {
             token.token.upstream_proxy_url,
             extraHeaders,
           );
-          this.logger.log(
-            `Upstream response snippet (non-stream): ${JSON.stringify(response).substring(0, 500)}`,
-          );
           // Transform Gemini response to OpenAI format
           const claudeResponse = transformResponse(response, signatureContext);
-          this.logger.log(
-            `Transformed Claude response snippet: ${JSON.stringify(claudeResponse).substring(0, 500)}`,
-          );
           return this.convertClaudeToOpenAIResponse(
             claudeResponse,
             request.model,
@@ -1201,12 +1193,13 @@ export class ProxyService {
         }
 
         try {
-          const parsed = JSON.parse(dataStr);
-          const upstreamError = this.getUpstreamStreamError(parsed);
+          const rawPayload = JSON.parse(dataStr);
+          const upstreamError = this.getUpstreamStreamError(rawPayload);
           if (upstreamError) {
             rejectOnce(upstreamError, true);
             return;
           }
+          const parsed = unwrapInternalGeminiResponse(rawPayload);
 
           const candidate = parsed?.candidates?.[0];
           groundingMetadata = this.mergeGroundingMetadata(
@@ -1866,9 +1859,9 @@ export class ProxyService {
         const dataStr = trimmed.slice('data:'.length).trim();
         if (dataStr.length === 0 || dataStr === '[DONE]') return;
 
-        let json: any;
+        let rawPayload: any;
         try {
-          json = JSON.parse(dataStr);
+          rawPayload = JSON.parse(dataStr);
         } catch {
           // A malformed upstream payload is a real failure: surface one terminal
           // stream error instead of silently completing as a successful stream.
@@ -1876,11 +1869,12 @@ export class ProxyService {
           return;
         }
 
-        const upstreamError = this.getUpstreamStreamError(json);
+        const upstreamError = this.getUpstreamStreamError(rawPayload);
         if (upstreamError) {
           failStream(upstreamError);
           return;
         }
+        const json = unwrapInternalGeminiResponse(rawPayload);
 
         {
           const candidate = json?.candidates?.[0];

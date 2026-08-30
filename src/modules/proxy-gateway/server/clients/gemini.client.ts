@@ -8,6 +8,17 @@ import { getServerConfig } from '../../../../server/server-config';
 import { resolveRequestUserAgent } from '../request-user-agent';
 import { UpstreamRequestError } from './upstream-error';
 
+export function unwrapInternalGeminiResponse<T>(payload: T | { response: T }): T {
+  if (isObjectLike(payload)) {
+    const record = payload as Record<string, unknown>;
+    if (Object.hasOwn(record, 'response') && isObjectLike(record.response)) {
+      return record.response as T;
+    }
+  }
+
+  return payload as T;
+}
+
 @Injectable()
 export class GeminiClient {
   private readonly logger = new Logger(GeminiClient.name);
@@ -131,11 +142,7 @@ export class GeminiClient {
       'generate-content',
       extraHeaders,
     );
-    const payload = response.data;
-    if (isObjectLike(payload) && 'response' in payload) {
-      return (payload as { response: GeminiResponse }).response;
-    }
-    return payload as GeminiResponse;
+    return unwrapInternalGeminiResponse(response.data);
   }
 
   private getInternalBaseUrls(): string[] {
