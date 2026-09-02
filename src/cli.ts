@@ -226,6 +226,17 @@ async function run(parsed: ParsedArgs): Promise<void> {
     return;
   }
 
+  if (primary === 'accounts' && secondary === 'refresh-quota') {
+    const force = getBooleanOption(options, 'force');
+    const suffix = force ? '?force=true' : '';
+    writeJson(
+      await requestAdmin(options, `/admin/accounts/refresh-quota${suffix}`, {
+        method: 'POST',
+      }),
+    );
+    return;
+  }
+
   if (primary === 'oauth' && secondary === 'url') {
     const clientKey = getStringOption(options, 'clientKey');
     const suffix = clientKey ? `?client_key=${encodeURIComponent(clientKey)}` : '';
@@ -258,7 +269,7 @@ async function run(parsed: ParsedArgs): Promise<void> {
       '  antigravity-proxy serve',
       '  antigravity-proxy health [--url http://127.0.0.1:8045]',
       '  antigravity-proxy status [--admin-key key] [--url http://127.0.0.1:8045]',
-      '  antigravity-proxy accounts list|import|export|remove|reload',
+      '  antigravity-proxy accounts list|import|export|remove|reload|refresh-quota',
       '  antigravity-proxy oauth url|exchange',
     ].join('\n'),
   );

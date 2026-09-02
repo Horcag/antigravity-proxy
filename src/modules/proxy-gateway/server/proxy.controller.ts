@@ -174,8 +174,9 @@ export class ProxyController {
   ) {}
 
   @Get('models')
-  listModels(@Res() res: FastifyReply) {
+  async listModels(@Res() res: FastifyReply) {
     try {
+      await this.accountLeaseService?.refreshQuotaCatalog();
       const data = this.buildOpenAIModelList();
 
       res.status(HttpStatus.OK).send({
@@ -189,7 +190,8 @@ export class ProxyController {
   }
 
   @Get('models/:model')
-  getModel(@Param('model') model: string, @Res() res: FastifyReply) {
+  async getModel(@Param('model') model: string, @Res() res: FastifyReply) {
+    await this.accountLeaseService?.refreshQuotaCatalog({ model });
     const matched = this.buildOpenAIModelList().find((item) => item.id === model);
     if (!matched) {
       sendOpenAIProtocolError(

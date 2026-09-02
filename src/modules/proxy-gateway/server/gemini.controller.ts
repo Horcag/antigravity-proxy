@@ -48,7 +48,8 @@ export class GeminiController {
   ) {}
 
   @Get('models')
-  listModels(@Res() res: FastifyReply) {
+  async listModels(@Res() res: FastifyReply) {
+    await this.accountLeaseService?.refreshQuotaCatalog();
     const models = this.buildGeminiModelList();
     res.status(HttpStatus.OK).send({
       models,
@@ -56,7 +57,8 @@ export class GeminiController {
   }
 
   @Get('models/:model')
-  getModel(@Param('model') model: string, @Res() res: FastifyReply) {
+  async getModel(@Param('model') model: string, @Res() res: FastifyReply) {
+    await this.accountLeaseService?.refreshQuotaCatalog({ model });
     const targetName = model.startsWith('models/') ? model : `models/${model}`;
     const matched = this.buildGeminiModelList().find((item) => item.name === targetName);
 

@@ -232,6 +232,16 @@ export class AdminService {
     };
   }
 
+  async refreshQuotaCatalog(force: boolean): Promise<{
+    refreshed: true;
+    quota: Awaited<ReturnType<AccountLeaseService['refreshQuotaCatalog']>>;
+  }> {
+    return {
+      refreshed: true,
+      quota: await this.accountLeaseService.refreshQuotaCatalog({ force }),
+    };
+  }
+
   getOAuthUrl(oauthClientKey?: string): { url: string } {
     return {
       url: GoogleAPIService.getAuthUrl(oauthClientKey),

@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit, Optional } from '@nestjs/common';
 import { CloudAccount } from '@/modules/cloud-account/types';
 import { RateLimitTracker } from './rate-limit-tracker';
 import {
@@ -10,6 +10,7 @@ import {
   googleAccountLeaseUpstreamAdapter,
 } from './account-lease-adapters';
 import { AccountLeaseQuotaRefreshPolicy } from './account-lease-quota-refresh-policy';
+import type { AccountLeaseQuotaCatalogRefreshResult } from './account-lease-quota-refresh-policy';
 import { AccountLeaseTokenCache } from './account-lease-token-cache';
 import { AccountLeaseHydrationPolicy } from './account-lease-hydration-policy';
 import { AccountLeaseFulfillmentPolicy } from './account-lease-fulfillment-policy';
@@ -32,13 +33,15 @@ type TokenData = AccountLeaseTokenData;
 type TokenEntry = [string, TokenData];
 
 @Injectable()
-export class AccountLeaseService implements OnModuleInit {
+export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(AccountLeaseService.name);
   private readonly stickySessionTtlMs = 10 * 60 * 1000;
   private readonly rateLimitCooldownMs = 5 * 60 * 1000;
   private readonly forbiddenCooldownMs = 30 * 60 * 1000;
+  private readonly quotaCatalogRefreshIntervalMs = 10 * 60 * 1000;
 
   private tokens: Map<string, TokenData> = new Map();
+  private quotaCatalogRefreshTimer?: NodeJS.Timeout;
   private readonly configPolicy = new AccountLeaseConfigPolicy();
   private readonly quotaRefreshPolicy: AccountLeaseQuotaRefreshPolicy;
   private readonly tokenCache: AccountLeaseTokenCache;
@@ -60,6 +63,10 @@ export class AccountLeaseService implements OnModuleInit {
       accountStore: this.accountStore,
       upstream: this.upstream,
       getTokenCache: () => this.tokens,
+      hydrateTokenIfNeeded: (accountId, tokenData, nowSeconds) =>
+        this.hydrationPolicy.refreshSelectedTokenIfNeeded(accountId, tokenData, nowSeconds),
+      hydrateTokenAfterAuthFailure: (accountId, tokenData, nowSeconds) =>
+        this.hydrationPolicy.refreshSelectedTokenAfterAuthFailure(accountId, tokenData, nowSeconds),
       setLockoutUntilIso: (accountId, resetTime, reason, model) =>
         this.rateLimitTracker.setLockoutUntilIso(accountId, resetTime, reason, model),
       logger: this.logger,
@@ -121,9 +128,19 @@ export class AccountLeaseService implements OnModuleInit {
 
   async onModuleInit() {
     await this.loadAccounts();
+    void this.refreshQuotaCatalog({ force: true }).catch((error: unknown) => {
+      this.logger.warn('Startup quota catalog refresh failed', error);
+    });
+    this.startQuotaCatalogRefreshTimer();
+  }
+
+  async onModuleDestroy() {
+    this.stopQuotaCatalogRefreshTimer();
+    await this.quotaRefreshPolicy.shutdown();
   }
 
   async loadAccounts(): Promise<number> {
+    this.quotaRefreshPolicy.invalidateActiveRefreshes();
     return this.tokenCache.loadAccounts();
   }
 
@@ -132,6 +149,13 @@ export class AccountLeaseService implements OnModuleInit {
     this.clearAllRateLimits();
     this.clearAllSessions();
     return count;
+  }
+
+  refreshQuotaCatalog(options: {
+    force?: boolean;
+    model?: string;
+  } = {}): Promise<AccountLeaseQuotaCatalogRefreshResult> {
+    return this.quotaRefreshPolicy.refreshQuotaCatalog(options);
   }
 
   clearAllSessions(): void {
@@ -184,7 +208,14 @@ export class AccountLeaseService implements OnModuleInit {
       this.rateLimitTracker.cleanupExpired();
 
       const fullAccountPool = Array.from(this.tokens.entries());
-      const modelCapableAccountPool = this.selectModelCapableAccounts(fullAccountPool, model);
+      let modelCapableAccountPool = this.selectModelCapableAccounts(fullAccountPool, model);
+      if (model && modelCapableAccountPool.length === 0) {
+        await this.refreshQuotaCatalog({ force: true, model });
+        modelCapableAccountPool = this.selectModelCapableAccounts(
+          Array.from(this.tokens.entries()),
+          model,
+        );
+      }
       if (modelCapableAccountPool.length === 0) {
         this.logger.warn(`No account advertises requested model: ${model ?? 'unknown'}`);
         return null;
@@ -351,6 +382,15 @@ export class AccountLeaseService implements OnModuleInit {
     return this.selectModelCapableAccounts(Array.from(this.tokens.entries()), model).length;
   }
 
+  async getRefreshedModelCapableAccountCount(model?: string): Promise<number> {
+    let count = this.getModelCapableAccountCount(model);
+    if (model && count === 0) {
+      await this.refreshQuotaCatalog({ force: true, model });
+      count = this.getModelCapableAccountCount(model);
+    }
+    return count;
+  }
+
   private normalizeRefreshedOauthClientKey(
     currentToken: { oauth_client_key?: string; project_id?: string },
     refreshedClientKey?: string,
@@ -360,6 +400,11 @@ export class AccountLeaseService implements OnModuleInit {
 
   getAllCollectedModels(): Set<string> {
     return this.modelPolicy.getAllCollectedModels();
+  }
+
+  async getRefreshedAllCollectedModels(): Promise<Set<string>> {
+    await this.refreshQuotaCatalog();
+    return this.getAllCollectedModels();
   }
 
   private getAvailableModelsFromToken(tokenData: TokenData): Set<string> {
@@ -384,5 +429,23 @@ export class AccountLeaseService implements OnModuleInit {
 
   getModelThinkingBudgetForAccount(accountId: string, modelName: string): number | undefined {
     return this.modelPolicy.getModelThinkingBudgetForAccount(accountId, modelName);
+  }
+
+  private startQuotaCatalogRefreshTimer(): void {
+    this.stopQuotaCatalogRefreshTimer();
+    this.quotaCatalogRefreshTimer = setInterval(() => {
+      void this.refreshQuotaCatalog({ force: true }).catch((error: unknown) => {
+        this.logger.warn('Scheduled quota catalog refresh failed', error);
+      });
+    }, this.quotaCatalogRefreshIntervalMs);
+    this.quotaCatalogRefreshTimer.unref?.();
+  }
+
+  private stopQuotaCatalogRefreshTimer(): void {
+    if (!this.quotaCatalogRefreshTimer) {
+      return;
+    }
+    clearInterval(this.quotaCatalogRefreshTimer);
+    this.quotaCatalogRefreshTimer = undefined;
   }
 }

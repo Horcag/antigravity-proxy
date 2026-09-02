@@ -26,6 +26,7 @@ function account(id: string): CloudAccount {
 function createAccountLeaseService(accounts: CloudAccount[]) {
   return {
     getModelCapableAccountCount: vi.fn().mockReturnValue(accounts.length),
+    getRefreshedModelCapableAccountCount: vi.fn().mockResolvedValue(accounts.length),
     getNextToken: vi.fn(
       async (options?: { excludeAccountIds?: string[] }): Promise<CloudAccount | null> => {
         const excluded = new Set(options?.excludeAccountIds ?? []);
@@ -139,6 +140,36 @@ describe('ProxyService account failover', () => {
     ).rejects.toMatchObject({
       status: HttpStatus.SERVICE_UNAVAILABLE,
       message: 'No account advertises a compatible upstream model for missing-image-model',
+    });
+  });
+
+  it('refreshes model capability before proxy preflight rejects a request', async () => {
+    const accounts = [account('acc-1')];
+    const accountLeaseService = {
+      ...createAccountLeaseService(accounts),
+      getModelCapableAccountCount: vi.fn().mockReturnValue(0),
+      getRefreshedModelCapableAccountCount: vi.fn().mockResolvedValue(1),
+    };
+    const geminiClient = {
+      generateInternal: vi.fn().mockResolvedValue({
+        candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] } }],
+      }),
+    };
+    const service = new ProxyService(accountLeaseService as any, geminiClient as any);
+
+    await expect(
+      service.handleGeminiGenerateContent('gemini-new-flash-high', {
+        contents: [{ role: 'user', parts: [{ text: 'reply' }] }],
+      }),
+    ).resolves.toEqual(expect.objectContaining({ candidates: expect.any(Array) }));
+
+    expect(accountLeaseService.getRefreshedModelCapableAccountCount).toHaveBeenCalledWith(
+      'gemini-new-flash-high',
+    );
+    expect(accountLeaseService.getNextToken).toHaveBeenCalledWith({
+      excludeAccountIds: [],
+      model: 'gemini-new-flash-high',
+      sessionKey: undefined,
     });
   });
 });

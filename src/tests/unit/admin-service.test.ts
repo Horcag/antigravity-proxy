@@ -30,6 +30,12 @@ function createAccount(overrides: Partial<CloudAccount> = {}): CloudAccount {
 function createService() {
   const leaseService = {
     reloadAllAccounts: vi.fn().mockResolvedValue(1),
+    refreshQuotaCatalog: vi.fn().mockResolvedValue({
+      refreshed: 1,
+      skipped: 0,
+      failed: 0,
+      account_ids: ['acc-1'],
+    }),
   } as Pick<AccountLeaseService, 'reloadAllAccounts'> as AccountLeaseService;
 
   return new AdminService(leaseService);
@@ -104,5 +110,19 @@ describe('AdminService', () => {
         }),
       }),
     );
+  });
+
+  it('refreshes account quota through the lease service without exposing tokens', async () => {
+    const service = createService();
+
+    await expect(service.refreshQuotaCatalog(true)).resolves.toEqual({
+      refreshed: true,
+      quota: {
+        refreshed: 1,
+        skipped: 0,
+        failed: 0,
+        account_ids: ['acc-1'],
+      },
+    });
   });
 });

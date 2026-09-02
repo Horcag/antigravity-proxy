@@ -1,9 +1,14 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_PROXY_CONFIG, ProxyConfig } from '@/modules/config/types';
 import { setServerConfig } from '../../server/server-config';
 import { AccountLeaseService } from '../../modules/proxy-gateway/server/account-lease.service';
-import { GoogleAPIService } from '@/modules/cloud-account/services/GoogleAPIService';
+import { GoogleAPIService, type TokenResponse } from '@/modules/cloud-account/services/GoogleAPIService';
 import { proxyModelAvailabilityStore } from '@/modules/proxy-gateway/server/proxy-model-availability-store';
+import type {
+  AccountLeaseAccountStore,
+  AccountLeaseUpstream,
+} from '@/modules/proxy-gateway/server/account-lease-adapters';
+import type { CloudAccount, CloudQuotaData } from '@/modules/cloud-account/types';
 
 function createProxyConfig(overrides: Partial<ProxyConfig>): ProxyConfig {
   return {
@@ -50,12 +55,83 @@ function seedTokens(service: AccountLeaseService): void {
   ]);
 }
 
+function quota(models: Record<string, number>): CloudQuotaData {
+  return {
+    models: Object.fromEntries(
+      Object.entries(models).map(([model, percentage]) => [
+        model,
+        {
+          percentage,
+          resetTime: '2026-09-02T12:00:00.000Z',
+          max_output_tokens: percentage * 100,
+        },
+      ]),
+    ),
+  };
+}
+
+function account(id: string, accountQuota?: CloudQuotaData, expiryTimestamp?: number): CloudAccount {
+  return {
+    id,
+    provider: 'google',
+    email: `${id}@test.dev`,
+    token: {
+      access_token: `access-${id}`,
+      refresh_token: `refresh-${id}`,
+      token_type: 'Bearer',
+      expires_in: 3600,
+      expiry_timestamp: expiryTimestamp ?? Math.floor(Date.now() / 1000) + 3600,
+      project_id: `project-${id}`,
+    },
+    quota: accountQuota,
+    created_at: 1,
+    last_used: 1,
+  };
+}
+
+function createAccountStore(accounts: CloudAccount[]): AccountLeaseAccountStore {
+  return {
+    getAccounts: vi.fn().mockResolvedValue(accounts),
+    getAccount: vi.fn(async (accountId: string) => accounts.find((item) => item.id === accountId)),
+    updateToken: vi.fn(async (accountId: string, token: CloudAccount['token']) => {
+      const target = accounts.find((item) => item.id === accountId);
+      if (target) {
+        target.token = token;
+      }
+    }),
+    updateQuota: vi.fn(async (accountId: string, refreshedQuota: CloudQuotaData) => {
+      const target = accounts.find((item) => item.id === accountId);
+      if (target) {
+        target.quota = refreshedQuota;
+      }
+    }),
+  };
+}
+
+function createUpstream(overrides: Partial<AccountLeaseUpstream>): AccountLeaseUpstream {
+  return {
+    fetchQuota: vi.fn(),
+    refreshAccessToken: vi.fn(),
+    fetchProjectId: vi.fn(),
+    normalizeRefreshedOAuthClientKey: vi.fn((currentToken, refreshedClientKey) =>
+      refreshedClientKey ?? currentToken.oauth_client_key,
+    ),
+    ...overrides,
+  };
+}
+
 describe('AccountLeaseService parity scheduling replay', () => {
   let service: AccountLeaseService;
 
   beforeEach(() => {
     service = new AccountLeaseService();
     seedTokens(service);
+  });
+
+  afterEach(async () => {
+    await service.onModuleDestroy();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
   it('rewrites gemini pro model to first available account candidate', () => {
@@ -254,6 +330,262 @@ describe('AccountLeaseService parity scheduling replay', () => {
 
     fetchProjectIdSpy.mockRestore();
     fetchProjectContextSpy.mockRestore();
+  });
+
+  it('refreshes quota catalog before rejecting a newly available model', async () => {
+    const accounts = [account('acc-1', quota({ 'gemini-3.7-flash-high': 10 }))];
+    const store = createAccountStore(accounts);
+    const upstream = createUpstream({
+      fetchQuota: vi.fn().mockResolvedValue(quota({ 'gemini-new-flash-high': 88 })),
+    });
+    service = new AccountLeaseService(store, upstream);
+    await service.loadAccounts();
+
+    await expect(
+      service.getRefreshedModelCapableAccountCount('gemini-new-flash-high'),
+    ).resolves.toBe(1);
+    await expect(service.getNextToken({ model: 'gemini-new-flash-high' })).resolves.toEqual(
+      expect.objectContaining({ id: 'acc-1' }),
+    );
+    expect(upstream.fetchQuota).toHaveBeenCalledTimes(1);
+    expect(store.updateQuota).toHaveBeenCalledWith(
+      'acc-1',
+      expect.objectContaining({
+        models: expect.objectContaining({
+          'gemini-new-flash-high': expect.any(Object),
+        }),
+      }),
+    );
+  });
+
+  it('coalesces concurrent forced quota catalog refreshes', async () => {
+    const accounts = [account('acc-1', quota({ 'gemini-old-flash-high': 10 }))];
+    const store = createAccountStore(accounts);
+    let resolveQuota: ((value: CloudQuotaData) => void) | undefined;
+    const upstream = createUpstream({
+      fetchQuota: vi.fn(
+        () =>
+          new Promise<CloudQuotaData>((resolve) => {
+            resolveQuota = resolve;
+          }),
+      ),
+    });
+    service = new AccountLeaseService(store, upstream);
+    await service.loadAccounts();
+
+    const first = service.getRefreshedModelCapableAccountCount('gemini-new-flash-high');
+    const second = service.getRefreshedModelCapableAccountCount('gemini-new-flash-high');
+    await Promise.resolve();
+
+    expect(upstream.fetchQuota).toHaveBeenCalledTimes(1);
+    resolveQuota?.(quota({ 'gemini-new-flash-high': 77 }));
+    await expect(Promise.all([first, second])).resolves.toEqual([1, 1]);
+  });
+
+  it('keeps the last good quota snapshot when refresh fails', async () => {
+    const accounts = [account('acc-1', quota({ 'gemini-old-flash-high': 42 }))];
+    const store = createAccountStore(accounts);
+    const upstream = createUpstream({
+      fetchQuota: vi.fn().mockRejectedValue(new Error('quota endpoint down')),
+    });
+    service = new AccountLeaseService(store, upstream);
+    await service.loadAccounts();
+
+    await expect(service.refreshQuotaCatalog({ force: true })).resolves.toMatchObject({
+      refreshed: 0,
+      failed: 1,
+    });
+
+    expect(service.getAllCollectedModels()).toContain('gemini-old-flash-high');
+    expect(service.getAllCollectedModels()).not.toContain('gemini-new-flash-high');
+    expect(store.updateQuota).not.toHaveBeenCalled();
+  });
+
+  it('replaces stale quota and model limits with current quota metadata', async () => {
+    const accounts = [account('acc-1', quota({ 'gemini-refresh-flash-high': 12 }))];
+    const store = createAccountStore(accounts);
+    const upstream = createUpstream({
+      fetchQuota: vi.fn().mockResolvedValue(quota({ 'gemini-refresh-flash-high': 91 })),
+    });
+    service = new AccountLeaseService(store, upstream);
+    await service.loadAccounts();
+
+    await expect(service.refreshQuotaCatalog({ force: true })).resolves.toMatchObject({
+      refreshed: 1,
+      failed: 0,
+    });
+
+    expect(service.getModelOutputLimitForAccount('acc-1', 'gemini-refresh-flash-high')).toBe(9100);
+  });
+
+  it('hydrates an expired access token through the existing policy before quota refresh', async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const accounts = [account('acc-1', quota({ 'gemini-old-flash-high': 10 }), nowSec - 1)];
+    const store = createAccountStore(accounts);
+    const upstream = createUpstream({
+      refreshAccessToken: vi.fn().mockResolvedValue({
+        access_token: 'access-new',
+        expires_in: 7200,
+        token_type: 'Bearer',
+      }),
+      fetchQuota: vi.fn().mockResolvedValue(quota({ 'gemini-new-flash-high': 66 })),
+    });
+    service = new AccountLeaseService(store, upstream);
+    await service.loadAccounts();
+
+    await service.refreshQuotaCatalog({ force: true });
+
+    expect(upstream.refreshAccessToken).toHaveBeenCalledWith('refresh-acc-1', undefined, undefined);
+    expect(upstream.fetchQuota).toHaveBeenCalledWith('access-new', undefined);
+  });
+
+  it('refreshes access token once after quota endpoint rejects an unexpired token', async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const accounts = [account('acc-1', quota({ 'gemini-old-flash-high': 10 }), nowSec + 3600)];
+    const store = createAccountStore(accounts);
+    const upstream = createUpstream({
+      refreshAccessToken: vi.fn().mockResolvedValue({
+        access_token: 'access-after-401',
+        expires_in: 7200,
+        token_type: 'Bearer',
+      }),
+      fetchQuota: vi
+        .fn()
+        .mockRejectedValueOnce(new Error('UNAUTHORIZED'))
+        .mockResolvedValueOnce(quota({ 'gemini-new-flash-high': 66 })),
+    });
+    service = new AccountLeaseService(store, upstream);
+    await service.loadAccounts();
+
+    await expect(service.refreshQuotaCatalog({ force: true })).resolves.toMatchObject({
+      refreshed: 1,
+      failed: 0,
+    });
+
+    expect(upstream.refreshAccessToken).toHaveBeenCalledWith('refresh-acc-1', undefined, undefined);
+    expect(upstream.fetchQuota).toHaveBeenNthCalledWith(1, 'access-acc-1', undefined);
+    expect(upstream.fetchQuota).toHaveBeenNthCalledWith(2, 'access-after-401', undefined);
+  });
+
+  it('cools down repeated forced refreshes for a still-unknown model', async () => {
+    const accounts = [account('acc-1', quota({ 'gemini-old-flash-high': 10 }))];
+    const upstream = createUpstream({
+      fetchQuota: vi.fn().mockResolvedValue(quota({ 'gemini-old-flash-high': 10 })),
+    });
+    service = new AccountLeaseService(createAccountStore(accounts), upstream);
+    await service.loadAccounts();
+
+    await expect(
+      service.getRefreshedModelCapableAccountCount('gemini-still-missing-high'),
+    ).resolves.toBe(0);
+    await expect(
+      service.getRefreshedModelCapableAccountCount('gemini-still-missing-high'),
+    ).resolves.toBe(0);
+
+    expect(upstream.fetchQuota).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not mark a cooldown-only catalog scan fresh for ten minutes', async () => {
+    const baseNowMs = 1_000_000;
+    const accounts = [account('acc-1', quota({ 'gemini-old-flash-high': 10 }))];
+    const upstream = createUpstream({
+      fetchQuota: vi
+        .fn()
+        .mockRejectedValueOnce(new Error('quota endpoint down'))
+        .mockResolvedValueOnce(quota({ 'gemini-new-flash-high': 66 })),
+    });
+    service = new AccountLeaseService(createAccountStore(accounts), upstream);
+    await service.loadAccounts();
+
+    await expect(
+      (service as any).quotaRefreshPolicy.refreshQuotaCatalog({ force: true, nowMs: baseNowMs }),
+    ).resolves.toMatchObject({ refreshed: 0, failed: 1 });
+    await expect(
+      (service as any).quotaRefreshPolicy.refreshQuotaCatalog({ nowMs: baseNowMs + 1_000 }),
+    ).resolves.toMatchObject({ refreshed: 0, skipped: 1, failed: 0 });
+    await expect(
+      (service as any).quotaRefreshPolicy.refreshQuotaCatalog({ nowMs: baseNowMs + 61_001 }),
+    ).resolves.toMatchObject({ refreshed: 1, skipped: 0, failed: 0 });
+
+    expect(upstream.fetchQuota).toHaveBeenCalledTimes(2);
+    expect(service.getAllCollectedModels()).toContain('gemini-new-flash-high');
+  });
+
+  it('does not resurrect an account removed while quota refresh is in flight', async () => {
+    const accounts = [account('acc-1', quota({ 'gemini-old-flash-high': 10 }))];
+    const store = createAccountStore(accounts);
+    let resolveQuota: ((value: CloudQuotaData) => void) | undefined;
+    const upstream = createUpstream({
+      fetchQuota: vi.fn(
+        () =>
+          new Promise<CloudQuotaData>((resolve) => {
+            resolveQuota = resolve;
+          }),
+      ),
+    });
+    service = new AccountLeaseService(store, upstream);
+    await service.loadAccounts();
+
+    const refresh = service.refreshQuotaCatalog({ force: true });
+    await Promise.resolve();
+    accounts.length = 0;
+    await service.reloadAllAccounts();
+    resolveQuota?.(quota({ 'gemini-new-flash-high': 66 }));
+
+    await expect(refresh).resolves.toMatchObject({ refreshed: 0, skipped: 1, failed: 0 });
+    expect(service.getAccountCount()).toBe(0);
+    expect(store.updateQuota).not.toHaveBeenCalled();
+  });
+
+  it('does not persist or cache an access token refreshed after account removal', async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const accounts = [account('acc-1', quota({ 'gemini-old-flash-high': 10 }), nowSec - 1)];
+    const store = createAccountStore(accounts);
+    let resolveRefresh: ((value: TokenResponse) => void) | undefined;
+    const upstream = createUpstream({
+      refreshAccessToken: vi.fn(
+        () =>
+          new Promise<TokenResponse>((resolve) => {
+            resolveRefresh = resolve;
+          }),
+      ),
+    });
+    service = new AccountLeaseService(store, upstream);
+    await service.loadAccounts();
+    const tokenData = (service as any).tokens.get('acc-1');
+
+    const selected = (service as any).finalizeSelectedToken('acc-1', tokenData, nowSec);
+    await Promise.resolve();
+    accounts.length = 0;
+    await service.reloadAllAccounts();
+    resolveRefresh?.({
+      access_token: 'access-after-removal',
+      expires_in: 7200,
+      token_type: 'Bearer',
+    });
+
+    await selected;
+    expect(service.getAccountCount()).toBe(0);
+    expect(store.updateToken).not.toHaveBeenCalled();
+  });
+
+  it('tears down the periodic quota catalog refresh lifecycle', async () => {
+    vi.useFakeTimers();
+    const accounts = [account('acc-1', quota({ 'gemini-old-flash-high': 10 }))];
+    const upstream = createUpstream({
+      fetchQuota: vi.fn().mockResolvedValue(quota({ 'gemini-new-flash-high': 66 })),
+    });
+    service = new AccountLeaseService(createAccountStore(accounts), upstream);
+
+    await service.onModuleInit();
+    expect(upstream.fetchQuota).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    expect(upstream.fetchQuota).toHaveBeenCalledTimes(2);
+
+    service.onModuleDestroy();
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    expect(upstream.fetchQuota).toHaveBeenCalledTimes(2);
   });
 
   it('passes oauth_client_key when refreshing token and persists refreshed key', async () => {

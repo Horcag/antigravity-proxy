@@ -125,6 +125,19 @@ curl http://127.0.0.1:8045/admin/status \
   -H "Authorization: Bearer $AG_PROXY_ADMIN_API_KEY"
 ```
 
+Refresh the cached account quota/model catalog without exporting tokens:
+
+```bash
+antigravity-proxy accounts refresh-quota --force
+```
+
+Headless deployments can set `AG_PROXY_UPSTREAM_VERSION` to the verified installed
+Antigravity client version, then restart the service. Google filters the available
+model catalog by client version; refreshing quotas with an outdated version can
+still return an older catalog. Keep this deployment setting aligned with the client
+used to validate upstream access. It does not create model aliases or bypass
+account capability checks.
+
 OpenAI-compatible request:
 
 ```bash

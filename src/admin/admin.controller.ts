@@ -53,6 +53,12 @@ export class AdminController {
     return this.adminService.reloadAccounts();
   }
 
+  @Post('admin/accounts/refresh-quota')
+  @UseGuards(AdminGuard)
+  refreshQuotaCatalog(@Query('force') force?: string) {
+    return this.adminService.refreshQuotaCatalog(isExplicitTrue(force));
+  }
+
   @Get('admin/oauth/url')
   @UseGuards(AdminGuard)
   oauthUrl(@Query('client_key') clientKey?: string) {

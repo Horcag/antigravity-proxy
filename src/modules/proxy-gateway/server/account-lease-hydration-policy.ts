@@ -68,14 +68,26 @@ export class AccountLeaseHydrationPolicy {
     this.syncTokenDataFromCache(accountId, tokenData);
   }
 
-  async refreshSelectedTokenLocked(
+  async refreshSelectedTokenAfterAuthFailure(
     accountId: string,
     tokenData: AccountLeaseTokenData,
     nowSeconds: number,
   ): Promise<void> {
+    await this.runAccountLock(this.refreshLocks, accountId, () =>
+      this.refreshSelectedTokenLocked(accountId, tokenData, nowSeconds, true),
+    );
+    this.syncTokenDataFromCache(accountId, tokenData);
+  }
+
+  async refreshSelectedTokenLocked(
+    accountId: string,
+    tokenData: AccountLeaseTokenData,
+    nowSeconds: number,
+    force = false,
+  ): Promise<void> {
     const tokenCache = this.options.getTokenCache();
     const latestToken = tokenCache.get(accountId);
-    if (latestToken && nowSeconds < latestToken.expiry_timestamp - 300) {
+    if (!force && latestToken && nowSeconds < latestToken.expiry_timestamp - 300) {
       Object.assign(tokenData, latestToken);
       this.options.logger.debug(
         `Access token already refreshed by another request for ${tokenData.email}`,
@@ -91,6 +103,12 @@ export class AccountLeaseHydrationPolicy {
         tokenToRefresh.upstream_proxy_url,
         tokenToRefresh.oauth_client_key,
       );
+      if (tokenCache.get(accountId) !== tokenToRefresh) {
+        this.options.logger.debug(
+          `Access token refresh result ignored for ${tokenToRefresh.email}; account cache changed`,
+        );
+        return;
+      }
       tokenToRefresh.access_token = refreshedToken.access_token;
       tokenToRefresh.refresh_token = refreshedToken.refresh_token ?? tokenToRefresh.refresh_token;
       tokenToRefresh.id_token = refreshedToken.id_token ?? tokenToRefresh.id_token;
@@ -101,7 +119,19 @@ export class AccountLeaseHydrationPolicy {
         refreshedToken.oauth_client_key,
       );
       Object.assign(tokenData, tokenToRefresh);
+      if (tokenCache.get(accountId) !== tokenToRefresh) {
+        this.options.logger.debug(
+          `Access token persistence skipped for ${tokenToRefresh.email}; account cache changed`,
+        );
+        return;
+      }
       await this.saveTokenState(accountId, tokenToRefresh);
+      if (tokenCache.get(accountId) !== tokenToRefresh) {
+        this.options.logger.debug(
+          `Access token cache update skipped for ${tokenToRefresh.email}; account cache changed`,
+        );
+        return;
+      }
       tokenCache.set(accountId, tokenToRefresh);
       this.options.logger.log(`Access token refreshed for ${tokenToRefresh.email}`);
     } catch (error) {

@@ -181,8 +181,8 @@ export class ProxyService {
     await this.retryPolicy.waitBeforeRetry(attemptIndex, maxRetries, label);
   }
 
-  private getModelRetryBudget(model: string): number {
-    const accountCount = this.accountLeaseService.getModelCapableAccountCount(model);
+  private async getModelRetryBudget(model: string): Promise<number> {
+    const accountCount = await this.accountLeaseService.getRefreshedModelCapableAccountCount(model);
     if (accountCount === 0) {
       throw new AccountPoolUnavailableException(
         `No account advertises a compatible upstream model for ${model}`,
@@ -216,7 +216,7 @@ export class ProxyService {
 
     // Retry loop
     let lastError: unknown = null;
-    const maxRetries = this.getModelRetryBudget(targetModel);
+    const maxRetries = await this.getModelRetryBudget(targetModel);
     const retryState = this.createTokenRetryState();
 
     for (let i = 0; i < maxRetries; i++) {
@@ -579,7 +579,7 @@ export class ProxyService {
     );
 
     let lastError: unknown = null;
-    const maxRetries = this.getModelRetryBudget(targetModel);
+    const maxRetries = await this.getModelRetryBudget(targetModel);
     const retryState = this.createTokenRetryState();
 
     for (let i = 0; i < maxRetries; i++) {
@@ -674,7 +674,7 @@ export class ProxyService {
     );
 
     let lastError: unknown = null;
-    const maxRetries = this.getModelRetryBudget(targetModel);
+    const maxRetries = await this.getModelRetryBudget(targetModel);
     const retryState = this.createTokenRetryState();
 
     for (let i = 0; i < maxRetries; i++) {
@@ -914,7 +914,7 @@ export class ProxyService {
 
     // Retry loop for account selection
     let lastError: unknown = null;
-    const maxRetries = this.getModelRetryBudget(targetModel);
+    const maxRetries = await this.getModelRetryBudget(targetModel);
     const retryState = this.createTokenRetryState();
 
     for (let i = 0; i < maxRetries; i++) {
