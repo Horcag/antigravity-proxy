@@ -346,4 +346,3 @@ export function resolveModelRoute(
   // 4. Fall through to system default mapping logic
   return mapClaudeModelToGemini(originalModel);
 }
-
