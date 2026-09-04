@@ -1433,15 +1433,21 @@ export class ProxyController {
 
   private validateAnthropicMaxTokens(maxTokens: unknown): void {
     const gatewayMaxTokens = 128_000;
+    if (maxTokens === 0) {
+      throw this.invalidRequest(
+        'prompt-cache-only mode is unsupported by this gateway',
+        'max_tokens',
+      );
+    }
     if (
       !isNumber(maxTokens) ||
       !Number.isFinite(maxTokens) ||
       !Number.isInteger(maxTokens) ||
-      maxTokens < 0 ||
+      maxTokens < 1 ||
       maxTokens > gatewayMaxTokens
     ) {
       throw this.invalidRequest(
-        `max_tokens must be an integer between 0 and ${gatewayMaxTokens}`,
+        `max_tokens must be an integer between 1 and ${gatewayMaxTokens}`,
         'max_tokens',
       );
     }

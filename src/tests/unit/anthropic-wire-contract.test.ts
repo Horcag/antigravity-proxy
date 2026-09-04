@@ -87,21 +87,29 @@ describe('Anthropic wire contract', () => {
     expect(reply.header).toHaveBeenCalledWith('request-id', requestId);
   });
 
-  it('accepts max_tokens of 0 and dispatches to handler', async () => {
-    const service = {
-      handleAnthropicMessages: vi.fn().mockResolvedValue({ id: 'msg_1', content: [] }),
-    };
+  it('rejects max_tokens of 0 before dispatch because prompt-cache-only mode is unsupported', async () => {
+    const service = { handleAnthropicMessages: vi.fn() };
     const controller = new ProxyController(service as never);
     const reply = createReply();
     const request = createRequest('zero-max-tokens');
 
-    await controller.anthropicMessages(validBody({ max_tokens: 0 }) as never, request as never, reply as never);
-
-    expect(service.handleAnthropicMessages).toHaveBeenCalledWith(
-      expect.objectContaining({ max_tokens: 0 }),
+    await invokeWithProtocolFilter(
+      controller,
+      validBody({ max_tokens: 0 }),
+      request,
+      reply,
     );
-    expect(reply.status).toHaveBeenCalledWith(200);
-    expect(reply.send).toHaveBeenCalledWith({ id: 'msg_1', content: [] });
+
+    expect(service.handleAnthropicMessages).not.toHaveBeenCalled();
+    expect(reply.status).toHaveBeenCalledWith(400);
+    expect(reply.sentBody).toMatchObject({
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        message: 'prompt-cache-only mode is unsupported by this gateway',
+      },
+      request_id: 'zero-max-tokens',
+    });
     expect(reply.header).toHaveBeenCalledWith('request-id', 'zero-max-tokens');
   });
 
