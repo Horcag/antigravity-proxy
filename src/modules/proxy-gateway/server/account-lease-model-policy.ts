@@ -73,6 +73,7 @@ export class AccountLeaseModelPolicy {
   }
 
   resolveUnrequestableSibling(
+    accountId: string,
     modelId: string,
     tokenData?: AccountLeaseTokenData,
   ): string | undefined {
@@ -97,7 +98,11 @@ export class AccountLeaseModelPolicy {
     const siblings: Array<{ priority: number; modelId: string }> = [];
     for (const collectedModel of candidateModels) {
       const collectedNormalized = normalizeModelId(collectedModel)?.toLowerCase();
-      if (!collectedNormalized || this.unrequestableModels.has(collectedNormalized)) {
+      if (
+        !collectedNormalized ||
+        this.unrequestableModels.has(collectedNormalized) ||
+        !proxyModelAvailabilityStore.isAvailable(accountId, collectedNormalized)
+      ) {
         continue;
       }
       const collectedMatch = MODEL_VARIANT_SUFFIX_PATTERN.exec(collectedNormalized);
@@ -116,7 +121,7 @@ export class AccountLeaseModelPolicy {
 
   getAllCollectedModels(): Set<string> {
     const allModels = new Set<string>();
-    for (const tokenData of this.options.getTokenCache().values()) {
+    for (const [accountId, tokenData] of this.options.getTokenCache()) {
       const describedModels = new Set<string>();
       for (const [modelId, modelInfo] of Object.entries(tokenData.quota?.models ?? {})) {
         const normalizedModelId = normalizeModelId(modelId)?.toLowerCase();
@@ -126,10 +131,7 @@ export class AccountLeaseModelPolicy {
         describedModels.add(normalizedModelId);
         const publicModelId =
           getPublicModelIdForDisplayName(modelInfo.display_name) ?? normalizedModelId;
-        if (
-          !this.unrequestableModels.has(normalizedModelId) &&
-          !this.unrequestableModels.has(publicModelId)
-        ) {
+        if (this.isCatalogModelAvailable(accountId, normalizedModelId, publicModelId)) {
           allModels.add(publicModelId);
         }
       }
@@ -139,7 +141,7 @@ export class AccountLeaseModelPolicy {
         if (
           normalizedModelId &&
           !describedModels.has(normalizedModelId) &&
-          !this.unrequestableModels.has(normalizedModelId)
+          this.isCatalogModelAvailable(accountId, normalizedModelId, normalizedModelId)
         ) {
           allModels.add(normalizedModelId);
         }
@@ -231,7 +233,11 @@ export class AccountLeaseModelPolicy {
     logRewrite = true,
   ): string {
     const tokenData = this.options.getTokenCache().get(accountId);
-    const unrequestableSibling = this.resolveUnrequestableSibling(mappedModel, tokenData);
+    const unrequestableSibling = this.resolveUnrequestableSibling(
+      accountId,
+      mappedModel,
+      tokenData,
+    );
     if (unrequestableSibling) {
       if (logRewrite) {
         this.options.logger.log(
@@ -333,6 +339,24 @@ export class AccountLeaseModelPolicy {
       }
     }
     return filtered;
+  }
+
+  /**
+   * The catalog reports public display presets but requests eventually resolve
+   * to provider ids. A hard failure recorded under either name must therefore
+   * suppress only that account's contribution to the catalog.
+   */
+  private isCatalogModelAvailable(
+    accountId: string,
+    providerModelId: string,
+    publicModelId: string,
+  ): boolean {
+    return (
+      !this.unrequestableModels.has(providerModelId) &&
+      !this.unrequestableModels.has(publicModelId) &&
+      proxyModelAvailabilityStore.isCapabilityAvailable(accountId, providerModelId) &&
+      proxyModelAvailabilityStore.isCapabilityAvailable(accountId, publicModelId)
+    );
   }
 
   private filterCapabilityModels(accountId: string, models: Set<string>): Set<string> {

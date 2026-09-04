@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   getAllDynamicModels,
   getOpenAICompatibleModels,
@@ -14,6 +14,7 @@ import { ProxyController } from '@/modules/proxy-gateway/server/proxy.controller
 import { GeminiController } from '@/modules/proxy-gateway/server/gemini.controller';
 import { ProxyModelRoutingPolicy } from '@/modules/proxy-gateway/server/proxy-model-routing-policy';
 import { AccountLeaseModelPolicy } from '@/modules/proxy-gateway/server/account-lease-model-policy';
+import { proxyModelAvailabilityStore } from '@/modules/proxy-gateway/server/proxy-model-availability-store';
 import type { OpenAIChatRequest } from '@/modules/proxy-gateway/server/interfaces/request-interfaces';
 import type { AccountLeaseTokenData } from '@/modules/proxy-gateway/server/account-lease-token-types';
 
@@ -47,6 +48,45 @@ const FOUR_CATEGORIES_WITHOUT_CIVIC = [
   'HARM_CATEGORY_SEXUALLY_EXPLICIT',
   'HARM_CATEGORY_DANGEROUS_CONTENT',
 ];
+
+const MODEL_POLICY_TEST_ACCOUNT_IDS = [
+  'catalog-only-account',
+  'catalog-capable-account',
+  'catalog-cooldown-account',
+  'catalog-display-account',
+  'sibling-account',
+];
+
+function modelToken(accountId: string, modelQuotas: Record<string, number>): AccountLeaseTokenData {
+  return {
+    account_id: accountId,
+    email: `${accountId}@test.dev`,
+    access_token: `access-${accountId}`,
+    refresh_token: `refresh-${accountId}`,
+    token_type: 'Bearer',
+    expires_in: 3600,
+    expiry_timestamp: Math.floor(Date.now() / 1000) + 3600,
+    model_quotas: modelQuotas,
+    model_limits: {},
+    model_reset_times: {},
+    model_forwarding_rules: {},
+  };
+}
+
+function createModelPolicy(
+  tokenCache: Map<string, AccountLeaseTokenData>,
+): AccountLeaseModelPolicy {
+  return new AccountLeaseModelPolicy({
+    getTokenCache: () => tokenCache,
+    logger: { log: vi.fn(), warn: vi.fn() } as any,
+  });
+}
+
+afterEach(() => {
+  for (const accountId of MODEL_POLICY_TEST_ACCOUNT_IDS) {
+    proxyModelAvailabilityStore.clearAccount(accountId);
+  }
+});
 
 describe('Model-Family Safety Settings Resolution (acdc530f)', () => {
   it.each([
@@ -147,12 +187,14 @@ describe('Truthful Model Catalog (/v1/models and /v1beta/models)', () => {
     const discovered = [
       'gemini-3-flash',
       'gemini-3.5-flash-high',
+      'gemini-3.8-flash-tiered',
       'gemini-3.1-flash-image',
       'gemini-3-pro-image',
       'chat_20706',
       'chat_23310',
       'tab_flash_lite_preview',
       'tab_jump_flash_lite_preview',
+      'claude-sonnet-4-6-thinking',
       'gpt-oss-120b-medium',
     ];
 
@@ -160,6 +202,8 @@ describe('Truthful Model Catalog (/v1/models and /v1beta/models)', () => {
     // Discovered chat models are present
     expect(openAIModels).toContain('gemini-3-flash');
     expect(openAIModels).toContain('gemini-3.5-flash-high');
+    expect(openAIModels).toContain('gemini-3.8-flash-tiered');
+    expect(openAIModels).toContain('claude-sonnet-4-6-thinking');
     expect(openAIModels).toContain('gpt-oss-120b-medium');
 
     // Image-only models are hidden from OpenAI catalog
@@ -365,6 +409,93 @@ describe('Request compatibility for legacy aliases', () => {
     expect(policy.resolveDynamicModelForAccount('acc-1', 'gemini-3.8-flash-high')).toBe(
       'gemini-3.8-flash-low',
     );
+  });
+
+  it('never rewrites an unrequestable sibling to an account model in cooldown', () => {
+    const policy = createModelPolicy(
+      new Map([
+        [
+          'sibling-account',
+          modelToken('sibling-account', {
+            'gemini-3.8-flash-high': 99,
+            'gemini-3.8-flash-low': 99,
+          }),
+        ],
+      ]),
+    );
+
+    policy.markModelUnrequestable('gemini-3.8-flash-high');
+    proxyModelAvailabilityStore.mark(
+      'sibling-account',
+      'gemini-3.8-flash-low',
+      'quota_exhausted',
+    );
+
+    expect(policy.resolveDynamicModelForAccount('sibling-account', 'gemini-3.8-flash-high')).toBe(
+      'gemini-3.8-flash-high',
+    );
+  });
+
+  it('publishes the union of capability-eligible account models without cooldown erasure', () => {
+    const policy = createModelPolicy(
+      new Map([
+        [
+          'catalog-only-account',
+          modelToken('catalog-only-account', { 'gemini-3.1-pro-image': 99 }),
+        ],
+        [
+          'catalog-capable-account',
+          modelToken('catalog-capable-account', { 'gemini-3.1-pro-image': 99 }),
+        ],
+        [
+          'catalog-cooldown-account',
+          modelToken('catalog-cooldown-account', { 'gemini-3.5-flash-high': 99 }),
+        ],
+      ]),
+    );
+
+    proxyModelAvailabilityStore.mark(
+      'catalog-only-account',
+      'gemini-3.1-pro-image',
+      'model_not_supported',
+    );
+    proxyModelAvailabilityStore.mark(
+      'catalog-cooldown-account',
+      'gemini-3.5-flash-high',
+      'quota_exhausted',
+    );
+
+    const models = policy.getAllCollectedModels();
+    expect(models).toContain('gemini-3.1-pro-image');
+    expect(models).toContain('gemini-3.5-flash-high');
+
+    proxyModelAvailabilityStore.mark(
+      'catalog-capable-account',
+      'gemini-3.1-pro-image',
+      'model_forbidden',
+    );
+    expect(policy.getAllCollectedModels()).not.toContain('gemini-3.1-pro-image');
+  });
+
+  it('uses raw provider capability state for display-mapped catalog entries', () => {
+    const token = modelToken('catalog-display-account', {});
+    token.quota = {
+      models: {
+        'provider-gemini-3.1-pro-high': {
+          display_name: 'Gemini 3.1 Pro (High)',
+        },
+      },
+    } as any;
+    const policy = createModelPolicy(new Map([['catalog-display-account', token]]));
+
+    expect(policy.getAllCollectedModels()).toEqual(new Set(['gemini-3.1-pro-high']));
+
+    proxyModelAvailabilityStore.mark(
+      'catalog-display-account',
+      'provider-gemini-3.1-pro-high',
+      'model_not_supported',
+    );
+    expect(policy.getAllCollectedModels()).toEqual(new Set());
   });
 
   it('ProxyController accepts chat completion requests with legacy aliases', async () => {
