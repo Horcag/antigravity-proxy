@@ -57,6 +57,10 @@ export class ProxyModelAvailabilityStore {
     }
   }
 
+  clearModel(accountId: string, modelId: string): void {
+    this.entries.delete(createKey(accountId, modelId));
+  }
+
   clearCapabilityFailures(accountId: string): void {
     for (const [key, entry] of this.entries) {
       if (

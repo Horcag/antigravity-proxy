@@ -261,6 +261,7 @@ export class ProxyService {
             token.token.upstream_proxy_url,
             extraHeaders,
           );
+          this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
           return this.processAnthropicInternalStream(
             stream,
             geminiBody.model,
@@ -274,6 +275,7 @@ export class ProxyService {
             token.token.upstream_proxy_url,
             extraHeaders,
           );
+          this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
           return this.toAnthropicChatResponse(
             transformResponse(response, signatureContext, request.model),
           );
@@ -301,6 +303,7 @@ export class ProxyService {
                 token.token.upstream_proxy_url,
                 extraHeaders,
               );
+              this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
               return this.processAnthropicInternalStream(
                 stream,
                 fallbackBody.model,
@@ -314,6 +317,7 @@ export class ProxyService {
                 token.token.upstream_proxy_url,
                 extraHeaders,
               );
+              this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
               return this.toAnthropicChatResponse(
                 transformResponse(response, signatureContext, request.model),
               );
@@ -351,6 +355,7 @@ export class ProxyService {
                 token.token.upstream_proxy_url,
                 extraHeaders,
               );
+              this.retryPolicy.markUpstreamSuccess(token.id, 'gemini-3-flash');
               return this.processAnthropicInternalStream(
                 stream,
                 downgradedBody.model,
@@ -364,6 +369,7 @@ export class ProxyService {
                 token.token.upstream_proxy_url,
                 extraHeaders,
               );
+              this.retryPolicy.markUpstreamSuccess(token.id, 'gemini-3-flash');
               const transformed = this.toAnthropicChatResponse(
                 transformResponse(response, downgradedSignatureContext, request.model),
               );
@@ -618,6 +624,7 @@ export class ProxyService {
           extraHeaders,
         );
 
+        this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
         return this.normalizeGeminiGenerateResponse(response);
       } catch (err) {
         if (err instanceof Error && this.isProjectContextError(err.message)) {
@@ -640,6 +647,7 @@ export class ProxyService {
               token.token.upstream_proxy_url,
               extraHeaders,
             );
+            this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
             return this.normalizeGeminiGenerateResponse(response);
           } catch (fallbackErr) {
             lastError = fallbackErr;
@@ -716,6 +724,7 @@ export class ProxyService {
           token.token.upstream_proxy_url,
           extraHeaders,
         );
+        this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
         return this.passthroughSseStream(stream);
       } catch (err) {
         if (err instanceof Error && this.isProjectContextError(err.message)) {
@@ -738,6 +747,7 @@ export class ProxyService {
               token.token.upstream_proxy_url,
               extraHeaders,
             );
+            this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
             return this.passthroughSseStream(stream);
           } catch (fallbackErr) {
             lastError = fallbackErr;
@@ -966,6 +976,7 @@ export class ProxyService {
               token.token.upstream_proxy_url,
               extraHeaders,
             );
+            this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
             return this.createOpenAIProtocolStream(
               stream,
               request.model,
@@ -990,6 +1001,7 @@ export class ProxyService {
               token.token.upstream_proxy_url,
               extraHeaders,
             );
+            this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
             const claudeResponse = transformResponse(response, signatureContext);
             const openaiResponse = this.convertClaudeToOpenAIResponse(
               claudeResponse,
@@ -1008,6 +1020,7 @@ export class ProxyService {
             token.token.upstream_proxy_url,
             extraHeaders,
           );
+          this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
           // Transform Gemini response to OpenAI format
           const claudeResponse = transformResponse(response, signatureContext);
           return this.convertClaudeToOpenAIResponse(
@@ -1039,6 +1052,7 @@ export class ProxyService {
                 token.token.upstream_proxy_url,
                 extraHeaders,
               );
+              this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
               return this.createOpenAIProtocolStream(
                 stream,
                 request.model,
@@ -1055,6 +1069,7 @@ export class ProxyService {
               token.token.upstream_proxy_url,
               extraHeaders,
             );
+            this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
             const claudeResponse = transformResponse(response, signatureContext);
             return this.convertClaudeToOpenAIResponse(
               claudeResponse,

@@ -42,6 +42,7 @@ function createAccountLeaseService(accounts: CloudAccount[]) {
     markAsForbidden: vi.fn(),
     markAsRateLimited: vi.fn(),
     markFromUpstreamError: vi.fn().mockResolvedValue(undefined),
+    markModelSuccess: vi.fn(),
     markModelUnrequestable: vi.fn(),
   };
 }
@@ -84,6 +85,10 @@ describe('ProxyService account failover', () => {
 
     expect(geminiClient.generateInternal).toHaveBeenCalledTimes(5);
     expect(accountLeaseService.getNextToken).toHaveBeenCalledTimes(5);
+    expect(accountLeaseService.markModelSuccess).toHaveBeenCalledWith(
+      'acc-5',
+      'gemini-3.1-flash-image',
+    );
     expect(
       accountLeaseService.getNextToken.mock.calls.map(
         ([options]) => options?.excludeAccountIds,

@@ -192,4 +192,29 @@ describe('ProxyRetryPolicy', () => {
       ),
     ).toBe(false);
   });
+
+  it.each([401, 403, 429, 500, 503])(
+    'keeps retry eligibility for upstream status %i',
+    async (status) => {
+      const { policy, accountLeaseService } = createPolicy();
+
+      await expect(
+        policy.applyUpstreamPenalty(
+          'acc-1',
+          'gemini-3-flash',
+          new UpstreamRequestError({ message: `upstream ${status}`, status }),
+        ),
+      ).resolves.toBe(true);
+
+      if (status === 401 || status === 403) {
+        expect(accountLeaseService.markAsForbidden).toHaveBeenCalledWith('acc-1');
+        expect(accountLeaseService.markFromUpstreamError).not.toHaveBeenCalled();
+        return;
+      }
+
+      expect(accountLeaseService.markFromUpstreamError).toHaveBeenCalledWith(
+        expect.objectContaining({ accountIdOrEmail: 'acc-1', status }),
+      );
+    },
+  );
 });

@@ -186,6 +186,10 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     this.limitPolicy.markAsForbidden(accountIdOrEmail);
   }
 
+  markModelSuccess(accountIdOrEmail: string, model: string): void {
+    this.limitPolicy.markModelSuccess(accountIdOrEmail, model);
+  }
+
   async markFromUpstreamError(params: AccountLeaseUpstreamErrorParams): Promise<void> {
     await this.limitPolicy.markFromUpstreamError(params);
   }

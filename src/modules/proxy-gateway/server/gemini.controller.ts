@@ -37,6 +37,18 @@ type GeminiModelMetadata = {
   version: string;
 };
 
+const NATIVE_GEMINI_STATUS_TO_HTTP: Record<string, HttpStatus> = {
+  INVALID_ARGUMENT: HttpStatus.BAD_REQUEST,
+  UNAUTHENTICATED: HttpStatus.UNAUTHORIZED,
+  PERMISSION_DENIED: HttpStatus.FORBIDDEN,
+  NOT_FOUND: HttpStatus.NOT_FOUND,
+  RESOURCE_EXHAUSTED: HttpStatus.TOO_MANY_REQUESTS,
+  FAILED_PRECONDITION: HttpStatus.BAD_REQUEST,
+  ABORTED: HttpStatus.CONFLICT,
+  UNIMPLEMENTED: HttpStatus.NOT_IMPLEMENTED,
+  UNAVAILABLE: HttpStatus.SERVICE_UNAVAILABLE,
+};
+
 @Controller('v1beta')
 @UseGuards(ProxyGuard)
 export class GeminiController {
@@ -139,12 +151,7 @@ export class GeminiController {
         `Unsupported model action: ${action}`,
       );
     } catch (error) {
-      const status =
-        error instanceof UpstreamRequestError
-          ? error.status
-          : error instanceof HttpException
-            ? error.getStatus()
-            : undefined;
+      const status = this.resolveErrorStatus(error);
       const retryAfter =
         error instanceof UpstreamRequestError ? error.headers?.retryAfter : undefined;
       this.sendGoogleErrorResponse(
@@ -244,6 +251,29 @@ export class GeminiController {
     return status >= HttpStatus.BAD_REQUEST && status <= 599
       ? status
       : HttpStatus.INTERNAL_SERVER_ERROR;
+  }
+
+  private resolveErrorStatus(error: unknown): number | undefined {
+    if (error instanceof HttpException) {
+      return error.getStatus();
+    }
+    if (!(error instanceof UpstreamRequestError)) {
+      return undefined;
+    }
+    if (error.status && this.normalizeGoogleHttpStatus(error.status) === error.status) {
+      return error.status;
+    }
+
+    try {
+      const parsed = JSON.parse(error.body ?? '') as { error?: { status?: unknown } };
+      const nativeStatus = parsed.error?.status;
+      if (isString(nativeStatus)) {
+        return NATIVE_GEMINI_STATUS_TO_HTTP[nativeStatus.trim().toUpperCase()];
+      }
+    } catch {
+      // A malformed upstream body must preserve the generic error fallback.
+    }
+    return undefined;
   }
 
   private normalizeGeminiUsageMetadata(

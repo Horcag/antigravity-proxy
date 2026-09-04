@@ -25,6 +25,7 @@ export interface ProxyRetryAccountLeaseService {
     body?: string;
     model?: string;
   }): Promise<void>;
+  markModelSuccess?(accountIdOrEmail: string, model: string): void;
 }
 
 interface ProxyRetryLogger {
@@ -89,6 +90,15 @@ export class ProxyRetryPolicy {
       error instanceof UpstreamRequestError &&
       (error.status === 401 || error.status === 403 || error.status === 429)
     );
+  }
+
+  markUpstreamSuccess(accountId: string, model?: string): void {
+    if (!model) {
+      return;
+    }
+
+    this.accountLeaseService.markModelSuccess?.(accountId, model);
+    proxyModelAvailabilityStore.clearModel(accountId, model);
   }
 
   async applyUpstreamPenalty(accountId: string, model: string, error: unknown): Promise<boolean> {

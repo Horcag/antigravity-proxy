@@ -1,4 +1,5 @@
 import { isEmpty, isNumber, isObjectLike, isString } from 'lodash-es';
+import { normalizeModelId } from './account-lease-token-types';
 
 export enum RateLimitReason {
   QuotaExhausted = 'quota_exhausted',
@@ -38,6 +39,7 @@ interface ParsedGoogleErrorBody {
 }
 
 const FAILURE_COUNT_EXPIRY_MS = 60 * 60 * 1000;
+const MAX_RETRY_DELAY_MS = 24 * 60 * 60 * 1000;
 const MAX_RETRY_DELAY_SEARCH_DEPTH = 8;
 const GRACE_RETRY_WINDOW_MS = 2000;
 export const GRACE_RETRY_BUFFER_MS = 1500;
@@ -58,15 +60,41 @@ function toLowerText(value: string | undefined): string {
   return (value ?? '').toLowerCase();
 }
 
+export function hasGenericResourceExhaustedSignal(body: string | undefined): boolean {
+  const lowerBody = toLowerText(body);
+  return (
+    lowerBody.includes('resource has been exhausted') || lowerBody.includes('resource_exhausted')
+  );
+}
+
+export function hasExplicitQuotaExhaustedSignal(body: string | undefined): boolean {
+  const lowerBody = toLowerText(body);
+  return (
+    lowerBody.includes('quota_exhausted') ||
+    lowerBody.includes('quota exceeded') ||
+    lowerBody.includes('quotaresetdelay') ||
+    lowerBody.includes('quota reset') ||
+    lowerBody.includes('quota limit') ||
+    lowerBody.includes('quota will reset') ||
+    lowerBody.includes('per day') ||
+    lowerBody.includes('daily quota')
+  );
+}
+
 function parseDurationToMilliseconds(text: string): number | null {
+  const trimmed = text.trim();
+  if (trimmed.startsWith('-')) {
+    return null;
+  }
+
   const durationRegex = /([\d.]+)\s*(ms|s|m|h)/gi;
   let totalMs = 0;
   let matched = false;
 
-  for (const match of text.matchAll(durationRegex)) {
+  for (const match of trimmed.matchAll(durationRegex)) {
     matched = true;
     const value = Number(match[1]);
-    if (!Number.isFinite(value)) {
+    if (!Number.isFinite(value) || value < 0) {
       return null;
     }
 
@@ -75,10 +103,18 @@ function parseDurationToMilliseconds(text: string): number | null {
   }
 
   if (!matched) {
+    const numericValue = Number(trimmed);
+    if (!Number.isFinite(numericValue) || numericValue <= 0) {
+      return null;
+    }
+    totalMs = numericValue * 1000;
+  }
+
+  if (!Number.isFinite(totalMs) || totalMs <= 0) {
     return null;
   }
 
-  return Math.round(totalMs);
+  return Math.min(Math.round(totalMs), MAX_RETRY_DELAY_MS);
 }
 
 function parseDurationToSeconds(text: string): number | null {
@@ -130,14 +166,31 @@ function parseStructuredDurationObject(value: unknown): number | null {
   }
 
   const obj = value as Record<string, unknown>;
-  const seconds = Number(obj.seconds ?? obj.Seconds ?? 0);
-  const nanos = Number(obj.nanos ?? obj.Nanos ?? 0);
+  const rawSeconds = obj.seconds ?? obj.Seconds;
+  const rawNanos = obj.nanos ?? obj.Nanos;
 
-  if ((!Number.isFinite(seconds) || seconds <= 0) && (!Number.isFinite(nanos) || nanos <= 0)) {
+  if (rawSeconds === undefined && rawNanos === undefined) {
     return null;
   }
 
-  return Math.round(Math.max(0, seconds) * 1000 + Math.max(0, nanos) / 1_000_000);
+  const seconds = Number(rawSeconds ?? 0);
+  const nanos = Number(rawNanos ?? 0);
+  if (
+    !Number.isFinite(seconds) ||
+    seconds < 0 ||
+    !Number.isFinite(nanos) ||
+    nanos < 0 ||
+    nanos >= 1_000_000_000
+  ) {
+    return null;
+  }
+
+  const totalMs = Math.round(seconds * 1000 + nanos / 1_000_000);
+  if (totalMs <= 0) {
+    return null;
+  }
+
+  return Math.min(totalMs, MAX_RETRY_DELAY_MS);
 }
 
 function parseStructuredDurationValue(value: unknown): number | null {
@@ -145,8 +198,8 @@ function parseStructuredDurationValue(value: unknown): number | null {
     return parseDurationToMilliseconds(value);
   }
 
-  if (isNumber(value) && value > 0) {
-    return Math.round(value * 1000);
+  if (isNumber(value) && Number.isFinite(value) && value > 0) {
+    return Math.min(Math.round(value * 1000), MAX_RETRY_DELAY_MS);
   }
 
   return parseStructuredDurationObject(value);
@@ -226,10 +279,31 @@ export class RateLimitTracker {
   private readonly failureCounts = new Map<string, FailureCountEntry>();
 
   private buildLockoutKey(accountId: string, model?: string): string {
-    if (!isEmpty(model?.trim() ?? '')) {
-      return `${accountId}:${model}`;
+    const normalizedModel = normalizeModelId(model);
+    if (normalizedModel) {
+      return `${accountId}:${normalizedModel}`;
     }
     return accountId;
+  }
+
+  private isModelScopedReason(reason: RateLimitReason): boolean {
+    return (
+      reason === RateLimitReason.QuotaExhausted ||
+      reason === RateLimitReason.RateLimitExceeded ||
+      reason === RateLimitReason.ModelCapacityExhausted
+    );
+  }
+
+  private buildFailureCountKey(
+    accountId: string,
+    reason: RateLimitReason,
+    model?: string,
+  ): string {
+    const normalizedModel = normalizeModelId(model);
+    if (normalizedModel && this.isModelScopedReason(reason)) {
+      return `${accountId}:${reason}:${normalizedModel}`;
+    }
+    return `${accountId}:${reason}`;
   }
 
   getRemainingWaitSeconds(accountId: string, model?: string): number {
@@ -293,6 +367,10 @@ export class RateLimitTracker {
     return this.lockoutByKey.delete(accountId);
   }
 
+  clearModel(accountId: string, model: string): boolean {
+    return this.lockoutByKey.delete(this.buildLockoutKey(accountId, model));
+  }
+
   clearAll(): number {
     const size = this.lockoutByKey.size;
     this.lockoutByKey.clear();
@@ -312,8 +390,26 @@ export class RateLimitTracker {
   }
 
   markSuccess(accountId: string): void {
-    this.failureCounts.delete(accountId);
+    for (const key of this.failureCounts.keys()) {
+      if (key.startsWith(`${accountId}:`)) {
+        this.failureCounts.delete(key);
+      }
+    }
     this.lockoutByKey.delete(accountId);
+  }
+
+  markModelSuccess(accountId: string, model: string): void {
+    const normalizedModel = normalizeModelId(model);
+    if (!normalizedModel) {
+      return;
+    }
+
+    for (const key of this.failureCounts.keys()) {
+      if (key.startsWith(`${accountId}:`) && key.endsWith(`:${normalizedModel}`)) {
+        this.failureCounts.delete(key);
+      }
+    }
+    this.clearModel(accountId, normalizedModel);
   }
 
   trackFromUpstreamError(params: {
@@ -336,6 +432,7 @@ export class RateLimitTracker {
       retryAfter: params.retryAfter,
       body: params.body,
       accountId: params.accountId,
+      model: params.model,
       backoffSteps: params.backoffSteps,
     });
 
@@ -346,7 +443,7 @@ export class RateLimitTracker {
       model: params.model,
     };
 
-    const useModelKey = reason === RateLimitReason.QuotaExhausted && Boolean(params.model);
+    const useModelKey = this.isModelScopedReason(reason) && Boolean(normalizeModelId(params.model));
     const key = useModelKey
       ? this.buildLockoutKey(params.accountId, params.model)
       : params.accountId;
@@ -380,9 +477,6 @@ export class RateLimitTracker {
     }
 
     const statusFromBody = parsedBody?.error?.status?.trim().toUpperCase();
-    if (statusFromBody === 'RESOURCE_EXHAUSTED') {
-      return RateLimitReason.QuotaExhausted;
-    }
     if (statusFromBody === 'UNAVAILABLE') {
       const loweredBody = toLowerText(body);
       if (loweredBody.includes('no capacity available') || loweredBody.includes('model capacity')) {
@@ -395,11 +489,15 @@ export class RateLimitTracker {
     }
 
     const lowerBody = toLowerText(body);
+    const hasGenericResourceExhausted =
+      statusFromBody === 'RESOURCE_EXHAUSTED' || hasGenericResourceExhaustedSignal(body);
+    const hasExplicitQuotaExhausted = hasExplicitQuotaExhaustedSignal(body);
     if (
       lowerBody.includes('per minute') ||
       lowerBody.includes('rate limit') ||
       lowerBody.includes('rate_limit') ||
-      lowerBody.includes('too many requests')
+      lowerBody.includes('too many requests') ||
+      (hasGenericResourceExhausted && !hasExplicitQuotaExhausted)
     ) {
       return RateLimitReason.RateLimitExceeded;
     }
@@ -409,7 +507,7 @@ export class RateLimitTracker {
     ) {
       return RateLimitReason.ModelCapacityExhausted;
     }
-    if (lowerBody.includes('quota') || lowerBody.includes('exhausted')) {
+    if (hasExplicitQuotaExhausted || lowerBody.includes('quota')) {
       return RateLimitReason.QuotaExhausted;
     }
 
@@ -422,6 +520,7 @@ export class RateLimitTracker {
     retryAfter?: string;
     body?: string;
     accountId: string;
+    model?: string;
     backoffSteps: number[];
   }): number {
     const headerRetryRaw = params.retryAfter?.trim() ?? '';
@@ -447,7 +546,9 @@ export class RateLimitTracker {
 
     const failureCount =
       params.reason !== RateLimitReason.ServerError
-        ? this.incrementFailureCount(params.accountId)
+        ? this.incrementFailureCount(
+            this.buildFailureCountKey(params.accountId, params.reason, params.model),
+          )
         : 1;
 
     if (params.reason === RateLimitReason.QuotaExhausted) {

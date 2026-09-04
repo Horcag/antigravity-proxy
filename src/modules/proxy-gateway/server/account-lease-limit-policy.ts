@@ -1,5 +1,11 @@
 import { isEmpty, isString } from 'lodash-es';
-import { RateLimitReason, RateLimitTracker } from './rate-limit-tracker';
+import {
+  hasExplicitQuotaExhaustedSignal,
+  hasGenericResourceExhaustedSignal,
+  parseRetryDelayMilliseconds,
+  RateLimitReason,
+  RateLimitTracker,
+} from './rate-limit-tracker';
 import { normalizeModelId } from './account-lease-token-types';
 
 export interface AccountLeaseUpstreamErrorParams {
@@ -30,13 +36,16 @@ interface AccountLeaseLimitPolicyOptions {
     model?: string,
   ) => boolean;
   logger: AccountLeaseLimitLogger;
+  rateLimitTracker?: RateLimitTracker;
 }
 
 export class AccountLeaseLimitPolicy {
   private readonly accountCooldowns = new Map<string, number>();
-  private readonly rateLimitTracker = new RateLimitTracker();
+  private readonly rateLimitTracker: RateLimitTracker;
 
-  constructor(private readonly options: AccountLeaseLimitPolicyOptions) {}
+  constructor(private readonly options: AccountLeaseLimitPolicyOptions) {
+    this.rateLimitTracker = options.rateLimitTracker ?? new RateLimitTracker();
+  }
 
   getAccountCooldowns(): Map<string, number> {
     return this.accountCooldowns;
@@ -49,6 +58,11 @@ export class AccountLeaseLimitPolicy {
   clearAllRateLimits(): void {
     this.accountCooldowns.clear();
     this.rateLimitTracker.clearAll();
+  }
+
+  markModelSuccess(accountIdOrEmail: string, model: string): void {
+    const accountId = this.resolveAccountId(accountIdOrEmail);
+    this.rateLimitTracker.markModelSuccess(accountId, model);
   }
 
   isRateLimited(accountIdOrEmail: string, model?: string): boolean {
@@ -74,7 +88,7 @@ export class AccountLeaseLimitPolicy {
     const normalizedModel = normalizeModelId(params.model);
     const hasExplicitRetryWindow =
       Boolean(isString(params.retryAfter) && !isEmpty(params.retryAfter.trim())) ||
-      Boolean(params.body && params.body.includes('quotaResetDelay'));
+      parseRetryDelayMilliseconds(params.body) !== null;
 
     if (!hasExplicitRetryWindow && (params.status ?? 0) === 429) {
       const reason = this.detectRateLimitReasonFromBody(params.body);
@@ -127,11 +141,12 @@ export class AccountLeaseLimitPolicy {
       return;
     }
 
-    if (
-      parsed.reason !== RateLimitReason.QuotaExhausted ||
-      !parsed.model ||
-      isEmpty(parsed.model.trim())
-    ) {
+    const isModelScoped =
+      Boolean(parsed.model && !isEmpty(parsed.model.trim())) &&
+      (parsed.reason === RateLimitReason.QuotaExhausted ||
+        parsed.reason === RateLimitReason.RateLimitExceeded ||
+        parsed.reason === RateLimitReason.ModelCapacityExhausted);
+    if (!isModelScoped) {
       this.accountCooldowns.set(accountId, Date.now() + parsed.retryAfterSec * 1000);
     }
 
@@ -147,15 +162,16 @@ export class AccountLeaseLimitPolicy {
     if (lowerBody.includes('model_capacity')) {
       return RateLimitReason.ModelCapacityExhausted;
     }
-    if (lowerBody.includes('exhausted') || lowerBody.includes('quota')) {
-      return RateLimitReason.QuotaExhausted;
-    }
     if (
       lowerBody.includes('per minute') ||
       lowerBody.includes('rate limit') ||
-      lowerBody.includes('rate_limit')
+      lowerBody.includes('rate_limit') ||
+      (hasGenericResourceExhaustedSignal(body) && !hasExplicitQuotaExhaustedSignal(body))
     ) {
       return RateLimitReason.RateLimitExceeded;
+    }
+    if (hasExplicitQuotaExhaustedSignal(body) || lowerBody.includes('quota')) {
+      return RateLimitReason.QuotaExhausted;
     }
     return RateLimitReason.Unknown;
   }
