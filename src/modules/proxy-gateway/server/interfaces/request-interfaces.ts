@@ -218,6 +218,7 @@ export interface GeminiGenerationConfig {
   maxOutputTokens?: number;
   topP?: number;
   topK?: number;
+  responseModalities?: string[];
 }
 
 export interface GeminiResponse {

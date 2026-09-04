@@ -3075,22 +3075,11 @@ export class ProxyController {
     res: FastifyReply,
   ): Promise<void> {
     try {
-      const result = await this.proxyService.handleChatCompletions(request);
-      if (result instanceof Observable) {
-        this.logProxyEndpointError(
-          endpoint,
-          HttpStatus.INTERNAL_SERVER_ERROR,
-          'Streaming image generation is not supported by this endpoint',
-        );
-        sendOpenAIProtocolError(
-          res,
-          this.invalidRequest('Streaming image generation is not supported by this endpoint'),
-        );
-        return;
-      }
-
-      const content = result.choices?.[0]?.message?.content;
-      const image = this.extractInlineBase64Image(isString(content) ? content : '');
+      const result = await this.proxyService.handleGeminiGenerateContent(
+        request.model ?? OPENAI_COMPATIBLE_DEFAULT_MODELS.images,
+        this.buildGeminiImageRequest(request, prompt),
+      );
+      const image = this.extractInlineBase64ImageFromGeminiResponse(result);
       if (!image) {
         this.logProxyEndpointError(
           endpoint,
@@ -3116,41 +3105,6 @@ export class ProxyController {
         ],
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Internal Server Error';
-
-      if (this.isProjectContextErrorMessage(message)) {
-        try {
-          const geminiRequest = this.buildGeminiImageRequest(request, prompt);
-          const geminiResult = await this.proxyService.handleGeminiGenerateContent(
-            request.model ?? 'gemini-3-pro-image',
-            geminiRequest,
-          );
-          const fallbackImage = this.extractInlineBase64ImageFromGeminiResponse(geminiResult);
-          if (fallbackImage) {
-            res.status(HttpStatus.OK).send({
-              created: Math.floor(Date.now() / 1000),
-              data: [
-                {
-                  b64_json: fallbackImage.data,
-                },
-              ],
-            });
-            return;
-          }
-          sendOpenAIProtocolError(
-            res,
-            new OpenAIProtocolException(
-              'Upstream did not return inline image data',
-              HttpStatus.BAD_GATEWAY,
-            ),
-          );
-          return;
-        } catch (fallbackError) {
-          this.sendOpenAIErrorResponse(res, endpoint, fallbackError);
-          return;
-        }
-      }
-
       this.sendOpenAIErrorResponse(res, endpoint, error);
     }
   }
@@ -3246,17 +3200,10 @@ export class ProxyController {
           parts,
         },
       ],
+      generationConfig: {
+        responseModalities: ['IMAGE'],
+      },
     };
-  }
-
-  private isProjectContextErrorMessage(message: string): boolean {
-    const lowered = message.toLowerCase();
-    return (
-      lowered.includes('#3501') ||
-      (lowered.includes('google cloud project') && lowered.includes('code assist license')) ||
-      (lowered.includes('resource projects/') && lowered.includes('could not be found')) ||
-      (lowered.includes('project') && lowered.includes('not found'))
-    );
   }
 
   private hasMultipartBoundary(req: FastifyRequest): boolean {
