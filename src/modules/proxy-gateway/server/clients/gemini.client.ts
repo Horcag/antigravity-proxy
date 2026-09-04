@@ -400,9 +400,7 @@ export class GeminiClient {
 
           if (this.shouldRetryWithoutProjectHeader(error, projectHeaders)) {
             this.logger.warn(
-              `[${operation}] received 403 with x-goog-user-project for account=${
-                safeAccount || 'default'
-              } project=${safeProject}; retrying without project context.`,
+              `[${operation}] received 403 with project context; retrying without project context.`,
             );
             if (safeProject) {
               this.userProjectCapabilityCache.recordNegativeCapability(safeAccount, safeProject);

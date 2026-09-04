@@ -64,6 +64,11 @@ interface StreamIdleTimer {
   dispose: () => void;
 }
 
+interface StreamHealthLifecycle {
+  markUsableOutput: () => void;
+  recordFailure: (error: unknown) => void;
+}
+
 type OpenAIOutputProtocol = 'chat-completions' | 'responses' | 'text-completions';
 
 /** Wire shape emitted by the OpenAI streaming mappers. */
@@ -85,6 +90,7 @@ interface OpenAIStreamUsage {
 export class ProxyService {
   private readonly logger = new Logger(ProxyService.name);
   private readonly streamIdleTimeoutMs = 300_000;
+  private readonly streamPenaltyTimeoutMs = 10_000;
   private readonly generationConstraints: ProxyGenerationConstraints;
   private readonly retryPolicy: ProxyRetryPolicy;
   private readonly modelRoutingPolicy = new ProxyModelRoutingPolicy();
@@ -159,6 +165,55 @@ export class ProxyService {
         this.destroyUpstreamStream(upstreamStream);
       },
     };
+  }
+
+  private createStreamHealthLifecycle(accountId: string, model: string): StreamHealthLifecycle {
+    let hasMarkedSuccess = false;
+    let hasRecordedFailure = false;
+
+    return {
+      markUsableOutput: () => {
+        if (hasMarkedSuccess) {
+          return;
+        }
+        hasMarkedSuccess = true;
+        this.retryPolicy.markUpstreamSuccess(accountId, model);
+      },
+      recordFailure: (error: unknown) => {
+        if (hasRecordedFailure) {
+          return;
+        }
+        hasRecordedFailure = true;
+        this.recordBoundedStreamPenalty(accountId, model, error);
+      },
+    };
+  }
+
+  private recordBoundedStreamPenalty(accountId: string, model: string, error: unknown): void {
+    const penaltyError =
+      error instanceof UpstreamRequestError
+        ? error
+        : new UpstreamRequestError({
+            message: error instanceof Error ? error.message : String(error),
+            status: HttpStatus.SERVICE_UNAVAILABLE,
+          });
+    let timeout: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<void>((resolve) => {
+      timeout = setTimeout(resolve, this.streamPenaltyTimeoutMs);
+    });
+
+    void Promise.race([this.applyUpstreamPenalty(accountId, model, penaltyError), timeoutPromise])
+      .then(() => {
+        if (timeout) {
+          clearTimeout(timeout);
+        }
+      })
+      .catch(() => {
+        if (timeout) {
+          clearTimeout(timeout);
+        }
+        this.logger.warn('Unable to record stream health penalty');
+      });
   }
 
   private createTokenRetryState(): ProxyTokenRetryState {
@@ -262,10 +317,10 @@ export class ProxyService {
             extraHeaders,
             token.id,
           );
-          this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
           return this.processAnthropicInternalStream(
             stream,
             geminiBody.model,
+            this.createStreamHealthLifecycle(token.id, effectiveTargetModel),
             signatureContext,
             request.model,
           );
@@ -313,10 +368,10 @@ export class ProxyService {
                 extraHeaders,
                 token.id,
               );
-              this.retryPolicy.markUpstreamSuccess(token.id, 'gemini-3-flash');
               return this.processAnthropicInternalStream(
                 stream,
                 downgradedBody.model,
+                this.createStreamHealthLifecycle(token.id, 'gemini-3-flash'),
                 downgradedSignatureContext,
                 request.model,
               );
@@ -359,6 +414,7 @@ export class ProxyService {
   private processAnthropicInternalStream(
     upstreamStream: NodeJS.ReadableStream,
     model: string,
+    streamHealth: StreamHealthLifecycle,
     signatureContext?: SignatureContext,
     publicModelFallback: string = model,
   ): Observable<string> {
@@ -391,6 +447,7 @@ export class ProxyService {
         if (destroyUpstream) {
           this.destroyUpstreamStream(upstreamStream);
         }
+        streamHealth.recordFailure(error);
         subscriber.error(error);
       };
 
@@ -435,6 +492,7 @@ export class ProxyService {
             const startMsg = state.emitMessageStart(json);
             if (startMsg) {
               hasUsableEvent = true;
+              streamHealth.markUsableOutput();
               subscriber.next(startMsg);
             }
 
@@ -658,8 +716,10 @@ export class ProxyService {
           extraHeaders,
           token.id,
         );
-        this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
-        return this.passthroughSseStream(stream);
+        return this.passthroughSseStream(
+          stream,
+          this.createStreamHealthLifecycle(token.id, effectiveTargetModel),
+        );
       } catch (err) {
         lastError = err;
 
@@ -677,17 +737,37 @@ export class ProxyService {
     throw lastError || new Error('Gemini stream request failed after retries');
   }
 
-  private passthroughSseStream(upstreamStream: NodeJS.ReadableStream): Observable<string> {
+  private passthroughSseStream(
+    upstreamStream: NodeJS.ReadableStream,
+    streamHealth: StreamHealthLifecycle,
+  ): Observable<string> {
     return new Observable<string>((subscriber) => {
       const decoder = new TextDecoder();
-      let receivedData = false;
+      let buffer = '';
+      let receivedUsableOutput = false;
       let terminated = false;
-      const failStream = (error: Error): void => {
+
+      const cleanup = (): void => {
+        upstreamStream.removeListener('data', onData);
+        upstreamStream.removeListener('end', onEnd);
+        upstreamStream.removeListener('error', onError);
+        idleTimer.dispose();
+      };
+
+      const terminate = (): boolean => {
         if (terminated) {
-          return;
+          return false;
         }
         terminated = true;
-        idleTimer.clear();
+        cleanup();
+        return true;
+      };
+
+      const failStream = (error: Error): void => {
+        if (!terminate()) {
+          return;
+        }
+        streamHealth.recordFailure(error);
         subscriber.error(error);
       };
       const idleTimer = this.createStreamIdleTimer(upstreamStream, 'Gemini-SSE', () => {
@@ -696,35 +776,94 @@ export class ProxyService {
 
       idleTimer.reset();
 
-      upstreamStream.on('data', (chunk: Buffer) => {
+      const processLine = (line: string): void => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) {
+          return;
+        }
+        const data = trimmed.slice('data:'.length).trim();
+        if (data.length === 0 || data === '[DONE]') {
+          return;
+        }
+        try {
+          const rawPayload = JSON.parse(data);
+          const upstreamError = this.getUpstreamStreamError(rawPayload);
+          if (upstreamError) {
+            failStream(upstreamError);
+            return;
+          }
+          const response = unwrapInternalGeminiResponse(rawPayload);
+          const candidate = response?.candidates?.[0];
+          const hasUsableCandidate =
+            (Array.isArray(candidate?.content?.parts) &&
+              candidate.content.parts.some((part: unknown) => this.normalizeGeminiPart(part))) ||
+            Boolean(candidate?.groundingMetadata) ||
+            (isString(candidate?.finishReason) && candidate.finishReason.length > 0);
+          if (hasUsableCandidate) {
+            receivedUsableOutput = true;
+            streamHealth.markUsableOutput();
+          }
+        } catch (error) {
+          failStream(
+            error instanceof Error ? error : new Error('Malformed upstream stream payload'),
+          );
+        }
+      };
+
+      const onData = (chunk: Buffer): void => {
         if (terminated) {
           return;
         }
-        receivedData = true;
         idleTimer.reset();
-        subscriber.next(decoder.decode(chunk, { stream: true }));
-      });
+        const forwardedChunk = decoder.decode(chunk, { stream: true });
+        if (forwardedChunk) {
+          subscriber.next(forwardedChunk);
+          buffer += forwardedChunk;
+        }
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          processLine(line);
+          if (terminated) {
+            return;
+          }
+        }
+      };
 
-      upstreamStream.on('end', () => {
+      const onEnd = (): void => {
         if (terminated) {
           return;
         }
-        idleTimer.clear();
-        if (!receivedData) {
-          subscriber.error(new Error('Empty response stream'));
+        const forwardedChunk = decoder.decode();
+        if (forwardedChunk) {
+          subscriber.next(forwardedChunk);
+          buffer += forwardedChunk;
+        }
+        if (buffer.trim()) {
+          processLine(buffer);
+        }
+        if (terminated) {
           return;
         }
-        terminated = true;
+        if (!receivedUsableOutput) {
+          failStream(new Error('Empty response stream'));
+          return;
+        }
+        terminate();
         subscriber.complete();
-      });
+      };
 
-      upstreamStream.on('error', (err: unknown) => {
+      const onError = (err: unknown): void => {
         const cleanError = err instanceof Error ? new Error(err.message) : new Error(String(err));
         failStream(cleanError);
-      });
+      };
+
+      upstreamStream.on('data', onData);
+      upstreamStream.on('end', onEnd);
+      upstreamStream.on('error', onError);
 
       return () => {
-        idleTimer.dispose();
+        terminate();
       };
     });
   }
@@ -884,7 +1023,6 @@ export class ProxyService {
               extraHeaders,
               token.id,
             );
-            this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
             return this.createOpenAIProtocolStream(
               stream,
               request.model,
@@ -892,6 +1030,7 @@ export class ProxyService {
               streamOptions,
               signatureContext,
               responsesConfiguration,
+              this.createStreamHealthLifecycle(token.id, effectiveTargetModel),
             );
           } catch (streamError) {
             if (this.retryPolicy.shouldFailoverImmediately(streamError)) {
@@ -1202,6 +1341,7 @@ export class ProxyService {
     streamOptions: OpenAIStreamOptions,
     signatureContext?: SignatureContext,
     responsesConfiguration?: OpenAIResponsesConfiguration,
+    streamHealth?: StreamHealthLifecycle,
   ): Observable<string> {
     if (outputProtocol === 'responses') {
       return this.processResponsesStreamResponse(
@@ -1209,9 +1349,16 @@ export class ProxyService {
         model,
         signatureContext,
         responsesConfiguration,
+        streamHealth,
       );
     }
-    return this.processStreamResponse(upstreamStream, model, signatureContext, streamOptions);
+    return this.processStreamResponse(
+      upstreamStream,
+      model,
+      signatureContext,
+      streamOptions,
+      streamHealth,
+    );
   }
 
   private resolveOpenAIStreamOptions(
@@ -1265,6 +1412,7 @@ export class ProxyService {
     model: string,
     signatureContext?: SignatureContext,
     responsesConfiguration?: OpenAIResponsesConfiguration,
+    streamHealth?: StreamHealthLifecycle,
   ): Observable<string> {
     return new Observable<string>((subscriber) => {
       const decoder = new TextDecoder();
@@ -1287,12 +1435,28 @@ export class ProxyService {
         }
       };
 
-      const complete = (finishReason?: string): void => {
+      const cleanup = (): void => {
+        clearHeartbeat();
+        upstreamStream.removeListener('data', onData);
+        upstreamStream.removeListener('end', onEnd);
+        upstreamStream.removeListener('error', onError);
+        idleTimer.dispose();
+      };
+
+      const terminate = (): boolean => {
         if (completed) {
-          return;
+          return false;
         }
         completed = true;
-        clearHeartbeat();
+        cleanup();
+        return true;
+      };
+
+      const complete = (finishReason?: string): void => {
+        if (!terminate()) {
+          return;
+        }
+        streamHealth?.markUsableOutput();
         for (const event of mapper.complete(finishReason)) {
           subscriber.next(event);
         }
@@ -1300,12 +1464,10 @@ export class ProxyService {
       };
 
       const fail = (message: string, code = 'upstream_error'): void => {
-        if (completed) {
+        if (!terminate()) {
           return;
         }
-        completed = true;
-        clearHeartbeat();
-        idleTimer.clear();
+        streamHealth?.recordFailure(new Error(message));
         for (const event of mapper.fail(message, code)) {
           subscriber.next(event);
         }
@@ -1384,6 +1546,7 @@ export class ProxyService {
                 const events = mapper.processPart(normalizedPart);
                 if (events.length > 0) {
                   receivedUsableOutput = true;
+                  streamHealth?.markUsableOutput();
                 }
                 for (const event of events) {
                   subscriber.next(event);
@@ -1396,6 +1559,7 @@ export class ProxyService {
             const events = mapper.processGrounding(grounding);
             if (events.length > 0) {
               receivedUsableOutput = true;
+              streamHealth?.markUsableOutput();
             }
             for (const event of events) {
               subscriber.next(event);
@@ -1415,7 +1579,7 @@ export class ProxyService {
         }
       };
 
-      upstreamStream.on('data', (chunk: Buffer) => {
+      const onData = (chunk: Buffer): void => {
         if (completed) {
           return;
         }
@@ -1430,12 +1594,17 @@ export class ProxyService {
             return;
           }
         }
-      });
+      };
 
-      upstreamStream.on('end', () => {
-        idleTimer.clear();
+      const onEnd = (): void => {
+        if (completed) {
+          return;
+        }
         if (buffer.trim()) {
           processLine(buffer);
+        }
+        if (completed) {
+          return;
         }
         if (!receivedUsableOutput) {
           const mappedFinishReason = mapGeminiFinishReasonToOpenAI(lastFinishReason);
@@ -1447,19 +1616,24 @@ export class ProxyService {
           return;
         }
         complete(lastFinishReason);
-      });
+      };
 
-      upstreamStream.on('error', (error: unknown) => {
-        idleTimer.clear();
+      const onError = (error: unknown): void => {
+        if (completed) {
+          return;
+        }
         const cleanError =
           error instanceof Error ? new Error(error.message) : new Error(String(error));
         this.logger.error(`OpenAI Responses stream error: ${cleanError.message}`);
         fail(cleanError.message, 'upstream_error');
-      });
+      };
+
+      upstreamStream.on('data', onData);
+      upstreamStream.on('end', onEnd);
+      upstreamStream.on('error', onError);
 
       return () => {
-        clearHeartbeat();
-        idleTimer.dispose();
+        terminate();
       };
     });
   }
@@ -1681,6 +1855,7 @@ export class ProxyService {
     model: string,
     signatureContext?: SignatureContext,
     streamOptions: OpenAIStreamOptions = { variant: 'chat', includeUsage: false },
+    streamHealth?: StreamHealthLifecycle,
   ): Observable<string> {
     return new Observable<string>((subscriber) => {
       const decoder = new TextDecoder();
@@ -1697,6 +1872,22 @@ export class ProxyService {
       /** Signature seen earlier in THIS stream, used only for tool calls of this same stream. */
       let streamSignature: string | null = null;
 
+      const cleanup = (): void => {
+        upstreamStream.removeListener('data', onData);
+        upstreamStream.removeListener('end', onEnd);
+        upstreamStream.removeListener('error', onError);
+        idleTimer.dispose();
+      };
+
+      const terminate = (): boolean => {
+        if (terminated) {
+          return false;
+        }
+        terminated = true;
+        cleanup();
+        return true;
+      };
+
       const idPrefix =
         streamOptions.idPrefix ?? (streamOptions.variant === 'text' ? 'cmpl' : 'chatcmpl');
       const streamId = `${idPrefix}-${uuidv4()}`;
@@ -1710,6 +1901,7 @@ export class ProxyService {
       const pushChoice = (choice: Record<string, unknown>, countsAsUsable = true): void => {
         if (countsAsUsable) {
           hasEmittedChunk = true;
+          streamHealth?.markUsableOutput();
         }
         subscriber.next(
           `data: ${JSON.stringify(this.buildOpenAIStreamChunk(identity, streamOptions, [choice]))}\n\n`,
@@ -1738,12 +1930,11 @@ export class ProxyService {
       };
 
       const failStream = (error: Error): void => {
-        if (terminated) {
+        if (!terminate()) {
           return;
         }
-        terminated = true;
-        idleTimer.clear();
         this.logger.error(`OpenAI-compatible stream error: ${error.message}`);
+        streamHealth?.recordFailure(error);
         subscriber.error(error);
       };
 
@@ -1942,7 +2133,7 @@ export class ProxyService {
         }
       };
 
-      upstreamStream.on('data', (chunk: Buffer) => {
+      const onData = (chunk: Buffer): void => {
         if (terminated) {
           return;
         }
@@ -1957,9 +2148,9 @@ export class ProxyService {
           }
           handleLine(line);
         }
-      });
+      };
 
-      upstreamStream.on('end', () => {
+      const onEnd = (): void => {
         if (terminated) {
           return;
         }
@@ -1983,19 +2174,22 @@ export class ProxyService {
           failStream(new Error('Upstream stream ended without any usable content'));
           return;
         }
-        terminated = true;
-        idleTimer.clear();
+        terminate();
         sendDone();
         subscriber.complete();
-      });
+      };
 
-      upstreamStream.on('error', (err: unknown) => {
+      const onError = (err: unknown): void => {
         // Convert to clean Error to avoid circular reference issues (socket objects)
         failStream(err instanceof Error ? new Error(err.message) : new Error(String(err)));
-      });
+      };
+
+      upstreamStream.on('data', onData);
+      upstreamStream.on('end', onEnd);
+      upstreamStream.on('error', onError);
 
       return () => {
-        idleTimer.dispose();
+        terminate();
       };
     });
   }
