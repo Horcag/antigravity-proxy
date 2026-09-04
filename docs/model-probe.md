@@ -15,12 +15,13 @@
    - Uses live `model_forwarding_rules` from `/admin/accounts` to map published IDs to deduplicated request targets. Without an admin rule, the published ID remains its own target.
 3. **Modality-Specific Minimal Probing**:
    - Automatically classifies models by modality (`text` vs `image`).
-   - Text models are probed via `POST /v1/chat/completions` using a tiny payload (`max_tokens: 1`, prompt `"hi"`).
+   - Text models are probed via `POST /v1/chat/completions` using a minimal general execution contract (`max_tokens: 64`, prompt `"hi"`), allowing reasoning and output models to return a payload without model-specific exceptions.
    - Image models are probed via `POST /v1/images/generations` using a tiny payload (prompt `"probe"`).
 4. **Strict Sanitization & Zero Content Leakage**:
    - The probe records **only sanitized metadata**:
      - `model` (published ID)
      - `modality` (`text` | `image`)
+     - `attempt_count` (one initial attempt plus at most one retry)
      - `http_status` (HTTP response code or 0 for network/timeout errors)
      - `latency_ms` (round-trip latency)
      - `response_model` (model reported in upstream header/body)
@@ -28,13 +29,16 @@
      - `error_category` (compact normalized category: `timeout`, `network_error`, `auth_error`, `model_not_found`, `rate_limit`, `quota_exhausted`, `service_unavailable`, `server_error`, `client_error`, `empty_payload`)
    - **Never writes response text, generated content, prompts, tokens, or image base64 bytes to logs, stdout, stderr, or reports**.
 5. **Thinking Model Tolerance**:
-   - Models with thinking budgets (e.g. `gemini-3.5-flash-high`, `claude-sonnet-4-6-thinking`) might consume the 1-token output budget purely on internal reasoning, returning HTTP 200 with empty assistant content and `finish_reason: "length"`.
+   - Models with thinking budgets (e.g. `gemini-3.5-flash-high`, `claude-sonnet-4-6-thinking`) can return an empty assistant content with `finish_reason: "length"` while still returning a valid response structure.
    - Such responses have `payload_present: true` and are recognized as **successful probes**, not failures.
    - The tool exits non-zero **only for genuine failures** (HTTP non-200, missing payload structure, network timeout/error).
-6. **Bounded Concurrency & Timeout**:
+6. **Capability Verdicts and Bounded Retry**:
+   - A probe performs one retry only for a transient attempt outcome: network or timeout errors, HTTP `429`, HTTP `5xx`, or HTTP `200` with a missing payload.
+   - Authentication and other deterministic `4xx` failures are not retried. The final attempt determines the pass/fail verdict; probing never mutates the published service catalog.
+7. **Bounded Concurrency & Timeout**:
    - Configurable bounded concurrency (default: `4`) prevents overwhelming upstream rate limits.
    - Per-request timeout (default: `10000 ms`) prevents hangs.
-7. **Dry-Run Inventory Mode**:
+8. **Dry-Run Inventory Mode**:
    - `--dry-run` performs catalog discovery and target resolution without sending any generation requests.
 
 ---
@@ -137,6 +141,7 @@ node scripts/probe-models.ts > audit.json
     {
       "model": "gemini-3-flash",
       "modality": "text",
+      "attempt_count": 1,
       "http_status": 200,
       "latency_ms": 128,
       "response_model": "gemini-3-flash",
@@ -146,6 +151,7 @@ node scripts/probe-models.ts > audit.json
     {
       "model": "gemini-3-pro-image",
       "modality": "image",
+      "attempt_count": 1,
       "http_status": 200,
       "latency_ms": 340,
       "response_model": "gemini-3-pro-image",

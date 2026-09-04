@@ -21,12 +21,17 @@ export type ErrorCategory =
 export interface ModelProbeResult {
   model: string;
   modality: ModelModality;
+  attempt_count: number;
   http_status: number;
   latency_ms: number;
   response_model: string | null;
   payload_present: boolean;
   error_category: ErrorCategory | null;
 }
+
+type ModelProbeAttemptResult = Omit<ModelProbeResult, 'attempt_count'>;
+
+const MAX_PROBE_ATTEMPTS = 2;
 
 export interface ModelInventory {
   published_ids: string[];
@@ -422,7 +427,7 @@ export function categorizeHttpError(
   return 'http_error';
 }
 
-export async function probeModel(
+async function probeModelAttempt(
   modelId: string,
   options: {
     baseUrl: string;
@@ -430,7 +435,7 @@ export async function probeModel(
     timeoutMs: number;
     modality?: ModelModality;
   },
-): Promise<ModelProbeResult> {
+): Promise<ModelProbeAttemptResult> {
   const modality = options.modality ?? detectModelModality(modelId);
   const startTime = performance.now();
 
@@ -439,13 +444,13 @@ export async function probeModel(
     ? `${options.baseUrl}/v1/images/generations`
     : `${options.baseUrl}/v1/chat/completions`;
 
-  // Tiny request payloads
+  // The smallest general contract that still allows reasoning models to produce a payload.
   const payload = isImage
     ? JSON.stringify({ model: modelId, prompt: 'probe' })
     : JSON.stringify({
         model: modelId,
         messages: [{ role: 'user', content: 'hi' }],
-        max_tokens: 1,
+        max_tokens: 64,
         stream: false,
       });
 
@@ -543,6 +548,36 @@ export async function probeModel(
       error_category: isTimeout ? 'timeout' : 'network_error',
     };
   }
+}
+
+export function isTransientProbeFailure(result: ModelProbeAttemptResult): boolean {
+  return (
+    result.http_status === 0 ||
+    result.http_status === 429 ||
+    (result.http_status >= 500 && result.http_status < 600) ||
+    (result.http_status === 200 && !result.payload_present)
+  );
+}
+
+export async function probeModel(
+  modelId: string,
+  options: {
+    baseUrl: string;
+    apiKey: string;
+    timeoutMs: number;
+    modality?: ModelModality;
+  },
+): Promise<ModelProbeResult> {
+  let result: ModelProbeAttemptResult | undefined;
+
+  for (let attempt = 1; attempt <= MAX_PROBE_ATTEMPTS; attempt++) {
+    result = await probeModelAttempt(modelId, options);
+    if (!isTransientProbeFailure(result) || attempt === MAX_PROBE_ATTEMPTS) {
+      return { ...result, attempt_count: attempt };
+    }
+  }
+
+  throw new Error('Probe attempts exhausted without a result');
 }
 
 export function isGenuineFailure(result: ModelProbeResult): boolean {

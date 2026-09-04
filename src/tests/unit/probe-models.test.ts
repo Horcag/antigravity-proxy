@@ -269,10 +269,10 @@ describe('probe-models CLI tool', () => {
         timeoutMs: 5000,
       });
 
-      // Verify request payload was tiny
+      // Verify the general text execution contract supports a real model response.
       expect(capturedBody).toBeDefined();
       const parsed = JSON.parse(capturedBody!);
-      expect(parsed.max_tokens).toBe(1);
+      expect(parsed.max_tokens).toBe(64);
       expect(parsed.model).toBe('gemini-3-flash');
       expect(parsed.messages).toEqual([{ role: 'user', content: 'hi' }]);
 
@@ -280,6 +280,7 @@ describe('probe-models CLI tool', () => {
       expect(result.model).toBe('gemini-3-flash');
       expect(result.modality).toBe('text');
       expect(result.http_status).toBe(200);
+      expect(result.attempt_count).toBe(1);
       expect(result.response_model).toBe('gemini-3-flash');
       expect(result.payload_present).toBe(true);
       expect(result.error_category).toBeNull();
@@ -289,6 +290,66 @@ describe('probe-models CLI tool', () => {
       expect(serialized).not.toContain('SECRET_GENERATED_CONTENT_DO_NOT_LEAK');
       expect(serialized).not.toContain('hi');
       expect(isGenuineFailure(result)).toBe(false);
+    });
+
+    it('retries one transient failure and reports the successful final attempt', async () => {
+      const fetchSpy = vi.spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce({ status: 502, text: async () => 'Upstream unavailable' } as Response)
+        .mockResolvedValueOnce({
+          status: 200,
+          json: async () => ({
+            model: 'gemini-3-flash',
+            choices: [{ message: { content: 'SECRET_RETRY_CONTENT_DO_NOT_LEAK' }, finish_reason: 'stop' }],
+          }),
+        } as Response);
+
+      const result = await probeModel('gemini-3-flash', {
+        baseUrl: 'http://proxy',
+        apiKey: 'test-key',
+        timeoutMs: 5000,
+      });
+
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      expect(result.http_status).toBe(200);
+      expect(result.payload_present).toBe(true);
+      expect(result.attempt_count).toBe(2);
+      expect(isGenuineFailure(result)).toBe(false);
+      expect(JSON.stringify(result)).not.toContain('SECRET_RETRY_CONTENT_DO_NOT_LEAK');
+    });
+
+    it('does not retry deterministic client failures', async () => {
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+        status: 401,
+        text: async () => 'Unauthorized',
+      } as Response);
+
+      const result = await probeModel('gemini-3-flash', {
+        baseUrl: 'http://proxy',
+        apiKey: 'test-key',
+        timeoutMs: 5000,
+      });
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(result.http_status).toBe(401);
+      expect(result.attempt_count).toBe(1);
+      expect(isGenuineFailure(result)).toBe(true);
+    });
+
+    it('fails after the bounded retry budget is exhausted', async () => {
+      const fetchSpy = vi.spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce({ status: 503, text: async () => 'Backend down' } as Response)
+        .mockResolvedValueOnce({ status: 503, text: async () => 'Backend down' } as Response);
+
+      const result = await probeModel('gemini-3-flash', {
+        baseUrl: 'http://proxy',
+        apiKey: 'test-key',
+        timeoutMs: 5000,
+      });
+
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      expect(result.http_status).toBe(503);
+      expect(result.attempt_count).toBe(2);
+      expect(isGenuineFailure(result)).toBe(true);
     });
 
     it('probes image model via /v1/images/generations and sanitizes image bytes', async () => {
@@ -381,10 +442,15 @@ describe('probe-models CLI tool', () => {
       expect(isGenuineFailure(r404)).toBe(true);
 
       // 429 Quota exhausted
-      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
-        status: 429,
-        text: async () => 'Resource exhausted: quota exceeded',
-      } as Response);
+      vi.spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce({
+          status: 429,
+          text: async () => 'Resource exhausted: quota exceeded',
+        } as Response)
+        .mockResolvedValueOnce({
+          status: 429,
+          text: async () => 'Resource exhausted: quota exceeded',
+        } as Response);
 
       const r429Quota = await probeModel('gemini-3-flash', {
         baseUrl: 'http://proxy',
@@ -396,10 +462,15 @@ describe('probe-models CLI tool', () => {
       expect(isGenuineFailure(r429Quota)).toBe(true);
 
       // 503 Service unavailable
-      vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
-        status: 503,
-        text: async () => 'Backend down',
-      } as Response);
+      vi.spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce({
+          status: 503,
+          text: async () => 'Backend down',
+        } as Response)
+        .mockResolvedValueOnce({
+          status: 503,
+          text: async () => 'Backend down',
+        } as Response);
 
       const r503 = await probeModel('gemini-3-flash', {
         baseUrl: 'http://proxy',
@@ -414,7 +485,9 @@ describe('probe-models CLI tool', () => {
     it('handles network timeouts cleanly', async () => {
       const timeoutErr = new Error('The operation was aborted due to timeout');
       timeoutErr.name = 'TimeoutError';
-      vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(timeoutErr);
+      vi.spyOn(globalThis, 'fetch')
+        .mockRejectedValueOnce(timeoutErr)
+        .mockRejectedValueOnce(timeoutErr);
 
       const result = await probeModel('gemini-3-flash', {
         baseUrl: 'http://proxy',
