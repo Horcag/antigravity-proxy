@@ -46,8 +46,8 @@ const GEMINI_FLASH_IMAGE_FAMILY = new Set(['gemini-3-flash-image', 'gemini-3.1-f
 
 const IMAGE_MODEL_CAPABILITY_PATTERN = /(?:^|-)image(?:-|$)/;
 
-const TIERED_MODEL_SUFFIXES = ['extra-low', 'high', 'medium', 'low'] as const;
-const TIER_PREFERENCE = ['high', 'medium', 'low', 'extra-low'] as const;
+const TIERED_MODEL_SUFFIXES = ['tiered', 'extra-low', 'high', 'medium', 'low'] as const;
+const TIER_PREFERENCE = ['tiered', 'high', 'medium', 'low', 'extra-low'] as const;
 type TieredModelSuffix = (typeof TIER_PREFERENCE)[number];
 export type AccountModelAvailability = 'unknown' | 'available' | 'unavailable';
 

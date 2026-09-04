@@ -163,6 +163,38 @@ describe('AccountLeaseService parity scheduling replay', () => {
     expect(resolved).toBe('gemini-3.1-pro-low');
   });
 
+  it('routes an explicit flash tier to an advertised tiered preset', async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    (service as any).tokens = new Map([
+      [
+        'acc-1',
+        {
+          account_id: 'acc-1',
+          email: 'acc-1@test.dev',
+          access_token: 'token-1',
+          refresh_token: 'refresh-1',
+          token_type: 'Bearer',
+          expires_in: 3600,
+          expiry_timestamp: nowSec + 3600,
+          project_id: 'project-1',
+          session_id: 'session-1',
+          model_quotas: { 'gemini-3.8-flash-tiered': 99 },
+          model_limits: {},
+          model_reset_times: {},
+          model_forwarding_rules: {},
+        },
+      ],
+    ]);
+
+    expect(service.getModelCapableAccountCount('gemini-3.8-flash-low')).toBe(1);
+    await expect(service.getNextToken({ model: 'gemini-3.8-flash-low' })).resolves.toEqual(
+      expect.objectContaining({ id: 'acc-1' }),
+    );
+    expect(service.resolveDynamicModelForAccount('acc-1', 'gemini-3.8-flash-low')).toBe(
+      'gemini-3.8-flash-tiered',
+    );
+  });
+
   it('resolves a stable image capability alias to the advertised upstream image model', async () => {
     const nowSec = Math.floor(Date.now() / 1000);
     (service as any).tokens = new Map([
