@@ -55,6 +55,8 @@ import {
   OpenAIProtocolException,
   ProxyProtocolExceptionFilter,
   mapAnthropicProtocolError,
+  createAnthropicRequestId,
+  getAnthropicRequestId,
   mapOpenAIProtocolError,
   sendAnthropicProtocolError,
   sendOpenAIProtocolError,
@@ -604,20 +606,26 @@ export class ProxyController {
   }
 
   @Post('messages')
-  async anthropicMessages(@Body() body: AnthropicChatRequest, @Res() res: FastifyReply) {
-    this.validateAnthropicRequest(body);
+  async anthropicMessages(
+    @Body() body: AnthropicChatRequest,
+    @Req() request: FastifyRequest,
+    @Res() res: FastifyReply,
+  ) {
+    const requestId = getAnthropicRequestId(request);
+    res.header('request-id', requestId);
+    this.validateAnthropicRequest(body, request.headers['anthropic-version']);
 
     try {
       const result = await this.proxyService.handleAnthropicMessages(body);
 
       if (body.stream && this.isObservableLike(result)) {
-        this.writeSseResponse(res, result, 'anthropic');
+        this.writeSseResponse(res, result, 'anthropic', requestId);
         return;
       } else {
         res.status(HttpStatus.OK).send(result);
       }
     } catch (error) {
-      this.sendAnthropicErrorResponse(res, '/v1/messages', error);
+      this.sendAnthropicErrorResponse(res, '/v1/messages', error, undefined, requestId);
     }
   }
 
@@ -1389,9 +1397,11 @@ export class ProxyController {
     }
   }
 
-  private validateAnthropicRequest(body: AnthropicChatRequest): void {
+  private validateAnthropicRequest(body: AnthropicChatRequest, anthropicVersion: unknown): void {
     this.requireJsonObject(body);
+    this.validateAnthropicVersion(anthropicVersion);
     this.requireNonEmptyString(body.model, 'model');
+    this.validateAnthropicMaxTokens(body.max_tokens);
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
       throw this.invalidRequest('messages must be a non-empty array', 'messages');
     }
@@ -1410,6 +1420,31 @@ export class ProxyController {
     this.validateAnthropicToolChoice(body.tool_choice, body.tools);
     this.validateAnthropicSystem(body.system);
     this.validateAnthropicStopSequences(body.stop_sequences);
+  }
+
+  private validateAnthropicVersion(version: unknown): void {
+    if (!isString(version) || isEmpty(version.trim())) {
+      throw this.invalidRequest('anthropic-version header is required', 'anthropic-version');
+    }
+    if (version.trim() !== '2023-06-01') {
+      throw this.invalidRequest('anthropic-version header is unsupported', 'anthropic-version');
+    }
+  }
+
+  private validateAnthropicMaxTokens(maxTokens: unknown): void {
+    const gatewayMaxTokens = 128_000;
+    if (
+      !isNumber(maxTokens) ||
+      !Number.isFinite(maxTokens) ||
+      !Number.isInteger(maxTokens) ||
+      maxTokens < 1 ||
+      maxTokens > gatewayMaxTokens
+    ) {
+      throw this.invalidRequest(
+        `max_tokens must be an integer between 1 and ${gatewayMaxTokens}`,
+        'max_tokens',
+      );
+    }
   }
 
   private validateAnthropicContent(content: unknown): void {
@@ -2977,11 +3012,17 @@ export class ProxyController {
     res: FastifyReply,
     stream: Observable<unknown>,
     wireProtocol: 'openai' | 'responses' | 'anthropic' = 'openai',
+    requestId?: string,
   ): void {
+    const anthropicRequestId =
+      wireProtocol === 'anthropic' ? requestId ?? createAnthropicRequestId() : undefined;
     if (!res.raw || !isFunction(res.raw.writeHead) || !isFunction(res.raw.write)) {
       res.header('Content-Type', 'text/event-stream');
       res.header('Cache-Control', 'no-cache');
       res.header('Connection', 'keep-alive');
+      if (anthropicRequestId) {
+        res.header('request-id', anthropicRequestId);
+      }
       res.send(stream);
       return;
     }
@@ -2994,6 +3035,7 @@ export class ProxyController {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
+      ...(anthropicRequestId ? { 'request-id': anthropicRequestId } : {}),
     });
 
     let nextResponsesSequenceNumber = 0;
@@ -3034,6 +3076,7 @@ export class ProxyController {
                     type: anthropicMapped!.error.type,
                     message: anthropicMapped!.error.message,
                   },
+                  request_id: anthropicRequestId,
                 }
               : { error: mapped.error };
         res.raw.write(
@@ -3241,11 +3284,12 @@ export class ProxyController {
     endpoint: string,
     error: unknown,
     overrideMessage?: string,
+    requestId?: string,
   ): void {
     const responseError = this.withOverriddenErrorMessage(error, overrideMessage);
     const mapped = mapOpenAIProtocolError(responseError);
     this.logProxyEndpointError(endpoint, mapped.status, mapped.error.message, error);
-    sendAnthropicProtocolError(res, responseError);
+    sendAnthropicProtocolError(res, responseError, requestId);
   }
 
   private withOverriddenErrorMessage(error: unknown, overrideMessage?: string): unknown {

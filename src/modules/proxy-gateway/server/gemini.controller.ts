@@ -26,14 +26,9 @@ import { createGoogleErrorEnvelope } from './fastify-multipart.provider';
 
 type GeminiModelMetadata = {
   name: string;
+  baseModelId: string;
   displayName: string;
-  description: string;
-  inputTokenLimit: number;
-  outputTokenLimit: number;
   supportedGenerationMethods: string[];
-  temperature: number;
-  topK: number;
-  topP: number;
   version: string;
 };
 
@@ -75,10 +70,7 @@ export class GeminiController {
     const matched = this.buildGeminiModelList().find((item) => item.name === targetName);
 
     if (matched) {
-      res.status(HttpStatus.OK).send({
-        name: matched.name,
-        displayName: matched.displayName,
-      });
+      res.status(HttpStatus.OK).send(matched);
       return;
     }
 
@@ -127,6 +119,13 @@ export class GeminiController {
         HttpStatus.NOT_IMPLEMENTED,
         'countTokens is not supported by the configured upstream.',
       );
+      return;
+    }
+
+    const modelId = model.replace(/^models\//, '');
+    await this.accountLeaseService?.refreshQuotaCatalog({ force: true, model: modelId });
+    if (!this.buildGeminiModelList().some((item) => item.name === model)) {
+      this.sendGoogleErrorResponse(res, HttpStatus.NOT_FOUND, `Model not found: ${model}`);
       return;
     }
 
@@ -201,15 +200,12 @@ export class GeminiController {
     const displayName = modelName.replace(/^models\//, '');
     return {
       name: modelName,
+      baseModelId: displayName,
       displayName,
-      description: '',
-      inputTokenLimit: 128000,
-      outputTokenLimit: 8192,
       supportedGenerationMethods: ['generateContent'],
-      temperature: 1,
-      topK: 64,
-      topP: 0.95,
-      version: '001',
+      // The gateway collects provider target IDs, but not a separate upstream
+      // release number; expose that stable target identity rather than guessing.
+      version: displayName,
     };
   }
 

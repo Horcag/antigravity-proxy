@@ -6,6 +6,7 @@ import {
   HttpStatus,
   Injectable,
 } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { FastifyReply, FastifyRequest } from 'fastify';
 import { isNumber, isString } from 'lodash-es';
 
@@ -62,12 +63,41 @@ export function sendOpenAIProtocolError(res: FastifyReply, error: unknown): void
   res.status(mapped.status).send({ error: mapped.error });
 }
 
-export function sendAnthropicProtocolError(res: FastifyReply, error: unknown): void {
+export function sendAnthropicProtocolError(
+  res: FastifyReply,
+  error: unknown,
+  requestId = createAnthropicRequestId(),
+): void {
   const mapped = mapAnthropicProtocolError(error);
   if (mapped.retryAfter) {
     res.header('retry-after', mapped.retryAfter);
   }
-  res.status(mapped.status).send({ type: 'error', error: mapped.error });
+  res.header('request-id', requestId);
+  res.status(mapped.status).send({ type: 'error', error: mapped.error, request_id: requestId });
+}
+
+const anthropicRequestIds = new WeakMap<FastifyRequest, string>();
+
+/**
+ * Keeps the public Anthropic request id stable for a request while ensuring it
+ * contains only header-safe characters and never derives from account data.
+ */
+export function getAnthropicRequestId(request: FastifyRequest): string {
+  const existing = anthropicRequestIds.get(request);
+  if (existing) {
+    return existing;
+  }
+
+  const requestId = createAnthropicRequestId(request.id);
+  anthropicRequestIds.set(request, requestId);
+  return requestId;
+}
+
+export function createAnthropicRequestId(candidate?: unknown): string {
+  const sanitized = isString(candidate)
+    ? candidate.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128)
+    : '';
+  return sanitized || `req_${randomUUID().replace(/-/g, '')}`;
 }
 
 export function mapAnthropicProtocolError(error: unknown): {
@@ -125,7 +155,7 @@ export class ProxyProtocolExceptionFilter implements ExceptionFilter {
     const reply = context.getResponse<FastifyReply>();
 
     if (request.method === 'POST' && request.url.split('?')[0] === '/v1/messages') {
-      sendAnthropicProtocolError(reply, exception);
+      sendAnthropicProtocolError(reply, exception, getAnthropicRequestId(request));
       return;
     }
 
