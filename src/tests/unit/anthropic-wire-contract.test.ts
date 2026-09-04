@@ -63,7 +63,10 @@ async function invokeWithProtocolFilter(
 describe('Anthropic wire contract', () => {
   it.each([
     ['missing max_tokens', validBody({ max_tokens: undefined }), createRequest('invalid-max')],
+    ['negative max_tokens', validBody({ max_tokens: -1 }), createRequest('invalid-max')],
     ['fractional max_tokens', validBody({ max_tokens: 1.5 }), createRequest('invalid-max')],
+    ['non-number max_tokens', validBody({ max_tokens: '64' }), createRequest('invalid-max')],
+    ['above-bound max_tokens', validBody({ max_tokens: 128_001 }), createRequest('invalid-max')],
     ['missing anthropic-version', validBody(), createRequest('invalid-header', null)],
     ['unsupported anthropic-version', validBody(), createRequest('invalid-header', '2024-01-01')],
   ])('rejects %s before dispatch with the Anthropic error envelope', async (_case, body, request) => {
@@ -82,6 +85,24 @@ describe('Anthropic wire contract', () => {
     const requestId = (reply.sentBody as { request_id: string }).request_id;
     expect(requestId).toBe(String(request.id).replace(/[^a-zA-Z0-9_-]/g, ''));
     expect(reply.header).toHaveBeenCalledWith('request-id', requestId);
+  });
+
+  it('accepts max_tokens of 0 and dispatches to handler', async () => {
+    const service = {
+      handleAnthropicMessages: vi.fn().mockResolvedValue({ id: 'msg_1', content: [] }),
+    };
+    const controller = new ProxyController(service as never);
+    const reply = createReply();
+    const request = createRequest('zero-max-tokens');
+
+    await controller.anthropicMessages(validBody({ max_tokens: 0 }) as never, request as never, reply as never);
+
+    expect(service.handleAnthropicMessages).toHaveBeenCalledWith(
+      expect.objectContaining({ max_tokens: 0 }),
+    );
+    expect(reply.status).toHaveBeenCalledWith(200);
+    expect(reply.send).toHaveBeenCalledWith({ id: 'msg_1', content: [] });
+    expect(reply.header).toHaveBeenCalledWith('request-id', 'zero-max-tokens');
   });
 
   it('uses the same request id for an Anthropic handler error header and body', async () => {

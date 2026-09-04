@@ -1437,11 +1437,11 @@ export class ProxyController {
       !isNumber(maxTokens) ||
       !Number.isFinite(maxTokens) ||
       !Number.isInteger(maxTokens) ||
-      maxTokens < 1 ||
+      maxTokens < 0 ||
       maxTokens > gatewayMaxTokens
     ) {
       throw this.invalidRequest(
-        `max_tokens must be an integer between 1 and ${gatewayMaxTokens}`,
+        `max_tokens must be an integer between 0 and ${gatewayMaxTokens}`,
         'max_tokens',
       );
     }
