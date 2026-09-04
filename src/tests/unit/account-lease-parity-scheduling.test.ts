@@ -850,6 +850,38 @@ describe('AccountLeaseService parity scheduling replay', () => {
     expect(otherModel?.id).toBe('acc-1');
   });
 
+  it('does not reset model A failure escalation when finalizing a model B selection', async () => {
+    await service.markFromUpstreamError({
+      accountIdOrEmail: 'acc-1',
+      status: 429,
+      model: 'model-a',
+      body: JSON.stringify({
+        error: {
+          details: [{ reason: 'MODEL_CAPACITY_EXHAUSTED' }],
+        },
+      }),
+    });
+
+    await expect(
+      service.getNextToken({ model: 'model-b', excludeAccountIds: ['acc-2'] }),
+    ).resolves.toMatchObject({ id: 'acc-1' });
+
+    await service.markFromUpstreamError({
+      accountIdOrEmail: 'acc-1',
+      status: 429,
+      model: 'model-a',
+      body: JSON.stringify({
+        error: {
+          details: [{ reason: 'MODEL_CAPACITY_EXHAUSTED' }],
+        },
+      }),
+    });
+
+    expect((service as any).rateLimitTracker.getRemainingWaitSeconds('acc-1', 'model-a')).toBe(
+      10,
+    );
+  });
+
   it('does not retry an account already attempted by the same request', async () => {
     setServerConfig(
       createProxyConfig({

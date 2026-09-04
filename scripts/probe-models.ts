@@ -69,65 +69,6 @@ export interface ResolvedCredentials {
   adminKey?: string;
 }
 
-const KNOWN_TARGET_MAPPINGS: Record<string, string> = {
-  // Claude models mapping to Sonnet 4.6 Thinking
-  'claude-sonnet-4-6': 'claude-sonnet-4-6-thinking',
-  'claude-sonnet-4-6-20260219': 'claude-sonnet-4-6-thinking',
-  'claude-sonnet-4-5': 'claude-sonnet-4-6-thinking',
-  'claude-sonnet-4-5-thinking': 'claude-sonnet-4-6-thinking',
-  'claude-sonnet-4-5-20250929': 'claude-sonnet-4-6-thinking',
-  'claude-3-5-sonnet-20241022': 'claude-sonnet-4-6-thinking',
-  'claude-3-5-sonnet-20240620': 'claude-sonnet-4-6-thinking',
-  'claude-3-5-sonnet': 'claude-sonnet-4-6-thinking',
-  'claude-3-7-sonnet': 'claude-sonnet-4-6-thinking',
-  'claude-haiku-4': 'claude-sonnet-4-6-thinking',
-  'claude-3-haiku-20240307': 'claude-sonnet-4-6-thinking',
-  'claude-haiku-4-5-20251001': 'claude-sonnet-4-6-thinking',
-
-  // Claude models mapping to Opus 4.6 Thinking
-  'claude-opus-4': 'claude-opus-4-6-thinking',
-  'claude-opus-4-5-thinking': 'claude-opus-4-6-thinking',
-  'claude-opus-4-5-20251101': 'claude-opus-4-6-thinking',
-  'claude-opus-4-6': 'claude-opus-4-6-thinking',
-  'claude-opus-4-6-20260201': 'claude-opus-4-6-thinking',
-
-  // OpenAI & Gemini mappings to Gemini 3 Flash
-  'gpt-4': 'gemini-3-flash',
-  'gpt-4-turbo': 'gemini-3-flash',
-  'gpt-4-turbo-preview': 'gemini-3-flash',
-  'gpt-4-0125-preview': 'gemini-3-flash',
-  'gpt-4-1106-preview': 'gemini-3-flash',
-  'gpt-4-0613': 'gemini-3-flash',
-  'gpt-4o': 'gemini-3-flash',
-  'gpt-4o-2024-05-13': 'gemini-3-flash',
-  'gpt-4o-2024-08-06': 'gemini-3-flash',
-  'gpt-4o-mini': 'gemini-3-flash',
-  'gpt-4o-mini-2024-07-18': 'gemini-3-flash',
-  'gpt-3.5-turbo': 'gemini-3-flash',
-  'gpt-3.5-turbo-16k': 'gemini-3-flash',
-  'gpt-3.5-turbo-0125': 'gemini-3-flash',
-  'gpt-3.5-turbo-1106': 'gemini-3-flash',
-  'gpt-3.5-turbo-0613': 'gemini-3-flash',
-  'gemini-2.5-flash-lite': 'gemini-3-flash',
-  'gemini-2.5-flash': 'gemini-3-flash',
-  'gemini-2.0-flash': 'gemini-3-flash',
-  'gemini-2.0-flash-online': 'gemini-3-flash',
-  'gemini-3-flash-preview': 'gemini-3-flash',
-  'internal-background-task': 'gemini-3-flash',
-
-  // Gemini mappings to Gemini 3.1 Pro High
-  'gemini-3.1-pro-preview': 'gemini-3.1-pro-high',
-  'gemini-3.1-pro': 'gemini-3.1-pro-high',
-  'gemini-3.0-pro': 'gemini-3.1-pro-high',
-  'gemini-2.5-pro': 'gemini-3.1-pro-high',
-
-  // Gemini mappings to Gemini 3 Pro Preview
-  'gemini-3-pro': 'gemini-3-pro-preview',
-
-  // Gemini Image mappings
-  'gemini-3-pro-image-preview': 'gemini-3-pro-image',
-};
-
 export function parseCliArgs(argv: string[]): ParsedCliArgs {
   // Check for forbidden credential CLI options
   for (const arg of argv) {
@@ -278,13 +219,6 @@ export function resolveRequestTarget(
   const normalized = modelId.trim().toLowerCase();
   if (forwardingRules && forwardingRules[normalized]) {
     return forwardingRules[normalized];
-  }
-  if (KNOWN_TARGET_MAPPINGS[normalized]) {
-    return KNOWN_TARGET_MAPPINGS[normalized];
-  }
-  // Dynamic image resolution / ratio variants map to gemini-3-pro-image
-  if (normalized.startsWith('gemini-3-pro-image-')) {
-    return 'gemini-3-pro-image';
   }
   return modelId.trim();
 }

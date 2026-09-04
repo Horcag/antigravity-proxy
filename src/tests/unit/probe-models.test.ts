@@ -129,55 +129,36 @@ describe('probe-models CLI tool', () => {
   });
 
   describe('Target Resolution & Model Mapping', () => {
-    it('resolves known OpenAI and Gemini aliases to gemini-3-flash', () => {
-      expect(resolveRequestTarget('gpt-4o')).toBe('gemini-3-flash');
-      expect(resolveRequestTarget('gpt-3.5-turbo')).toBe('gemini-3-flash');
-      expect(resolveRequestTarget('gemini-2.5-flash')).toBe('gemini-3-flash');
-      expect(resolveRequestTarget('gemini-2.0-flash')).toBe('gemini-3-flash');
-    });
-
-    it('resolves Claude aliases to Sonnet and Opus thinking targets', () => {
-      expect(resolveRequestTarget('claude-sonnet-4-6')).toBe('claude-sonnet-4-6-thinking');
-      expect(resolveRequestTarget('claude-3-5-sonnet')).toBe('claude-sonnet-4-6-thinking');
-      expect(resolveRequestTarget('claude-opus-4-6')).toBe('claude-opus-4-6-thinking');
-    });
-
-    it('resolves Gemini Pro aliases to gemini-3.1-pro-high', () => {
-      expect(resolveRequestTarget('gemini-3.1-pro')).toBe('gemini-3.1-pro-high');
-      expect(resolveRequestTarget('gemini-2.5-pro')).toBe('gemini-3.1-pro-high');
-    });
-
-    it('resolves dynamic image resolution variants to gemini-3-pro-image', () => {
-      expect(resolveRequestTarget('gemini-3-pro-image-2k')).toBe('gemini-3-pro-image');
-      expect(resolveRequestTarget('gemini-3-pro-image-16x9')).toBe('gemini-3-pro-image');
-    });
-
-    it('respects dynamic forwarding rules', () => {
+    it('uses live admin forwarding rules', () => {
       const forwarding = { 'legacy-target': 'gemini-3.5-flash-high' };
       expect(resolveRequestTarget('legacy-target', forwarding)).toBe('gemini-3.5-flash-high');
     });
 
-    it('preserves canonical unmapped models', () => {
+    it('preserves every published ID without a live forwarding rule', () => {
       expect(resolveRequestTarget('gemini-3.5-flash-high')).toBe('gemini-3.5-flash-high');
       expect(resolveRequestTarget('gpt-oss-120b-medium')).toBe('gpt-oss-120b-medium');
+      expect(resolveRequestTarget('gpt-4o')).toBe('gpt-4o');
+      expect(resolveRequestTarget('gemini-3-pro-image-2k')).toBe('gemini-3-pro-image-2k');
     });
   });
 
   describe('Inventory Construction', () => {
-    it('distinguishes published IDs, raw quota IDs, and deduplicated targets', () => {
-      const published = ['gemini-3-flash', 'gpt-4o', 'gpt-3.5-turbo', 'gemini-3-pro-image'];
+    it('uses live forwarding rules as the only deduplication source', () => {
+      const published = ['gemini-3-flash', 'legacy-flash', 'legacy-flash-alt'];
       const rawQuota = ['gemini-2.5-flash', 'gemini-2.5-pro'];
 
-      const inventory = buildInventory(published, rawQuota);
+      const inventory = buildInventory(published, rawQuota, {
+        'legacy-flash': 'gemini-3-flash',
+        'legacy-flash-alt': 'gemini-3-flash',
+      });
 
-      expect(inventory.published_count).toBe(4);
+      expect(inventory.published_count).toBe(3);
       expect(inventory.raw_quota_count).toBe(2);
-      expect(inventory.target_count).toBe(2); // gemini-3-flash and gemini-3-pro-image
+      expect(inventory.target_count).toBe(1);
 
       expect(inventory.deduplicated_targets['gemini-3-flash']).toEqual(
-        expect.arrayContaining(['gemini-3-flash', 'gpt-4o', 'gpt-3.5-turbo']),
+        expect.arrayContaining(['gemini-3-flash', 'legacy-flash', 'legacy-flash-alt']),
       );
-      expect(inventory.deduplicated_targets['gemini-3-pro-image']).toEqual(['gemini-3-pro-image']);
     });
   });
 

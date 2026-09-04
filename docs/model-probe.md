@@ -12,7 +12,7 @@
 2. **Catalog Inventory & Deduplication**:
    - Fetches published model IDs from `GET /v1/models`.
    - Fetches provider raw quota IDs from `GET /admin/accounts` (when `AG_PROXY_ADMIN_API_KEY` is present).
-   - Distinguishes and maps published IDs to underlying deduplicated request targets (e.g., `gpt-4o` -> `gemini-3-flash`, `claude-sonnet-4-6` -> `claude-sonnet-4-6-thinking`).
+   - Uses live `model_forwarding_rules` from `/admin/accounts` to map published IDs to deduplicated request targets. Without an admin rule, the published ID remains its own target.
 3. **Modality-Specific Minimal Probing**:
    - Automatically classifies models by modality (`text` vs `image`).
    - Text models are probed via `POST /v1/chat/completions` using a tiny payload (`max_tokens: 1`, prompt `"hi"`).
@@ -114,15 +114,15 @@ node scripts/probe-models.ts > audit.json
       "claude-sonnet-4-6-thinking",
       "gemini-3-flash",
       "gemini-3-pro-image",
-      "gpt-4o"
+      "legacy-flash"
     ],
     "provider_raw_quota_ids": [
       "gemini-2.5-flash",
       "gemini-2.5-pro"
     ],
     "deduplicated_targets": {
-      "gemini-3-flash": ["gemini-3-flash", "gpt-4o"],
-      "claude-sonnet-4-6-thinking": ["claude-sonnet-4-6", "claude-sonnet-4-6-thinking"],
+      "gemini-3-flash": ["gemini-3-flash", "legacy-flash"],
+      "claude-sonnet-4-6": ["claude-sonnet-4-6"],
       "gemini-3-pro-image": ["gemini-3-pro-image"]
     },
     "published_count": 5,

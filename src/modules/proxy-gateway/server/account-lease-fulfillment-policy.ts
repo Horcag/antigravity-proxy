@@ -8,7 +8,6 @@ interface AccountLeaseFulfillmentLogger {
 
 interface AccountLeaseFulfillmentPolicyOptions {
   hydrationPolicy: AccountLeaseHydrationPolicy;
-  markRateLimitSuccess: (accountId: string) => void;
   bindSession: (sessionKey: string | undefined, accountId: string, expiresAt: number) => void;
   stickySessionTtlMs: number;
   resolveFallbackProjectId: () => string;
@@ -36,7 +35,6 @@ export class AccountLeaseFulfillmentPolicy {
         fallbackProjectId: this.options.resolveFallbackProjectId(),
       });
 
-      this.options.markRateLimitSuccess(accountId);
       this.options.bindSession(sessionKey, accountId, Date.now() + this.options.stickySessionTtlMs);
 
       const timestamp = Date.now();

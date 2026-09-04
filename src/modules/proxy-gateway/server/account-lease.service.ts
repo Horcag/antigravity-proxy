@@ -86,7 +86,6 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     });
     this.fulfillmentPolicy = new AccountLeaseFulfillmentPolicy({
       hydrationPolicy: this.hydrationPolicy,
-      markRateLimitSuccess: (accountId) => this.rateLimitTracker.markSuccess(accountId),
       bindSession: (sessionKey, accountId, expiresAt) =>
         this.selectionPolicy.bindSession(sessionKey, accountId, expiresAt),
       stickySessionTtlMs: this.stickySessionTtlMs,
