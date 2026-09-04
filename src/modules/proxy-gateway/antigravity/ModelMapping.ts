@@ -24,10 +24,6 @@ export const OPENAI_COMPATIBLE_DEFAULT_MODELS = {
   images: 'gemini-3-pro-image',
 } as const;
 
-const OPENAI_COMPATIBLE_DEFAULT_MODEL_IDS = new Set<string>(
-  Object.values(OPENAI_COMPATIBLE_DEFAULT_MODELS),
-);
-
 const PUBLIC_SUPPORTED_MODELS = [
   ...Object.keys(PUBLIC_MODEL_PRESET_DISPLAY_NAMES),
   ...new Set(Object.values(OPENAI_COMPATIBLE_DEFAULT_MODELS)),
@@ -84,7 +80,6 @@ const CLAUDE_TO_GEMINI: Record<string, string> = {
   'gpt-3.5-turbo-0613': 'gemini-3-flash',
 
   // Gemini Protocol Mapping
-  'gemini-2.5-flash-lite': 'gemini-3-flash',
   'gemini-3.1-pro-preview': 'gemini-3.1-pro-high',
   'gemini-3.1-pro': 'gemini-3.1-pro-high',
   'gemini-3.0-pro': 'gemini-3.1-pro-high',
@@ -92,18 +87,40 @@ const CLAUDE_TO_GEMINI: Record<string, string> = {
   'gemini-3-pro-preview': 'gemini-3-pro-preview',
   'gemini-3-pro-low': 'gemini-3-pro-low',
   'gemini-3-pro-high': 'gemini-3-pro-high',
-  'gemini-2.5-flash': 'gemini-3-flash',
   'gemini-2.5-pro': 'gemini-3.1-pro-high',
-  'gemini-2.0-flash': 'gemini-3-flash',
-  'gemini-2.0-flash-online': 'gemini-3-flash',
   'gemini-3-pro-image': 'gemini-3-pro-image',
-  'internal-background-task': 'gemini-3-flash',
 };
 
-const DYNAMIC_IMAGE_BASE_MODEL = 'gemini-3-pro-image';
-const DYNAMIC_IMAGE_RESOLUTIONS = ['', '-2k', '-4k'];
-const DYNAMIC_IMAGE_RATIOS = ['', '-1x1', '-4x3', '-3x4', '-16x9', '-9x16', '-21x9'];
-const EXTRA_DYNAMIC_MODELS = ['gemini-3-flash', 'gemini-3.1-pro-high', 'gemini-3.1-pro-low'];
+export const NON_CHAT_CATALOG_MODEL_IDS: ReadonlySet<string> = new Set([
+  'chat_20706',
+  'chat_23310',
+  'tab_flash_lite_preview',
+  'tab_jump_flash_lite_preview',
+  'internal-background-task',
+]);
+
+export function isNonChatCatalogModelId(modelId: string): boolean {
+  const normalized = modelId.trim().replace(/^models\//i, '').toLowerCase();
+  return NON_CHAT_CATALOG_MODEL_IDS.has(normalized);
+}
+
+export function isImageCatalogModelId(modelId: string): boolean {
+  const normalized = modelId.trim().replace(/^models\//i, '').toLowerCase();
+  return /(?:^|-)image(?:-|$)/.test(normalized);
+}
+
+function normalizeCatalogModelId(modelId: unknown): string | undefined {
+  if (!isString(modelId)) {
+    return undefined;
+  }
+
+  const normalized = modelId.trim().replace(/^models\//i, '');
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(normalized)) {
+    return undefined;
+  }
+
+  return normalized;
+}
 
 const DYNAMIC_MODEL_FORWARDING_RULES = new Map<string, string>();
 
@@ -118,8 +135,9 @@ function collectDynamicModelIds(dynamicModelIds?: Iterable<string>): Set<string>
   }
 
   for (const dynamicModelId of dynamicModelIds) {
-    if (isString(dynamicModelId) && !isEmpty(dynamicModelId.trim())) {
-      modelIds.add(dynamicModelId.trim());
+    const normalizedModelId = normalizeCatalogModelId(dynamicModelId);
+    if (normalizedModelId) {
+      modelIds.add(normalizedModelId);
     }
   }
 
@@ -132,8 +150,6 @@ const GEMINI_MODEL_ALIASES: Record<string, string> = {
   'gemini-3.1-pro-preview': 'gemini-3.1-pro-high',
   'gemini-3.1-pro': 'gemini-3.1-pro-high',
 };
-
-const INTERNAL_BACKGROUND_TASK_MODEL = 'internal-background-task';
 
 export function getSupportedModels(): string[] {
   return [...PUBLIC_SUPPORTED_MODELS];
@@ -168,59 +184,31 @@ export function getDynamicForwardingTarget(modelId: string): string | undefined 
 }
 
 export function getAllDynamicModels(
-  customMapping: Record<string, string> = {},
+  _customMapping: Record<string, string> = {},
   dynamicModelIds?: Iterable<string>,
 ): string[] {
   const modelIds = collectDynamicModelIds(dynamicModelIds);
-  const shouldUseStaticFallback = modelIds.size === 0;
-
-  for (const modelId of getSupportedModels()) {
-    modelIds.add(modelId);
+  if (modelIds.size === 0) {
+    return [];
   }
 
-  for (const customModelId of Object.keys(customMapping)) {
-    modelIds.add(customModelId);
-  }
-
-  if (shouldUseStaticFallback) {
-    for (const resolution of DYNAMIC_IMAGE_RESOLUTIONS) {
-      for (const ratio of DYNAMIC_IMAGE_RATIOS) {
-        modelIds.add(`${DYNAMIC_IMAGE_BASE_MODEL}${resolution}${ratio}`);
-      }
-    }
-
-    for (const modelId of EXTRA_DYNAMIC_MODELS) {
-      modelIds.add(modelId);
-    }
-  }
-
-  return [...modelIds].filter((id) => !shouldHideDeprecatedModelFromList(id)).sort();
+  return [...modelIds]
+    .filter((id) => !isNonChatCatalogModelId(id))
+    .sort();
 }
 
 export function getOpenAICompatibleModels(
-  customMapping: Record<string, string> = {},
+  _customMapping: Record<string, string> = {},
   dynamicModelIds?: Iterable<string>,
-  anthropicMapping: Record<string, string> = {},
+  _anthropicMapping: Record<string, string> = {},
 ): string[] {
-  const configuredExactAliases = new Set(
-    [...Object.keys(customMapping), ...Object.keys(anthropicMapping)].filter(
-      (modelId) => !isEmpty(modelId.trim()) && !modelId.includes('*'),
-    ),
-  );
-  const modelIds = new Set([
-    ...getAllDynamicModels(customMapping, dynamicModelIds),
-    ...Object.keys(CLAUDE_TO_GEMINI),
-    ...Object.keys(GEMINI_MODEL_ALIASES),
-    ...configuredExactAliases,
-  ]);
+  const modelIds = collectDynamicModelIds(dynamicModelIds);
+  if (modelIds.size === 0) {
+    return [];
+  }
 
   return [...modelIds]
-    .filter(
-      (id) =>
-        !id.includes('*') &&
-        (configuredExactAliases.has(id) ||
-          (id !== INTERNAL_BACKGROUND_TASK_MODEL && !shouldHideNonChatModelFromOpenAIList(id))),
-    )
+    .filter((id) => !isNonChatCatalogModelId(id) && !isImageCatalogModelId(id))
     .sort();
 }
 
@@ -359,35 +347,3 @@ export function resolveModelRoute(
   return mapClaudeModelToGemini(originalModel);
 }
 
-function shouldHideDeprecatedModelFromList(modelId: string): boolean {
-  const normalized = modelId.toLowerCase();
-
-  if (/^gemini-1(\.|$|-)/.test(normalized) || /^gemini-2(\.|$|-)/.test(normalized)) {
-    return true;
-  }
-
-  if (normalized === 'gemini-3.1-pro' || normalized === 'gemini-3.1-pro-preview') {
-    return true;
-  }
-
-  const isLegacyGeminiPro =
-    /^gemini-3(\.0)?-pro($|-)/.test(normalized) && !normalized.startsWith('gemini-3-pro-image');
-  if (isLegacyGeminiPro) {
-    return true;
-  }
-
-  if (
-    normalized.includes('claude-sonnet-4-5') ||
-    normalized.includes('claude-opus-4-5') ||
-    normalized.includes('claude-haiku-4-5')
-  ) {
-    return true;
-  }
-
-  return false;
-}
-
-function shouldHideNonChatModelFromOpenAIList(modelId: string): boolean {
-  const normalized = modelId.toLowerCase();
-  return /(^|-)image($|-)/.test(normalized) && !OPENAI_COMPATIBLE_DEFAULT_MODEL_IDS.has(normalized);
-}
