@@ -260,6 +260,7 @@ export class ProxyService {
             token.token.access_token,
             token.token.upstream_proxy_url,
             extraHeaders,
+            token.id,
           );
           this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
           return this.processAnthropicInternalStream(
@@ -274,6 +275,7 @@ export class ProxyService {
             token.token.access_token,
             token.token.upstream_proxy_url,
             extraHeaders,
+            token.id,
           );
           this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
           return this.toAnthropicChatResponse(
@@ -302,6 +304,7 @@ export class ProxyService {
                 token.token.access_token,
                 token.token.upstream_proxy_url,
                 extraHeaders,
+                token.id,
               );
               this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
               return this.processAnthropicInternalStream(
@@ -316,6 +319,7 @@ export class ProxyService {
                 token.token.access_token,
                 token.token.upstream_proxy_url,
                 extraHeaders,
+                token.id,
               );
               this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
               return this.toAnthropicChatResponse(
@@ -354,6 +358,7 @@ export class ProxyService {
                 token.token.access_token,
                 token.token.upstream_proxy_url,
                 extraHeaders,
+                token.id,
               );
               this.retryPolicy.markUpstreamSuccess(token.id, 'gemini-3-flash');
               return this.processAnthropicInternalStream(
@@ -368,6 +373,7 @@ export class ProxyService {
                 token.token.access_token,
                 token.token.upstream_proxy_url,
                 extraHeaders,
+                token.id,
               );
               this.retryPolicy.markUpstreamSuccess(token.id, 'gemini-3-flash');
               const transformed = this.toAnthropicChatResponse(
@@ -622,6 +628,7 @@ export class ProxyService {
           token.token.access_token,
           token.token.upstream_proxy_url,
           extraHeaders,
+          token.id,
         );
 
         this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
@@ -646,6 +653,7 @@ export class ProxyService {
               token.token.access_token,
               token.token.upstream_proxy_url,
               extraHeaders,
+              token.id,
             );
             this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
             return this.normalizeGeminiGenerateResponse(response);
@@ -723,6 +731,7 @@ export class ProxyService {
           token.token.access_token,
           token.token.upstream_proxy_url,
           extraHeaders,
+          token.id,
         );
         this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
         return this.passthroughSseStream(stream);
@@ -746,6 +755,7 @@ export class ProxyService {
               token.token.access_token,
               token.token.upstream_proxy_url,
               extraHeaders,
+              token.id,
             );
             this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
             return this.passthroughSseStream(stream);
@@ -975,6 +985,7 @@ export class ProxyService {
               token.token.access_token,
               token.token.upstream_proxy_url,
               extraHeaders,
+              token.id,
             );
             this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
             return this.createOpenAIProtocolStream(
@@ -1000,6 +1011,7 @@ export class ProxyService {
               token.token.access_token,
               token.token.upstream_proxy_url,
               extraHeaders,
+              token.id,
             );
             this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
             const claudeResponse = transformResponse(response, signatureContext);
@@ -1019,6 +1031,7 @@ export class ProxyService {
             token.token.access_token,
             token.token.upstream_proxy_url,
             extraHeaders,
+            token.id,
           );
           this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
           // Transform Gemini response to OpenAI format
@@ -1051,6 +1064,7 @@ export class ProxyService {
                 token.token.access_token,
                 token.token.upstream_proxy_url,
                 extraHeaders,
+                token.id,
               );
               this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
               return this.createOpenAIProtocolStream(
@@ -1068,6 +1082,7 @@ export class ProxyService {
               token.token.access_token,
               token.token.upstream_proxy_url,
               extraHeaders,
+              token.id,
             );
             this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
             const claudeResponse = transformResponse(response, signatureContext);
@@ -1102,12 +1117,14 @@ export class ProxyService {
     accessToken: string,
     upstreamProxyUrl?: string,
     extraHeaders?: Record<string, string>,
+    accountKey?: string,
   ): Promise<GeminiResponse> {
     const direct = await this.geminiClient.generateInternal(
       body,
       accessToken,
       upstreamProxyUrl,
       extraHeaders,
+      accountKey,
     );
     if (this.hasUsableGeminiCandidate(direct)) {
       return direct;
@@ -1119,6 +1136,7 @@ export class ProxyService {
       accessToken,
       upstreamProxyUrl,
       extraHeaders,
+      accountKey,
     );
     return this.collectGeminiStreamAsResponse(stream);
   }

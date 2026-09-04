@@ -19,14 +19,119 @@ export function unwrapInternalGeminiResponse<T>(payload: T | { response: T }): T
   return payload as T;
 }
 
+export interface NegativeProjectCapabilityEntry {
+  accountKey: string;
+  project: string;
+  cachedAt: number;
+  expiresAt: number;
+}
+
+export const DEFAULT_PROJECT_CAPABILITY_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const PROJECT_HEADER_ATTEMPT_COUNT = 2;
+
+export class UserProjectCapabilityCache {
+  private readonly entries = new Map<string, NegativeProjectCapabilityEntry>();
+  private readonly maxEntries = 1000;
+
+  private createKey(accountKey: string, project: string): string | null {
+    const safeAccount = accountKey?.trim();
+    const safeProject = project?.trim();
+    if (!safeAccount || !safeProject) {
+      return null;
+    }
+    // Never key by token: reject any token-like value
+    if (
+      safeAccount.startsWith('ya29.') ||
+      safeAccount.toLowerCase().startsWith('bearer ') ||
+      safeAccount.length > 256
+    ) {
+      return null;
+    }
+    return `${safeAccount}:${safeProject}`;
+  }
+
+  hasNegativeCapability(accountKey: string, project: string, now = Date.now()): boolean {
+    const key = this.createKey(accountKey, project);
+    if (!key) {
+      return false;
+    }
+    const entry = this.entries.get(key);
+    if (!entry) {
+      return false;
+    }
+    if (entry.expiresAt <= now) {
+      this.entries.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  recordNegativeCapability(
+    accountKey: string,
+    project: string,
+    ttlMs = DEFAULT_PROJECT_CAPABILITY_TTL_MS,
+    now = Date.now(),
+  ): void {
+    const key = this.createKey(accountKey, project);
+    if (!key) {
+      return;
+    }
+    if (this.entries.size >= this.maxEntries) {
+      this.pruneExpired(now);
+      if (this.entries.size >= this.maxEntries) {
+        const oldestKey = this.entries.keys().next().value;
+        if (oldestKey) {
+          this.entries.delete(oldestKey);
+        }
+      }
+    }
+    this.entries.set(key, {
+      accountKey: accountKey.trim(),
+      project: project.trim(),
+      cachedAt: now,
+      expiresAt: now + ttlMs,
+    });
+  }
+
+  clearNegativeCapability(accountKey: string, project: string): void {
+    const key = this.createKey(accountKey, project);
+    if (!key) {
+      return;
+    }
+    this.entries.delete(key);
+  }
+
+  clearAll(): void {
+    this.entries.clear();
+  }
+
+  private pruneExpired(now: number): void {
+    for (const [key, entry] of this.entries) {
+      if (entry.expiresAt <= now) {
+        this.entries.delete(key);
+      }
+    }
+  }
+
+  getSnapshot(): NegativeProjectCapabilityEntry[] {
+    const now = Date.now();
+    this.pruneExpired(now);
+    return [...this.entries.values()];
+  }
+}
+
 @Injectable()
 export class GeminiClient {
   private readonly logger = new Logger(GeminiClient.name);
+  public readonly userProjectCapabilityCache = new UserProjectCapabilityCache();
+  private preferredInternalBaseUrl?: string;
+  private lastConfiguredBaseUrlsKey = '';
+
   // Default to v1beta for most features
   private readonly baseUrl = 'https://generativelanguage.googleapis.com/v1beta';
   private readonly defaultInternalBaseUrls = [
-    'https://cloudcode-pa.googleapis.com/v1internal',
     'https://daily-cloudcode-pa.googleapis.com/v1internal',
+    'https://cloudcode-pa.googleapis.com/v1internal',
   ];
 
   async streamGenerate(
@@ -109,6 +214,7 @@ export class GeminiClient {
     accessToken: string,
     upstreamProxyUrl?: string,
     extraHeaders?: Record<string, string>,
+    accountKeyOrOptions?: string | { accountKey?: string; accountId?: string },
   ): Promise<NodeJS.ReadableStream> {
     const response = await this.executeRequestWithEndpointFailover<NodeJS.ReadableStream>(
       ':streamGenerateContent?alt=sse',
@@ -120,6 +226,7 @@ export class GeminiClient {
       },
       'stream-generate',
       extraHeaders,
+      accountKeyOrOptions,
     );
 
     return response.data;
@@ -130,6 +237,7 @@ export class GeminiClient {
     accessToken: string,
     upstreamProxyUrl?: string,
     extraHeaders?: Record<string, string>,
+    accountKeyOrOptions?: string | { accountKey?: string; accountId?: string },
   ): Promise<GeminiResponse> {
     const response = await this.executeRequestWithEndpointFailover<
       GeminiResponse | { response: GeminiResponse }
@@ -141,8 +249,49 @@ export class GeminiClient {
       {},
       'generate-content',
       extraHeaders,
+      accountKeyOrOptions,
     );
     return unwrapInternalGeminiResponse(response.data);
+  }
+
+  getOrderedInternalBaseUrls(): string[] {
+    const configuredBaseUrls = this.getInternalBaseUrls();
+    const configKey = configuredBaseUrls.join('|');
+
+    if (this.lastConfiguredBaseUrlsKey !== configKey) {
+      this.preferredInternalBaseUrl = undefined;
+      this.lastConfiguredBaseUrlsKey = configKey;
+    }
+
+    if (configuredBaseUrls.length <= 1) {
+      return configuredBaseUrls;
+    }
+
+    if (
+      this.preferredInternalBaseUrl &&
+      configuredBaseUrls.includes(this.preferredInternalBaseUrl)
+    ) {
+      return [
+        this.preferredInternalBaseUrl,
+        ...configuredBaseUrls.filter((url) => url !== this.preferredInternalBaseUrl),
+      ];
+    }
+
+    return configuredBaseUrls;
+  }
+
+  resetPreferredEndpoint(): void {
+    this.preferredInternalBaseUrl = undefined;
+    this.lastConfiguredBaseUrlsKey = '';
+  }
+
+  private resolveAccountKey(
+    accountKeyOrOptions?: string | { accountKey?: string; accountId?: string },
+  ): string {
+    if (typeof accountKeyOrOptions === 'string') {
+      return accountKeyOrOptions.trim();
+    }
+    return (accountKeyOrOptions?.accountKey ?? accountKeyOrOptions?.accountId ?? '').trim();
   }
 
   private getInternalBaseUrls(): string[] {
@@ -177,12 +326,13 @@ export class GeminiClient {
 
     const status = error.response.status;
 
-    // Permanent auth errors should fail fast for current token.
-    if (status === 401 || status === 403) {
+    // Permanent auth errors and ordinary client errors should not rotate endpoints.
+    if (status === 400 || status === 401 || status === 403) {
       return false;
     }
 
-    return status === 408 || status === 429 || status >= 500;
+    // 499 is Google's client-cancelled code emitted for upstream aborts.
+    return status === 408 || status === 429 || status === 499 || status >= 500;
   }
 
   private async executeRequestWithEndpointFailover<T>(
@@ -193,15 +343,27 @@ export class GeminiClient {
     config: AxiosRequestConfig,
     operation: string,
     extraHeaders?: Record<string, string>,
+    accountKeyOrOptions?: string | { accountKey?: string; accountId?: string },
   ): Promise<AxiosResponse<T>> {
-    const baseUrls = this.getInternalBaseUrls();
+    const safeProject = body.project?.trim();
+    const safeAccount = this.resolveAccountKey(accountKeyOrOptions);
+    const hasKnownNegativeCapability = Boolean(
+      safeProject &&
+        this.userProjectCapabilityCache.hasNegativeCapability(safeAccount, safeProject),
+    );
+    let hasTriggeredProjectHeaderDowngrade = hasKnownNegativeCapability;
+
+    const baseUrls = this.getOrderedInternalBaseUrls();
     const timeout = this.getInternalTimeoutMs();
     const requestUserAgent = await resolveRequestUserAgent();
     const axiosProxy = this.resolveUpstreamAxiosProxy(upstreamProxyUrl);
     let lastError: unknown = null;
-    let hasTriggeredProjectHeaderDowngrade = false;
 
-    for (let projectHeaderAttempt = 0; projectHeaderAttempt < 5; projectHeaderAttempt++) {
+    for (
+      let projectHeaderAttempt = 0;
+      projectHeaderAttempt < PROJECT_HEADER_ATTEMPT_COUNT;
+      projectHeaderAttempt++
+    ) {
       let shouldRetryWithoutProjectHeader = false;
       const projectHeaders = hasTriggeredProjectHeaderDowngrade
         ? {}
@@ -212,7 +374,7 @@ export class GeminiClient {
         const url = `${baseUrl}${path}`;
 
         try {
-          return await axios.post<T>(url, this.createInternalRequestBody(path, body), {
+          const response = await axios.post<T>(url, this.createInternalRequestBody(path, body), {
             headers: {
               Authorization: `Bearer ${accessToken}`,
               'Content-Type': 'application/json',
@@ -224,13 +386,24 @@ export class GeminiClient {
             proxy: axiosProxy,
             ...config,
           });
+
+          this.preferredInternalBaseUrl = baseUrl;
+          if (Boolean(projectHeaders['x-goog-user-project']) && safeProject) {
+            this.userProjectCapabilityCache.clearNegativeCapability(safeAccount, safeProject);
+          }
+          return response;
         } catch (error) {
           lastError = error;
 
           if (this.shouldRetryWithoutProjectHeader(error, projectHeaders)) {
             this.logger.warn(
-              `[${operation}] received 403 with x-goog-user-project; retrying without project header.`,
+              `[${operation}] received 403 with x-goog-user-project for account=${
+                safeAccount || 'default'
+              } project=${safeProject}; retrying without project header.`,
             );
+            if (safeProject) {
+              this.userProjectCapabilityCache.recordNegativeCapability(safeAccount, safeProject);
+            }
             hasTriggeredProjectHeaderDowngrade = true;
             shouldRetryWithoutProjectHeader = true;
             break;
