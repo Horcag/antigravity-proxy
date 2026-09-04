@@ -124,12 +124,23 @@ export class AccountLeaseModelPolicy {
           continue;
         }
         describedModels.add(normalizedModelId);
-        allModels.add(getPublicModelIdForDisplayName(modelInfo.display_name) ?? normalizedModelId);
+        const publicModelId =
+          getPublicModelIdForDisplayName(modelInfo.display_name) ?? normalizedModelId;
+        if (
+          !this.unrequestableModels.has(normalizedModelId) &&
+          !this.unrequestableModels.has(publicModelId)
+        ) {
+          allModels.add(publicModelId);
+        }
       }
 
       for (const modelId of Object.keys(tokenData.model_quotas)) {
         const normalizedModelId = normalizeModelId(modelId)?.toLowerCase();
-        if (normalizedModelId && !describedModels.has(normalizedModelId)) {
+        if (
+          normalizedModelId &&
+          !describedModels.has(normalizedModelId) &&
+          !this.unrequestableModels.has(normalizedModelId)
+        ) {
           allModels.add(normalizedModelId);
         }
       }

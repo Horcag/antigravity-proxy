@@ -10,7 +10,7 @@
    - Credentials (`AG_PROXY_API_KEY`, `AG_PROXY_ADMIN_API_KEY`) are read **strictly from the process environment**.
    - Passing API or admin keys via command-line arguments (e.g. `--api-key`) is explicitly forbidden and rejected at startup to prevent key exposure via process tables (`ps`), shell histories, or CI logs.
 2. **Catalog Inventory & Deduplication**:
-   - Fetches published model IDs from `GET /v1/models`.
+   - Fetches and unions published IDs from `GET /v1/models` and `GET /v1beta/models`; Gemini names are normalized from `models/<id>` to `<id>`, so image-only models are inventoried and probed via the image route.
    - Fetches provider raw quota IDs from `GET /admin/accounts` (when `AG_PROXY_ADMIN_API_KEY` is present).
    - Uses live `model_forwarding_rules` from `/admin/accounts` to map published IDs to deduplicated request targets. Without an admin rule, the published ID remains its own target.
 3. **Modality-Specific Minimal Probing**:
@@ -58,7 +58,7 @@ chmod +x scripts/probe-models.ts
 
 | Variable | Description | Required | Default |
 | :--- | :--- | :--- | :--- |
-| `AG_PROXY_API_KEY` | Bearer API key used for `/v1/models` and completion endpoints | **Yes** | Fallback to `PROXY_API_KEY` / `OPENAI_API_KEY` |
+| `AG_PROXY_API_KEY` | Bearer API key used for public catalogs and completion endpoints | **Yes** | Fallback to `PROXY_API_KEY` / `OPENAI_API_KEY` |
 | `AG_PROXY_ADMIN_API_KEY` | Bearer Admin key used for `/admin/accounts` quota inspection | No | Fallback to `ADMIN_API_KEY` (skipped if unset) |
 | `AG_PROXY_BASE_URL` | Base URL of the running proxy instance | No | Derived from host & port |
 | `AG_PROXY_HOST` | Proxy host address | No | `127.0.0.1` |
@@ -70,14 +70,14 @@ chmod +x scripts/probe-models.ts
 
 | Flag | Description | Default |
 | :--- | :--- | :--- |
-| `--dry-run` | Inventory mode: inspects `/v1/models` and `/admin/accounts`, outputs target mapping, skips probe requests | `false` |
+| `--dry-run` | Inventory mode: inspects both public catalogs and `/admin/accounts`, outputs target mapping, skips probe requests | `false` |
 | `-c`, `--concurrency <N>` | Maximum concurrent probe requests | `4` |
 | `-t`, `--timeout <ms>` | Per-request timeout in milliseconds | `10000` |
 | `--url`, `--base-url <url>` | Override proxy base URL | `http://127.0.0.1:8045` |
 | `--json` | Output pure JSON to `stdout` | `false` |
 | `--summary` | Output human-readable summary to `stdout` | `false` |
 | `-o`, `--output <file>` | Save complete JSON audit report to a file | `undefined` |
-| `--models <m1,m2>` | Comma-separated list of specific models to probe | All published models |
+| `--models <m1,m2>` | Comma-separated IDs to probe; each must be published by either catalog | All published models |
 | `-h`, `--help` | Display help and usage information | `false` |
 
 ---
@@ -116,6 +116,10 @@ node scripts/probe-models.ts > audit.json
       "gemini-3-pro-image",
       "legacy-flash"
     ],
+    "catalog_sources": {
+      "openai": ["claude-sonnet-4-6", "gemini-3-flash", "legacy-flash"],
+      "gemini": ["gemini-3-pro-image"]
+    },
     "provider_raw_quota_ids": [
       "gemini-2.5-flash",
       "gemini-2.5-pro"

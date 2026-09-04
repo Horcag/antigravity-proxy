@@ -331,6 +331,42 @@ describe('Request compatibility for legacy aliases', () => {
     expect(resolved).toBe('gemini-3.8-flash-tiered');
   });
 
+  it('removes a runtime-rejected model from catalogs while preserving sibling rerouting', () => {
+    const tokenCache = new Map<string, AccountLeaseTokenData>([
+      [
+        'acc-1',
+        {
+          account_id: 'acc-1',
+          email: 'acc-1@test.dev',
+          access_token: 'token-1',
+          refresh_token: 'refresh-1',
+          token_type: 'Bearer',
+          expires_in: 3600,
+          expiry_timestamp: Math.floor(Date.now() / 1000) + 3600,
+          model_quotas: {
+            'gemini-3.8-flash-high': 99,
+            'gemini-3.8-flash-low': 99,
+          },
+          model_limits: {},
+          model_reset_times: {},
+          model_forwarding_rules: {},
+        },
+      ],
+    ]);
+    const policy = new AccountLeaseModelPolicy({
+      getTokenCache: () => tokenCache,
+      logger: { log: vi.fn(), warn: vi.fn() } as any,
+    });
+
+    policy.markModelUnrequestable('gemini-3.8-flash-high');
+
+    expect(policy.getAllCollectedModels()).not.toContain('gemini-3.8-flash-high');
+    expect(policy.getAllCollectedModels()).toContain('gemini-3.8-flash-low');
+    expect(policy.resolveDynamicModelForAccount('acc-1', 'gemini-3.8-flash-high')).toBe(
+      'gemini-3.8-flash-low',
+    );
+  });
+
   it('ProxyController accepts chat completion requests with legacy aliases', async () => {
     const mockProxyService: any = {
       handleChatCompletions: vi.fn().mockResolvedValue({

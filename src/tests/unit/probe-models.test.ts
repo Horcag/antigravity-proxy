@@ -4,6 +4,7 @@ import {
   categorizeHttpError,
   detectModelModality,
   fetchAdminAccounts,
+  fetchGeminiPublishedModels,
   fetchPublishedModels,
   formatSummary,
   isGenuineFailure,
@@ -180,6 +181,25 @@ describe('probe-models CLI tool', () => {
         expect.objectContaining({
           headers: { Authorization: 'Bearer key123' },
         }),
+      );
+    });
+
+    it('fetches Gemini catalog models and normalizes models/<id> names', async () => {
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          models: [{ name: 'models/gemini-3-pro-image' }, { name: 'gemini-3-flash' }],
+        }),
+      } as Response);
+
+      await expect(fetchGeminiPublishedModels('http://proxy', 'key123', 5000)).resolves.toEqual([
+        'gemini-3-pro-image',
+        'gemini-3-flash',
+      ]);
+      expect(fetchSpy).toHaveBeenCalledWith(
+        'http://proxy/v1beta/models',
+        expect.objectContaining({ headers: { Authorization: 'Bearer key123' } }),
       );
     });
 
@@ -462,6 +482,13 @@ describe('probe-models CLI tool', () => {
             }),
           } as Response;
         }
+        if (u.endsWith('/v1beta/models')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ models: [{ name: 'models/gemini-3-pro-image' }] }),
+          } as Response;
+        }
         throw new Error(`Unexpected endpoint called in dry-run: ${u}`);
       });
 
@@ -469,8 +496,16 @@ describe('probe-models CLI tool', () => {
       expect(exitCode).toBe(0);
       expect(report.summary.dry_run).toBe(true);
       expect(report.summary.probed).toBe(0);
-      expect(report.summary.total_published).toBe(2);
-      expect(report.inventory.published_ids).toEqual(['gemini-3-flash', 'gpt-4o']);
+      expect(report.summary.total_published).toBe(3);
+      expect(report.inventory.published_ids).toEqual([
+        'gemini-3-flash',
+        'gemini-3-pro-image',
+        'gpt-4o',
+      ]);
+      expect(report.inventory.catalog_sources).toEqual({
+        openai: ['gemini-3-flash', 'gpt-4o'],
+        gemini: ['gemini-3-pro-image'],
+      });
       expect(report.results).toEqual([]);
 
       const summaryText = formatSummary(report);
@@ -493,6 +528,22 @@ describe('probe-models CLI tool', () => {
             }),
           } as Response;
         }
+        if (u.endsWith('/v1beta/models')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ models: [{ name: 'models/gemini-3-pro-image' }] }),
+          } as Response;
+        }
+        if (u.endsWith('/v1/images/generations')) {
+          return {
+            status: 200,
+            json: async () => ({
+              model: 'gemini-3-pro-image',
+              data: [{ b64_json: 'sanitized' }],
+            }),
+          } as Response;
+        }
         if (u.endsWith('/v1/chat/completions')) {
           return {
             status: 200,
@@ -507,8 +558,8 @@ describe('probe-models CLI tool', () => {
 
       const { report, exitCode } = await runProbeAudit([]);
       expect(exitCode).toBe(0);
-      expect(report.summary.probed).toBe(1);
-      expect(report.summary.passed).toBe(1);
+      expect(report.summary.probed).toBe(2);
+      expect(report.summary.passed).toBe(2);
       expect(report.summary.failed).toBe(0);
 
       const summaryText = formatSummary(report);
@@ -530,6 +581,13 @@ describe('probe-models CLI tool', () => {
             }),
           } as Response;
         }
+        if (u.endsWith('/v1beta/models')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ models: [{ name: 'models/gemini-3-pro-image' }] }),
+          } as Response;
+        }
         if (u.endsWith('/v1/chat/completions')) {
           return {
             status: 500,
@@ -541,7 +599,7 @@ describe('probe-models CLI tool', () => {
 
       const { report, exitCode } = await runProbeAudit([]);
       expect(exitCode).toBe(1);
-      expect(report.summary.failed).toBe(2);
+      expect(report.summary.failed).toBe(3);
 
       const summaryText = formatSummary(report);
       expect(summaryText).toContain('MODEL(S) FAILED');

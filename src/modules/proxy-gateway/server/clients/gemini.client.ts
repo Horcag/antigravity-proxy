@@ -368,13 +368,16 @@ export class GeminiClient {
       const projectHeaders = hasTriggeredProjectHeaderDowngrade
         ? {}
         : this.createProjectHeaders(body);
+      const requestBody = hasTriggeredProjectHeaderDowngrade
+        ? this.createProjectlessRequestBody(body)
+        : body;
 
       for (let index = 0; index < baseUrls.length; index++) {
         const baseUrl = baseUrls[index];
         const url = `${baseUrl}${path}`;
 
         try {
-          const response = await axios.post<T>(url, this.createInternalRequestBody(path, body), {
+          const response = await axios.post<T>(url, this.createInternalRequestBody(path, requestBody), {
             headers: {
               Authorization: `Bearer ${accessToken}`,
               'Content-Type': 'application/json',
@@ -399,7 +402,7 @@ export class GeminiClient {
             this.logger.warn(
               `[${operation}] received 403 with x-goog-user-project for account=${
                 safeAccount || 'default'
-              } project=${safeProject}; retrying without project header.`,
+              } project=${safeProject}; retrying without project context.`,
             );
             if (safeProject) {
               this.userProjectCapabilityCache.recordNegativeCapability(safeAccount, safeProject);
@@ -440,6 +443,12 @@ export class GeminiClient {
     }
 
     return bodyText;
+  }
+
+  private createProjectlessRequestBody(body: GeminiInternalRequest): GeminiInternalRequest {
+    const projectlessBody = { ...body };
+    delete projectlessBody.project;
+    return projectlessBody;
   }
 
   private createProjectHeaders(body: GeminiInternalRequest): Record<string, string> {

@@ -30,6 +30,10 @@ export interface ModelProbeResult {
 
 export interface ModelInventory {
   published_ids: string[];
+  catalog_sources: {
+    openai: string[];
+    gemini: string[];
+  };
   provider_raw_quota_ids: string[];
   deduplicated_targets: Record<string, string[]>;
   published_count: number;
@@ -227,6 +231,7 @@ export function buildInventory(
   publishedIds: string[],
   rawQuotaIds: string[],
   forwardingRules: Record<string, string> = {},
+  catalogSources: ModelInventory['catalog_sources'] = { openai: publishedIds, gemini: [] },
 ): ModelInventory {
   const deduplicatedTargets: Record<string, string[]> = {};
   const sortedPublished = [...new Set(publishedIds)].sort();
@@ -242,6 +247,10 @@ export function buildInventory(
 
   return {
     published_ids: sortedPublished,
+    catalog_sources: {
+      openai: [...new Set(catalogSources.openai)].sort(),
+      gemini: [...new Set(catalogSources.gemini)].sort(),
+    },
     provider_raw_quota_ids: sortedRaw,
     deduplicated_targets: deduplicatedTargets,
     published_count: sortedPublished.length,
@@ -272,6 +281,32 @@ export async function fetchPublishedModels(
   }
 
   return json.data.map((item) => item.id).filter(Boolean);
+}
+
+export async function fetchGeminiPublishedModels(
+  baseUrl: string,
+  apiKey: string,
+  timeoutMs: number,
+): Promise<string[]> {
+  const res = await fetch(`${baseUrl}/v1beta/models`, {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+    },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Failed to fetch /v1beta/models: HTTP ${res.status}`);
+  }
+
+  const json = (await res.json()) as { models?: Array<{ name: string }> };
+  if (!json || !Array.isArray(json.models)) {
+    throw new Error('Invalid /v1beta/models response structure (missing models array)');
+  }
+
+  return json.models
+    .map((item) => item.name?.replace(/^models\//, '').trim())
+    .filter((name): name is string => Boolean(name));
 }
 
 export interface AdminAccountsResult {
@@ -613,6 +648,7 @@ export async function runProbeAudit(argv: string[]): Promise<{ report: ProbeRepo
         },
         inventory: {
           published_ids: [],
+          catalog_sources: { openai: [], gemini: [] },
           provider_raw_quota_ids: [],
           deduplicated_targets: {},
           published_count: 0,
@@ -627,14 +663,21 @@ export async function runProbeAudit(argv: string[]): Promise<{ report: ProbeRepo
 
   const credentials = resolveEnvironmentCredentials();
 
-  // 1. Fetch /v1/models
-  const publishedIds = await fetchPublishedModels(cliArgs.url, credentials.apiKey, cliArgs.timeoutMs);
+  // 1. Fetch both public catalogs. /v1/models intentionally omits image-only models.
+  const [openaiPublishedIds, geminiPublishedIds] = await Promise.all([
+    fetchPublishedModels(cliArgs.url, credentials.apiKey, cliArgs.timeoutMs),
+    fetchGeminiPublishedModels(cliArgs.url, credentials.apiKey, cliArgs.timeoutMs),
+  ]);
+  const publishedIds = [...new Set([...openaiPublishedIds, ...geminiPublishedIds])].sort();
 
   // 2. Fetch /admin/accounts if admin key available
   const adminResult = await fetchAdminAccounts(cliArgs.url, credentials.adminKey, cliArgs.timeoutMs);
 
   // 3. Build inventory
-  const inventory = buildInventory(publishedIds, adminResult.rawQuotaIds, adminResult.forwardingRules);
+  const inventory = buildInventory(publishedIds, adminResult.rawQuotaIds, adminResult.forwardingRules, {
+    openai: openaiPublishedIds,
+    gemini: geminiPublishedIds,
+  });
 
   const modelsToProbe = cliArgs.models && cliArgs.models.length > 0
     ? cliArgs.models.filter((m) => publishedIds.includes(m))
@@ -683,18 +726,18 @@ Usage:
   node scripts/probe-models.ts [options]
 
 Options:
-  --dry-run                 Inventory mode: discover models without sending probe requests.
+  --dry-run                 Inventory mode: discover OpenAI and Gemini models without probes.
   -c, --concurrency <num>   Max concurrent requests during probe (default: 4).
   -t, --timeout <ms>        Request timeout in milliseconds (default: 10000).
   --url, --base-url <url>   Proxy base URL (default: AG_PROXY_BASE_URL or http://127.0.0.1:8045).
   --json                    Output pure JSON to stdout.
   --summary                 Output only the human-readable summary.
   -o, --output <file>       Write the complete JSON report to a file.
-  --models <m1,m2,...>      Probe only specific published model IDs.
+  --models <m1,m2,...>      Probe only IDs published by either catalog.
   -h, --help                Show this help message.
 
 Environment Variables:
-  AG_PROXY_API_KEY          Bearer API key for /v1/models and completions (required).
+  AG_PROXY_API_KEY          Bearer API key for catalogs and completion endpoints (required).
   AG_PROXY_ADMIN_API_KEY    Bearer admin API key for /admin/accounts (optional for quota IDs).
   AG_PROXY_BASE_URL         Proxy base URL override (optional).
   AG_PROXY_HOST / PORT      Host/Port fallback for base URL (defaults: 127.0.0.1:8045).

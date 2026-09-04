@@ -155,8 +155,8 @@ describe('Upstream Endpoint and Project Header Stability', () => {
     });
   });
 
-  describe('3. Exactly One Project-Header Retry', () => {
-    it('retries exactly once without project header when 403 received, and preserves final 403 if retry also fails', async () => {
+  describe('3. Exactly One Project-Context Downgrade', () => {
+    it('retries exactly once without project context when 403 received, and preserves final 403 if retry also fails', async () => {
       const client = new GeminiClient();
       const postSpy = vi.spyOn(axios, 'post');
 
@@ -173,9 +173,11 @@ describe('Upstream Endpoint and Project Header Stability', () => {
       expect(postSpy).toHaveBeenCalledTimes(2);
       expect((postSpy.mock.calls[0][2] as any)?.headers?.['x-goog-user-project']).toBe('project-1');
       expect((postSpy.mock.calls[1][2] as any)?.headers?.['x-goog-user-project']).toBeUndefined();
+      expect(JSON.parse(postSpy.mock.calls[0][1] as string).project).toBe('project-1');
+      expect(JSON.parse(postSpy.mock.calls[1][1] as string).project).toBeUndefined();
     });
 
-    it('retries without project header and succeeds on 200', async () => {
+    it('retries without project context and succeeds on 200', async () => {
       const client = new GeminiClient();
       const postSpy = vi.spyOn(axios, 'post');
 
@@ -193,6 +195,25 @@ describe('Upstream Endpoint and Project Header Stability', () => {
       expect(postSpy).toHaveBeenCalledTimes(2);
       expect((postSpy.mock.calls[0][2] as any)?.headers?.['x-goog-user-project']).toBe('project-1');
       expect((postSpy.mock.calls[1][2] as any)?.headers?.['x-goog-user-project']).toBeUndefined();
+      expect(JSON.parse(postSpy.mock.calls[1][1] as string).project).toBeUndefined();
+    });
+
+    it('uses the same two-call projectless bound for streaming failures', async () => {
+      const client = new GeminiClient();
+      const postSpy = vi.spyOn(axios, 'post').mockRejectedValue(createAxiosError(403, 'Permission denied'));
+
+      await expect(
+        client.streamGenerateInternal(createInternalRequest({ project: 'project-1' }), 'token-1', undefined, undefined, 'acc-1'),
+      ).rejects.toThrow(UpstreamRequestError);
+
+      expect(postSpy).toHaveBeenCalledTimes(2);
+      expect((postSpy.mock.calls[0][2] as any)?.headers?.['x-goog-user-project']).toBe('project-1');
+      expect((postSpy.mock.calls[1][2] as any)?.headers?.['x-goog-user-project']).toBeUndefined();
+      let projectlessBody = '';
+      for await (const chunk of postSpy.mock.calls[1][1] as NodeJS.ReadableStream) {
+        projectlessBody += String(chunk);
+      }
+      expect(JSON.parse(projectlessBody).project).toBeUndefined();
     });
   });
 

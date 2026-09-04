@@ -284,53 +284,6 @@ export class ProxyService {
         }
       } catch (error) {
         let effectiveError: unknown = error;
-        if (error instanceof Error && this.isProjectContextError(error.message)) {
-          this.logger.warn(
-            `Anthropic request hit project context issue, retrying without project: ${error.message}`,
-          );
-          try {
-            const requestUserAgent = await resolveRequestUserAgent();
-            const fallbackBody = transformClaudeRequestIn(
-              this.toClaudeRequest(request),
-              '',
-              requestUserAgent,
-              signatureContext,
-            );
-            fallbackBody.model = effectiveTargetModel;
-            this.applyInternalGenerationConstraints(fallbackBody, effectiveTargetModel, token.id);
-            if (request.stream) {
-              const stream = await this.geminiClient.streamGenerateInternal(
-                fallbackBody,
-                token.token.access_token,
-                token.token.upstream_proxy_url,
-                extraHeaders,
-                token.id,
-              );
-              this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
-              return this.processAnthropicInternalStream(
-                stream,
-                fallbackBody.model,
-                signatureContext,
-                request.model,
-              );
-            } else {
-              const response = await this.generateInternalWithStreamFallback(
-                fallbackBody,
-                token.token.access_token,
-                token.token.upstream_proxy_url,
-                extraHeaders,
-                token.id,
-              );
-              this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
-              return this.toAnthropicChatResponse(
-                transformResponse(response, signatureContext, request.model),
-              );
-            }
-          } catch (fallbackErr) {
-            effectiveError = fallbackErr;
-          }
-        }
-
         if (error instanceof Error && this.isQuotaExhaustedError(error.message)) {
           this.logger.warn(
             `Anthropic request hit quota exhaustion on mapped model, retrying with fallback model gemini-3-flash: ${error.message}`,
@@ -634,35 +587,7 @@ export class ProxyService {
         this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
         return this.normalizeGeminiGenerateResponse(response);
       } catch (err) {
-        if (err instanceof Error && this.isProjectContextError(err.message)) {
-          this.logger.warn(
-            `Gemini request hit project context issue, retrying without project: ${err.message}`,
-          );
-          try {
-            const requestUserAgent = await resolveRequestUserAgent();
-            const fallbackBody = this.createGeminiInternalRequest(
-              effectiveTargetModel,
-              request,
-              '',
-              'generate-content',
-              requestUserAgent,
-            );
-            this.applyInternalGenerationConstraints(fallbackBody, effectiveTargetModel, token.id);
-            const response = await this.generateInternalWithStreamFallback(
-              fallbackBody,
-              token.token.access_token,
-              token.token.upstream_proxy_url,
-              extraHeaders,
-              token.id,
-            );
-            this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
-            return this.normalizeGeminiGenerateResponse(response);
-          } catch (fallbackErr) {
-            lastError = fallbackErr;
-          }
-        } else {
-          lastError = err;
-        }
+        lastError = err;
 
         const shouldRetry = await this.applyUpstreamPenalty(
           token.id,
@@ -736,35 +661,7 @@ export class ProxyService {
         this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
         return this.passthroughSseStream(stream);
       } catch (err) {
-        if (err instanceof Error && this.isProjectContextError(err.message)) {
-          this.logger.warn(
-            `Gemini stream request hit project context issue, retrying without project: ${err.message}`,
-          );
-          try {
-            const requestUserAgent = await resolveRequestUserAgent();
-            const fallbackBody = this.createGeminiInternalRequest(
-              effectiveTargetModel,
-              request,
-              '',
-              'generate-content',
-              requestUserAgent,
-            );
-            this.applyInternalGenerationConstraints(fallbackBody, effectiveTargetModel, token.id);
-            const stream = await this.geminiClient.streamGenerateInternal(
-              fallbackBody,
-              token.token.access_token,
-              token.token.upstream_proxy_url,
-              extraHeaders,
-              token.id,
-            );
-            this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
-            return this.passthroughSseStream(stream);
-          } catch (fallbackErr) {
-            lastError = fallbackErr;
-          }
-        } else {
-          lastError = err;
-        }
+        lastError = err;
 
         const shouldRetry = await this.applyUpstreamPenalty(
           token.id,
@@ -1044,60 +941,7 @@ export class ProxyService {
           );
         }
       } catch (err) {
-        if (err instanceof Error && this.isProjectContextError(err.message)) {
-          this.logger.warn(
-            `OpenAI compatibility request hit project context issue, retrying without project: ${err.message}`,
-          );
-          try {
-            const requestUserAgent = await resolveRequestUserAgent();
-            const fallbackBody = transformClaudeRequestIn(
-              claudeRequest,
-              '',
-              requestUserAgent,
-              signatureContext,
-            );
-            fallbackBody.model = effectiveTargetModel;
-            this.applyInternalGenerationConstraints(fallbackBody, effectiveTargetModel, token.id);
-            if (request.stream) {
-              const stream = await this.geminiClient.streamGenerateInternal(
-                fallbackBody,
-                token.token.access_token,
-                token.token.upstream_proxy_url,
-                extraHeaders,
-                token.id,
-              );
-              this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
-              return this.createOpenAIProtocolStream(
-                stream,
-                request.model,
-                outputProtocol,
-                streamOptions,
-                signatureContext,
-                responsesConfiguration,
-              );
-            }
-
-            const response = await this.generateInternalWithStreamFallback(
-              fallbackBody,
-              token.token.access_token,
-              token.token.upstream_proxy_url,
-              extraHeaders,
-              token.id,
-            );
-            this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
-            const claudeResponse = transformResponse(response, signatureContext);
-            return this.convertClaudeToOpenAIResponse(
-              claudeResponse,
-              request.model,
-              response.usageMetadata,
-              outputProtocol,
-            );
-          } catch (fallbackErr) {
-            lastError = fallbackErr;
-          }
-        } else {
-          lastError = err;
-        }
+        lastError = err;
 
         const shouldRetry = await this.applyUpstreamPenalty(
           token.id,
@@ -2869,27 +2713,6 @@ export class ProxyService {
 
   private createModelSpecificHeaders(model: string | undefined): Record<string, string> {
     return this.modelRoutingPolicy.createModelSpecificHeaders(model);
-  }
-
-  private isProjectLicenseError(errorMessage: string): boolean {
-    const msg = errorMessage.toLowerCase();
-    return (
-      msg.includes('#3501') ||
-      (msg.includes('google cloud project') && msg.includes('code assist license'))
-    );
-  }
-
-  private isProjectNotFoundError(errorMessage: string): boolean {
-    const msg = errorMessage.toLowerCase();
-    return (
-      msg.includes('invalid project resource name projects/') ||
-      (msg.includes('resource projects/') && msg.includes('could not be found')) ||
-      (msg.includes('project') && msg.includes('not found'))
-    );
-  }
-
-  private isProjectContextError(errorMessage: string): boolean {
-    return this.isProjectLicenseError(errorMessage) || this.isProjectNotFoundError(errorMessage);
   }
 
   private isQuotaExhaustedError(errorMessage: string): boolean {
