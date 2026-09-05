@@ -394,7 +394,7 @@ record_migration_publication() {
 
 rollback_migration_publication() {
   local index path expected_identity kind rollback_failed=0
-  [ "$migration_publication_open" = 1 ] || return
+  [ "$migration_publication_open" = 1 ] || return 0
   for ((index = ${#migration_published_paths[@]} - 1; index >= 0; index--)); do
     path="${migration_published_paths[$index]}"
     expected_identity="${migration_published_identities[$index]}"
@@ -844,8 +844,8 @@ restore_migration_unit_state() {
 }
 
 record_migration_wants_publication() {
-  [ "${mode:-}" = migrate ] || return
-  [ -L "$migration_wants_fs" ] || return
+  [ "${mode:-}" = migrate ] || return 0
+  [ -L "$migration_wants_fs" ] || return 0
   migration_wants_published_identity="$(publication_identity "$migration_wants_fs")"
   substitute_migration_test_entry wants "$migration_wants_fs"
   migration_checkpoint wants
@@ -1063,7 +1063,9 @@ validate_release_runtime() {
   local target_id="$1" release_fs runtime
   release_fs="$(release_path_for_id "$target_id")" || die "Release $target_id is not a verified immutable release"
   runtime="$(release_runtime_for "$release_fs")" || die "Release $target_id has no executable bundled runtime"
-  [ -f "$runtime" ] && [ -x "$runtime" ] || die "Release runtime is not executable: $runtime"
+  if ! { [ -f "$runtime" ] && [ -x "$runtime" ]; }; then
+    die "Release runtime is not executable: $runtime"
+  fi
 }
 
 write_unit_for_release() {
@@ -1132,63 +1134,160 @@ validate_environment_contract() {
 }
 
 systemd() {
-  if is_simulated; then
-    if [ -n "${RELEASE_TEST_SYSTEMD_LOG:-}" ]; then
-      printf '%s\n' "$*" >>"$RELEASE_TEST_SYSTEMD_LOG"
-    fi
-    if [ "$1" = enable ] && [ "$2" = --now ] && [ "$3" = antigravity-proxy.service ] && [ -n "$migration_wants_fs" ] && [ ! -e "$migration_wants_fs" ] && [ ! -L "$migration_wants_fs" ]; then
-      install -d -m 0755 "$(dirname "$migration_wants_fs")"
-      ln -s ../antigravity-proxy.service "$migration_wants_fs"
-    fi
-    return
+  if is_simulated && [ -n "$migration_wants_fs" ] && [ "$1" = enable ] && [ "$2" = --now ] && [ "$3" = antigravity-proxy.service ] && [ ! -e "$migration_wants_fs" ] && [ ! -L "$migration_wants_fs" ]; then
+    install -d -m 0755 "$(dirname "$migration_wants_fs")"
+    ln -s ../antigravity-proxy.service "$migration_wants_fs"
+  fi
+  if [ -n "${RELEASE_TEST_SYSTEMD_LOG:-}" ]; then
+    printf '%s\n' "$*" >>"$RELEASE_TEST_SYSTEMD_LOG"
+  fi
+  if is_simulated && [ "${RELEASE_TEST_SMOKE:-pass}" != real ] && [ "${RELEASE_TEST_SYSTEMCTL:-0}" != 1 ]; then
+    return 0
   fi
   systemctl "$@"
 }
 
 smoke_check() {
-  if is_simulated; then
+  if is_simulated && [ "${RELEASE_TEST_SMOKE:-pass}" != real ]; then
     migration_smoke_check_count=$((migration_smoke_check_count + 1))
     case "${RELEASE_TEST_SMOKE:-pass}" in
       pass) return 0 ;;
       fail) return 1 ;;
-      fail-first) [ "$migration_smoke_check_count" -ne 1 ] ;;
-      fail-restored) [ "$migration_smoke_check_count" -ne 2 ] ;;
-      *) die "Unknown RELEASE_TEST_SMOKE mode" ;;
+      fail-first)
+        [ "$migration_smoke_check_count" -ne 1 ]
+        return
+        ;;
+      fail-restored)
+        [ "$migration_smoke_check_count" -ne 2 ]
+        return
+        ;;
+      *) die "Unknown RELEASE_TEST_SMOKE mode: $RELEASE_TEST_SMOKE" ;;
     esac
-    return
   fi
 
-  local host port base_url admin_status listener main_pid service_user
-  host="$(sed -n 's/^AG_PROXY_HOST=//p' "$env_file" | tail -n 1)"
-  port="$(sed -n 's/^AG_PROXY_PORT=//p' "$env_file" | tail -n 1)"
+  local host port base_url admin_status listener main_pid service_user env_fs
+  env_fs="$(root_path "$env_file")"
+  if [ ! -f "$env_fs" ]; then
+    printf 'Environment file is missing: %s\n' "$env_fs" >&2
+    return 1
+  fi
+  host="$(sed -n 's/^AG_PROXY_HOST=//p' "$env_fs" | tail -n 1)"
+  port="$(sed -n 's/^AG_PROXY_PORT=//p' "$env_fs" | tail -n 1)"
   if [ -z "$host" ] || [ -z "$port" ]; then
-    die "Environment file lacks AG_PROXY_HOST or AG_PROXY_PORT"
+    printf 'Environment file lacks AG_PROXY_HOST or AG_PROXY_PORT: %s\n' "$env_fs" >&2
+    return 1
   fi
   base_url="http://$host:$port"
-  curl --fail --silent --show-error --max-time 5 "$base_url/health" >/dev/null
-  admin_status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 5 "$base_url/admin/status")"
-  case "$admin_status" in 401|403) ;; *) die "Unauthenticated admin endpoint returned HTTP $admin_status" ;; esac
-  listener="$(ss -ltnH "( sport = :$port )")"
-  printf '%s\n' "$listener" | grep -Fq "$host:$port" || die "Expected listener $host:$port is absent"
-  main_pid="$(systemd show --property=MainPID --value antigravity-proxy.service)"
-  case "$main_pid" in ''|0|*[!0-9]*) die "Systemd did not report a running MainPID" ;; esac
-  listener="$(ss -ltnpH "( sport = :$port )")"
-  printf '%s\n' "$listener" | grep -Fq "$host:$port" || die "Expected listener $host:$port is absent"
-  printf '%s\n' "$listener" | grep -Fq "pid=$main_pid," || die "Systemd MainPID $main_pid does not own $host:$port"
-  systemd is-enabled --quiet antigravity-proxy.service
-  systemd is-active --quiet antigravity-proxy.service
-  service_user="$(systemd show --property=User --value antigravity-proxy.service)"
-  [ "$service_user" = "$user_name" ] || die "Systemd service user does not match $user_name"
+
+  local timeout_secs="${SMOKE_TIMEOUT_SECS:-15}"
+  local request_timeout="${SMOKE_REQUEST_TIMEOUT_SECS:-2}"
+  local poll_interval="${SMOKE_POLL_INTERVAL_SECS:-0.1}"
+  case "$timeout_secs" in ''|*[!0-9]*) timeout_secs=15 ;; esac
+  case "$request_timeout" in ''|*[!0-9]*) request_timeout=2 ;; esac
+
+  local health_code='000'
+  local ready=0
+  local start_time current_time elapsed
+  start_time="$(date +%s)"
+  local curl_exit=0
+  local active_state=''
+
+  while true; do
+    active_state="$(systemd show --property=ActiveState --value antigravity-proxy.service 2>/dev/null || true)"
+    if [ "$active_state" = failed ]; then
+      printf 'Systemd service entered failed state during startup\n' >&2
+      return 1
+    fi
+
+    curl_exit=0
+    health_code="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time "$request_timeout" "$base_url/health" 2>/dev/null)" || curl_exit=$?
+
+    if [ "$curl_exit" -eq 0 ] && [ "$health_code" = 200 ]; then
+      ready=1
+      break
+    fi
+
+    # Tolerated transient startup states while PID initializes:
+    # curl exit 7 (connection refused), exit 28 (timeout), exit 52 (empty reply), exit 56 (reset), or HTTP status 000
+    if [ "$curl_exit" -eq 7 ] || [ "$curl_exit" -eq 28 ] || [ "$curl_exit" -eq 52 ] || [ "$curl_exit" -eq 56 ] || [ "$health_code" = '000' ]; then
+      current_time="$(date +%s)"
+      elapsed=$((current_time - start_time))
+      if [ "$elapsed" -ge "$timeout_secs" ]; then
+        break
+      fi
+      sleep "$poll_interval"
+      continue
+    fi
+
+    # Permanent bad health (e.g. 500, 404, etc.) must fail immediately, not be masked
+    printf 'Health endpoint returned unexpected HTTP status %s (curl exit %s)\n' "$health_code" "$curl_exit" >&2
+    return 1
+  done
+
+  if [ "$ready" -ne 1 ]; then
+    printf 'Startup readiness timed out after %s seconds (last HTTP %s, curl exit %s)\n' "$timeout_secs" "$health_code" "$curl_exit" >&2
+    return 1
+  fi
+
+  admin_status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time "$request_timeout" "$base_url/admin/status" 2>/dev/null || printf '000')"
+  case "$admin_status" in
+    401|403) ;;
+    *)
+      printf 'Unauthenticated admin endpoint returned unexpected HTTP %s\n' "$admin_status" >&2
+      return 1
+      ;;
+  esac
+
+  listener="$(ss -ltnH "( sport = :$port )" 2>/dev/null || true)"
+  if ! printf '%s\n' "$listener" | grep -Fq "$host:$port"; then
+    printf 'Expected listener %s:%s is absent from listening sockets\n' "$host" "$port" >&2
+    return 1
+  fi
+
+  main_pid="$(systemd show --property=MainPID --value antigravity-proxy.service 2>/dev/null || true)"
+  case "$main_pid" in
+    ''|0|*[!0-9]*)
+      printf 'Systemd did not report a running MainPID: %s\n' "$main_pid" >&2
+      return 1
+      ;;
+  esac
+
+  listener="$(ss -ltnpH "( sport = :$port )" 2>/dev/null || true)"
+  if ! printf '%s\n' "$listener" | grep -Fq "$host:$port"; then
+    printf 'Expected listener %s:%s is absent from listening sockets with PID info\n' "$host" "$port" >&2
+    return 1
+  fi
+  if ! printf '%s\n' "$listener" | grep -Fq "pid=$main_pid,"; then
+    printf 'Systemd MainPID %s does not own listener %s:%s\n' "$main_pid" "$host" "$port" >&2
+    return 1
+  fi
+
+  if ! systemd is-enabled --quiet antigravity-proxy.service; then
+    printf 'Antigravity Proxy service is not enabled in systemd\n' >&2
+    return 1
+  fi
+  if ! systemd is-active --quiet antigravity-proxy.service; then
+    printf 'Antigravity Proxy service is not active in systemd\n' >&2
+    return 1
+  fi
+
+  service_user="$(systemd show --property=User --value antigravity-proxy.service 2>/dev/null || true)"
+  if [ "$service_user" != "$user_name" ]; then
+    printf 'Systemd service user %s does not match expected user %s\n' "$service_user" "$user_name" >&2
+    return 1
+  fi
+
+  return 0
 }
 
 activate_release() {
   local action="$1"
-  systemd daemon-reload
+  systemd daemon-reload || return 1
   if [ "$action" = start ]; then
-    systemd enable --now antigravity-proxy.service
+    systemd enable --now antigravity-proxy.service || return 1
     record_migration_wants_publication
   else
-    systemd restart antigravity-proxy.service
+    systemd restart antigravity-proxy.service || return 1
   fi
   smoke_check
 }

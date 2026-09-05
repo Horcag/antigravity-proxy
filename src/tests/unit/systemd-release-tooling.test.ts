@@ -1308,4 +1308,335 @@ describe('systemd release tooling', () => {
     expect(existsSync(join(root, 'opt/antigravity-proxy/current'))).toBe(false);
     expect(existsSync(join(root, 'opt/antigravity-proxy/previous'))).toBe(false);
   });
+
+  interface SmokeShimOptions {
+    healthDelayedAttempts?: number;
+    healthCode?: string;
+    adminCode?: string;
+    failRelease?: string;
+    adminFailRelease?: string;
+    systemctlPid?: string;
+    systemctlUser?: string;
+    systemctlActiveState?: string;
+    systemctlNotEnabled?: boolean;
+    systemctlNotActive?: boolean;
+    ssPid?: string;
+    ssDropListener?: boolean;
+  }
+
+  function setupRealSmokeShims(root: string, options: SmokeShimOptions = {}) {
+    const binDir = join(root, 'shims/bin');
+    const stateDir = join(root, 'shims/state');
+    execFileSync('mkdir', ['-p', binDir, stateDir]);
+
+    if (options.healthDelayedAttempts !== undefined) {
+      writeFileSync(join(stateDir, 'health-delayed-until'), String(options.healthDelayedAttempts));
+    }
+    if (options.healthCode !== undefined) {
+      writeFileSync(join(stateDir, 'health-code'), options.healthCode);
+    }
+    if (options.adminCode !== undefined) {
+      writeFileSync(join(stateDir, 'admin-code'), options.adminCode);
+    }
+    if (options.failRelease !== undefined) {
+      writeFileSync(join(stateDir, 'fail-release'), options.failRelease);
+    }
+    if (options.adminFailRelease !== undefined) {
+      writeFileSync(join(stateDir, 'admin-fail-release'), options.adminFailRelease);
+    }
+    if (options.systemctlPid !== undefined) {
+      writeFileSync(join(stateDir, 'systemctl-pid'), options.systemctlPid);
+    }
+    if (options.systemctlUser !== undefined) {
+      writeFileSync(join(stateDir, 'systemctl-user'), options.systemctlUser);
+    }
+    if (options.systemctlActiveState !== undefined) {
+      writeFileSync(join(stateDir, 'systemctl-active-state'), options.systemctlActiveState);
+    }
+    if (options.systemctlNotEnabled) {
+      writeFileSync(join(stateDir, 'systemctl-not-enabled'), '1');
+    }
+    if (options.systemctlNotActive) {
+      writeFileSync(join(stateDir, 'systemctl-not-active'), '1');
+    }
+    if (options.ssPid !== undefined) {
+      writeFileSync(join(stateDir, 'ss-pid'), options.ssPid);
+    }
+    if (options.ssDropListener) {
+      writeFileSync(join(stateDir, 'ss-drop-listener'), '1');
+    }
+
+    writeFileSync(
+      join(binDir, 'curl'),
+      `#!/usr/bin/env bash
+url="\${!#}"
+state_dir="${stateDir}"
+
+if [[ "$url" == *"/health" ]]; then
+  attempt=0
+  if [ -f "$state_dir/health-attempts" ]; then
+    attempt=$(<"$state_dir/health-attempts")
+  fi
+  attempt=$((attempt + 1))
+  echo "$attempt" > "$state_dir/health-attempts"
+
+  current_release=""
+  if [ -L "${root}/opt/antigravity-proxy/current" ]; then
+    current_release="$(basename "$(readlink -f "${root}/opt/antigravity-proxy/current")")"
+  fi
+
+  if [ -f "$state_dir/fail-release" ] && [ "$current_release" = "$(<"$state_dir/fail-release")" ]; then
+    printf '000'
+    exit 7
+  fi
+
+  if [ -f "$state_dir/health-delayed-until" ]; then
+    delayed_until=$(<"$state_dir/health-delayed-until")
+    if [ "$attempt" -lt "$delayed_until" ]; then
+      printf '000'
+      exit 7
+    fi
+  fi
+
+  if [ -f "$state_dir/health-code" ]; then
+    code=$(<"$state_dir/health-code")
+    if [ "$code" = "000" ]; then
+      printf '000'
+      exit 7
+    fi
+    printf '%s' "$code"
+    exit 0
+  fi
+
+  printf '200'
+  exit 0
+fi
+
+if [[ "$url" == *"/admin/status" ]]; then
+  current_release=""
+  if [ -L "${root}/opt/antigravity-proxy/current" ]; then
+    current_release="$(basename "$(readlink -f "${root}/opt/antigravity-proxy/current")")"
+  fi
+
+  if [ -f "$state_dir/admin-code" ]; then
+    printf '%s' "$(<"$state_dir/admin-code")"
+    exit 0
+  fi
+
+  if [ -f "$state_dir/admin-fail-release" ] && [ "$current_release" = "$(<"$state_dir/admin-fail-release")" ]; then
+    printf '200'
+    exit 0
+  fi
+
+  printf '401'
+  exit 0
+fi
+
+exec /usr/bin/curl "$@"
+`,
+    );
+    chmodSync(join(binDir, 'curl'), 0o755);
+
+    writeFileSync(
+      join(binDir, 'ss'),
+      `#!/usr/bin/env bash
+state_dir="${stateDir}"
+port="8045"
+host="127.0.0.1"
+
+if [ -f "$state_dir/ss-drop-listener" ]; then
+  exit 0
+fi
+
+pid="4242"
+if [ -f "$state_dir/ss-pid" ]; then
+  pid=$(<"$state_dir/ss-pid")
+elif [ -f "$state_dir/systemctl-pid" ]; then
+  pid=$(<"$state_dir/systemctl-pid")
+fi
+
+case "$*" in
+  *-ltnpH*)
+    printf 'LISTEN 0 511 %s:%s 0.0.0.0:* users:(("node",pid=%s,fd=18))\\n' "$host" "$port" "$pid"
+    ;;
+  *-ltnH*)
+    printf 'LISTEN 0 511 %s:%s 0.0.0.0:*\\n' "$host" "$port"
+    ;;
+  *)
+    exec /usr/bin/ss "$@"
+    ;;
+esac
+`,
+    );
+    chmodSync(join(binDir, 'ss'), 0o755);
+
+    writeFileSync(
+      join(binDir, 'systemctl'),
+      `#!/usr/bin/env bash
+state_dir="${stateDir}"
+
+case "$1" in
+  show)
+    case "$2" in
+      --property=ActiveState*)
+        if [ -f "$state_dir/systemctl-active-state" ]; then
+          cat "$state_dir/systemctl-active-state"
+        else
+          printf 'active\\n'
+        fi
+        ;;
+      --property=MainPID*)
+        if [ -f "$state_dir/systemctl-pid" ]; then
+          cat "$state_dir/systemctl-pid"
+        else
+          printf '4242\\n'
+        fi
+        ;;
+      --property=User*)
+        if [ -f "$state_dir/systemctl-user" ]; then
+          cat "$state_dir/systemctl-user"
+        else
+          printf 'antigravity-proxy\\n'
+        fi
+        ;;
+      *)
+        printf '\\n'
+        ;;
+    esac
+    ;;
+  is-enabled)
+    if [ -f "$state_dir/systemctl-not-enabled" ]; then
+      exit 1
+    fi
+    exit 0
+    ;;
+  is-active)
+    if [ -f "$state_dir/systemctl-not-active" ]; then
+      exit 1
+    fi
+    exit 0
+    ;;
+  daemon-reload|restart|enable|disable)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+    );
+    chmodSync(join(binDir, 'systemctl'), 0o755);
+
+    return {
+      binDir,
+      stateDir,
+      env: {
+        PATH: `${binDir}:${process.env.PATH}`,
+        RELEASE_TEST_SMOKE: 'real',
+        SMOKE_POLL_INTERVAL_SECS: '0.01',
+      },
+      getHealthAttempts: () => {
+        const attemptsPath = join(stateDir, 'health-attempts');
+        return existsSync(attemptsPath) ? Number(readFileSync(attemptsPath, 'utf8').trim()) : 0;
+      },
+    };
+  }
+
+  it('tolerates transient connection refusal during startup readiness and succeeds once ready', () => {
+    const root = createRoot();
+    const shims = setupRealSmokeShims(root, { healthDelayedAttempts: 3 });
+    const result = runInstall(root, 'delayed-start-success', 'install', shims.env);
+
+    expect(result.status).toBe(0);
+    expect(shims.getHealthAttempts()).toBeGreaterThanOrEqual(3);
+    expect(realpathSync(join(root, 'opt/antigravity-proxy/current'))).toBe(
+      join(root, 'opt/antigravity-proxy/releases/delayed-start-success'),
+    );
+  }, 30_000);
+
+  it('fails when startup readiness times out due to persistent connection refusal', () => {
+    const root = createRoot();
+    const shims = setupRealSmokeShims(root, { healthCode: '000' });
+    const result = runInstall(root, 'unready-timeout', 'install', {
+      ...shims.env,
+      SMOKE_TIMEOUT_SECS: '1',
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Startup readiness timed out after 1 seconds');
+    expect(existsSync(join(root, 'opt/antigravity-proxy/current'))).toBe(false);
+  }, 30_000);
+
+  it('fails immediately without masking on wrong admin auth status or wrong socket ownership', () => {
+    const rootBadAuth = createRoot();
+    const shimsBadAuth = setupRealSmokeShims(rootBadAuth, { adminCode: '200' });
+    const resultBadAuth = runInstall(rootBadAuth, 'bad-admin-auth', 'install', shimsBadAuth.env);
+    expect(resultBadAuth.status).toBe(1);
+    expect(resultBadAuth.stderr).toContain('Unauthenticated admin endpoint returned unexpected HTTP 200');
+
+    const rootWrongPid = createRoot();
+    const shimsWrongPid = setupRealSmokeShims(rootWrongPid, { ssPid: '99999' });
+    const resultWrongPid = runInstall(rootWrongPid, 'wrong-socket-pid', 'install', shimsWrongPid.env);
+    expect(resultWrongPid.status).toBe(1);
+    expect(resultWrongPid.stderr).toContain('Systemd MainPID 4242 does not own listener 127.0.0.1:8045');
+
+    const rootWrongUser = createRoot();
+    const shimsWrongUser = setupRealSmokeShims(rootWrongUser, { systemctlUser: 'wrong-user' });
+    const resultWrongUser = runInstall(rootWrongUser, 'wrong-service-user', 'install', shimsWrongUser.env);
+    expect(resultWrongUser.status).toBe(1);
+    expect(resultWrongUser.stderr).toContain(
+      'Systemd service user wrong-user does not match expected user antigravity-proxy',
+    );
+  }, 30_000);
+
+  it('restores previous release topology, matching unit, and succeeds recovery when update smoke check fails', () => {
+    const root = createRoot();
+    expect(runInstall(root, 'release-one').status).toBe(0);
+    expect(runInstall(root, 'release-two', 'update').status).toBe(0);
+
+    const installRoot = join(root, 'opt/antigravity-proxy');
+    expect(realpathSync(join(installRoot, 'current'))).toBe(join(installRoot, 'releases/release-two'));
+    expect(realpathSync(join(installRoot, 'previous'))).toBe(join(installRoot, 'releases/release-one'));
+
+    const shims = setupRealSmokeShims(root, { failRelease: 'release-three' });
+    const failedUpdate = runInstall(root, 'release-three', 'update', {
+      ...shims.env,
+      SMOKE_TIMEOUT_SECS: '1',
+    });
+
+    expect(failedUpdate.status).toBe(1);
+    expect(failedUpdate.stderr).toContain('Release release-three failed smoke checks; previous release was restored');
+    expect(failedUpdate.stderr).not.toContain('Migration publication rollback was incomplete');
+
+    expect(realpathSync(join(installRoot, 'current'))).toBe(join(installRoot, 'releases/release-two'));
+    expect(realpathSync(join(installRoot, 'previous'))).toBe(join(installRoot, 'releases/release-one'));
+
+    const unit = readFileSync(join(root, 'etc/systemd/system/antigravity-proxy.service'), 'utf8');
+    expect(unit).toContain('ExecStart=/opt/antigravity-proxy/current/bin/node /opt/antigravity-proxy/current/dist/cli.js serve');
+  }, 30_000);
+
+  it('restores prior release topology, matching unit, and succeeds recovery when rollback smoke check fails', () => {
+    const root = createRoot();
+    expect(runInstall(root, 'release-one').status).toBe(0);
+    expect(runInstall(root, 'release-two', 'update').status).toBe(0);
+
+    const installRoot = join(root, 'opt/antigravity-proxy');
+    expect(realpathSync(join(installRoot, 'current'))).toBe(join(installRoot, 'releases/release-two'));
+    expect(realpathSync(join(installRoot, 'previous'))).toBe(join(installRoot, 'releases/release-one'));
+
+    const shims = setupRealSmokeShims(root, { failRelease: 'release-one' });
+    const failedRollback = runRollback(root, 'release-one', {
+      ...shims.env,
+      SMOKE_TIMEOUT_SECS: '1',
+    });
+
+    expect(failedRollback.status).toBe(1);
+    expect(failedRollback.stderr).toContain('Rollback to release release-one failed smoke checks; prior release topology was restored');
+
+    expect(realpathSync(join(installRoot, 'current'))).toBe(join(installRoot, 'releases/release-two'));
+    expect(realpathSync(join(installRoot, 'previous'))).toBe(join(installRoot, 'releases/release-one'));
+
+    const unit = readFileSync(join(root, 'etc/systemd/system/antigravity-proxy.service'), 'utf8');
+    expect(unit).toContain('ExecStart=/opt/antigravity-proxy/current/bin/node /opt/antigravity-proxy/current/dist/cli.js serve');
+  }, 30_000);
 });
