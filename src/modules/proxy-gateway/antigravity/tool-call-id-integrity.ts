@@ -6,8 +6,8 @@ interface ToolCallDefinition {
 }
 
 export class ToolCallIdConflictError extends Error {
-  constructor(toolCallId: string) {
-    super(`Conflicting function call reuse for explicit id: ${toolCallId}`);
+  constructor() {
+    super('Conflicting explicit function call id');
     this.name = 'ToolCallIdConflictError';
   }
 }
@@ -29,6 +29,6 @@ export class ToolCallIdIntegrityTracker {
     if (existing.name === name && isEqual(existing.args, args)) {
       return 'replay';
     }
-    throw new ToolCallIdConflictError(toolCallId);
+    throw new ToolCallIdConflictError();
   }
 }

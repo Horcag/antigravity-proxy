@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import { Logger } from '@nestjs/common';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import axios from 'axios';
 import {
@@ -5,6 +7,7 @@ import {
   UserProjectCapabilityCache,
 } from '@/modules/proxy-gateway/server/clients/gemini.client';
 import { UpstreamRequestError } from '@/modules/proxy-gateway/server/clients/upstream-error';
+import { mapOpenAIProtocolError } from '@/modules/proxy-gateway/server/openai-protocol-error';
 import { GoogleAPIService } from '@/modules/cloud-account/services/GoogleAPIService';
 import { GeminiInternalRequest } from '@/modules/proxy-gateway/antigravity/types';
 
@@ -56,6 +59,74 @@ describe('Upstream Endpoint and Project Header Stability', () => {
   });
 
   describe('1. 499 Failover & Transient vs Client Statuses', () => {
+    it('does not leak raw upstream diagnostics through retries, logs, errors, or protocol responses', async () => {
+      const client = new GeminiClient();
+      const rawValues = [
+        'canary-upstream-body',
+        'canary-upstream-message',
+        'canary-account-id',
+        'canary-project-id',
+        'canary-model-id',
+        'canary-import-source',
+        'canary-oauth-client-key',
+        'canary-proxy-user',
+        'canary-proxy-password',
+      ];
+      const rawProxyUrl = `http://${rawValues[7]}:${rawValues[8]}@%zz`;
+      rawValues.push(rawProxyUrl);
+      const canaries = rawValues.flatMap((value) => [
+        value,
+        Buffer.from(value).toString('base64'),
+        createHash('sha256').update(value).digest('hex'),
+      ]);
+      const upstreamPayload = canaries.join('|');
+      const logged: string[] = [];
+      const errorSpy = vi.spyOn(Logger.prototype, 'error').mockImplementation((message) => {
+        logged.push(String(message));
+      });
+      const warnSpy = vi.spyOn(Logger.prototype, 'warn').mockImplementation((message) => {
+        logged.push(String(message));
+      });
+      vi.spyOn(axios, 'post').mockRejectedValue(
+        createAxiosError(503, upstreamPayload, { error: { message: upstreamPayload } }),
+      );
+
+      let thrown: unknown;
+      try {
+        await client.generateInternal(
+          createInternalRequest({ project: rawValues[3], model: rawValues[4] }),
+          'token-1',
+          rawProxyUrl,
+          undefined,
+          rawValues[2],
+        );
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(UpstreamRequestError);
+      const upstreamError = thrown as UpstreamRequestError;
+      const serialized = JSON.stringify({
+        error: upstreamError,
+        message: upstreamError.message,
+        stack: upstreamError.stack,
+        cause: upstreamError.cause,
+        mapped: mapOpenAIProtocolError(upstreamError),
+      });
+      const diagnostics = logged.join('\n');
+
+      for (const canary of canaries) {
+        expect(serialized).not.toContain(canary);
+        expect(diagnostics).not.toContain(canary);
+      }
+      expect(errorSpy).toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalled();
+      expect(mapOpenAIProtocolError(upstreamError)).toMatchObject({
+        status: 503,
+        error: { message: 'Internal Server Error' },
+      });
+    });
+
     it('fails over to next endpoint on HTTP 499 (upstream client-cancelled)', async () => {
       const client = new GeminiClient();
       const postSpy = vi.spyOn(axios, 'post');
@@ -276,12 +347,23 @@ describe('Upstream Endpoint and Project Header Stability', () => {
       cache.recordNegativeCapability('Bearer ya29.foo', 'proj-1');
       expect(cache.hasNegativeCapability('Bearer ya29.foo', 'proj-1')).toBe(false);
 
-      // Snapshot contains only safe accountKey and project, no tokens
+      // Public snapshots are opaque: cache lookup remains testable without exposing identifiers.
       const snapshot = cache.getSnapshot();
       expect(snapshot).toHaveLength(1);
-      expect(snapshot[0].accountKey).toBe('acc-1');
-      expect(snapshot[0].project).toBe('proj-1');
-      expect((snapshot[0] as any).accessToken).toBeUndefined();
+      expect(snapshot[0]).toEqual({
+        cachedAt: expect.any(Number),
+        expiresAt: expect.any(Number),
+      });
+
+      const snapshotCanaries = ['acc-1', 'proj-1'].flatMap((value) => [
+        value,
+        Buffer.from(value).toString('base64'),
+        createHash('sha256').update(value).digest('hex'),
+      ]);
+      const serializedSnapshot = JSON.stringify(snapshot);
+      for (const canary of snapshotCanaries) {
+        expect(serializedSnapshot).not.toContain(canary);
+      }
     });
 
     it('revalidates after TTL expiry, and success clears negative state', async () => {
@@ -400,45 +482,52 @@ describe('Upstream Endpoint and Project Header Stability', () => {
 
   describe('6. Quota Summary 403 Retry Without Project', () => {
     it('retries grouped quota summary on the same endpoint without project after 403 and populates quota groups', async () => {
-      const fetchMock = vi
-        .fn()
-        // 1. Models endpoint succeeds
-        .mockResolvedValueOnce({
-          ok: true,
-          status: 200,
-          json: vi.fn().mockResolvedValue({
-            models: {
-              'gemini-3-flash': {
-                quotaInfo: {
-                  remainingFraction: 1,
-                  resetTime: '2026-05-05T00:00:00Z',
-                },
-              },
-            },
-          }),
-        })
-        // 2. Quota summary with project returns 403
-        .mockResolvedValueOnce({ ok: false, status: 403 })
-        // 3. Retry on same endpoint without project returns 200
-        .mockResolvedValueOnce({
-          ok: true,
-          status: 200,
-          json: vi.fn().mockResolvedValue({
-            groups: [
-              {
-                displayName: 'Gemini Models',
-                buckets: [
-                  {
-                    bucketId: 'gemini-weekly',
-                    window: 'weekly',
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+        if (url.includes('fetchAvailableModels')) {
+          return {
+            ok: true,
+            status: 200,
+            json: vi.fn().mockResolvedValue({
+              models: {
+                'gemini-3-flash': {
+                  quotaInfo: {
                     remainingFraction: 1,
                     resetTime: '2026-05-05T00:00:00Z',
                   },
-                ],
+                },
               },
-            ],
-          }),
-        });
+            }),
+          };
+        }
+        if (url.includes('retrieveUserQuotaSummary')) {
+          if (init?.body === JSON.stringify({ project: 'project-1' })) {
+            return { ok: false, status: 403 };
+          }
+          return {
+            ok: true,
+            status: 200,
+            json: vi.fn().mockResolvedValue({
+              groups: [
+                {
+                  displayName: 'Gemini Models',
+                  buckets: [
+                    {
+                      bucketId: 'gemini-weekly',
+                      window: 'weekly',
+                      remainingFraction: 1,
+                      resetTime: '2026-05-05T00:00:00Z',
+                    },
+                  ],
+                },
+              ],
+            }),
+          };
+        }
+        if (url.includes('loadCodeAssist')) {
+          return { ok: false, status: 503 };
+        }
+        throw new Error(`Unexpected URL: ${url}`);
+      });
 
       vi.stubGlobal('fetch', fetchMock);
 
@@ -458,37 +547,42 @@ describe('Upstream Endpoint and Project Header Stability', () => {
         ],
       });
 
-      expect(fetchMock).toHaveBeenCalledTimes(3);
-      // Calls 2 and 3 use the same endpoint
-      expect(fetchMock.mock.calls[2]?.[0]).toBe(fetchMock.mock.calls[1]?.[0]);
-      // Call 2 included project
-      expect(fetchMock.mock.calls[1]?.[1]?.body).toBe(JSON.stringify({ project: 'project-1' }));
-      // Call 3 retried without project
-      expect(fetchMock.mock.calls[2]?.[1]?.body).toBe(JSON.stringify({}));
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+      const summaryCalls = fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes('retrieveUserQuotaSummary'),
+      );
+      // Summary retries use the same endpoint regardless of the concurrent credit lookup.
+      expect(summaryCalls[1]?.[0]).toBe(summaryCalls[0]?.[0]);
+      expect(summaryCalls[0]?.[1]?.body).toBe(JSON.stringify({ project: 'project-1' }));
+      expect(summaryCalls[1]?.[1]?.body).toBe(JSON.stringify({}));
     });
 
     it('preserves truthful model quota errors if quota summary retry without project also fails', async () => {
-      const fetchMock = vi
-        .fn()
-        // 1. Models endpoint succeeds
-        .mockResolvedValueOnce({
-          ok: true,
-          status: 200,
-          json: vi.fn().mockResolvedValue({
-            models: {
-              'gemini-3-flash': {
-                quotaInfo: {
-                  remainingFraction: 0.8,
-                  resetTime: '2026-05-05T00:00:00Z',
+      const fetchMock = vi.fn(async (url: string) => {
+        if (url.includes('fetchAvailableModels')) {
+          return {
+            ok: true,
+            status: 200,
+            json: vi.fn().mockResolvedValue({
+              models: {
+                'gemini-3-flash': {
+                  quotaInfo: {
+                    remainingFraction: 0.8,
+                    resetTime: '2026-05-05T00:00:00Z',
+                  },
                 },
               },
-            },
-          }),
-        })
-        // 2. Quota summary with project returns 403
-        .mockResolvedValueOnce({ ok: false, status: 403 })
-        // 3. Retry without project also returns 403
-        .mockResolvedValueOnce({ ok: false, status: 403 });
+            }),
+          };
+        }
+        if (url.includes('retrieveUserQuotaSummary')) {
+          return { ok: false, status: 403 };
+        }
+        if (url.includes('loadCodeAssist')) {
+          return { ok: false, status: 503 };
+        }
+        throw new Error(`Unexpected URL: ${url}`);
+      });
 
       vi.stubGlobal('fetch', fetchMock);
 
@@ -502,7 +596,7 @@ describe('Upstream Endpoint and Project Header Stability', () => {
       // Model quota is preserved truthfully, quota_groups is not populated
       expect(result.models['gemini-3-flash']).toBeDefined();
       expect(result.quota_groups).toBeUndefined();
-      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock).toHaveBeenCalledTimes(4);
     });
   });
 });

@@ -1,4 +1,4 @@
-import { HttpStatus, Injectable, Logger, Inject } from '@nestjs/common';
+import { BadRequestException, HttpStatus, Injectable, Logger, Inject } from '@nestjs/common';
 import { isEmpty, isFunction, isNil, isNumber, isPlainObject, isString } from 'lodash-es';
 import { AccountLeaseService } from './account-lease.service';
 import { GeminiClient, unwrapInternalGeminiResponse } from './clients/gemini.client';
@@ -6,7 +6,7 @@ import { UpstreamRequestError } from './clients/upstream-error';
 import { AccountPoolUnavailableException, OpenAIProtocolException } from './openai-protocol-error';
 import { v4 as uuidv4 } from 'uuid';
 import { Observable } from 'rxjs';
-import { transformClaudeRequestIn } from '../antigravity/ClaudeRequestMapper';
+import { resolveSafetySettings, transformClaudeRequestIn } from '../antigravity/ClaudeRequestMapper';
 import { supportsAnthropicAssistantPrefill } from '../antigravity/ModelMapping';
 import { transformResponse } from '../antigravity/ClaudeResponseMapper';
 import { StreamingState, PartProcessor } from '../antigravity/ClaudeStreamingMapper';
@@ -31,7 +31,6 @@ import {
   GeminiPart as InternalGeminiPart,
 } from '../antigravity/types';
 import { normalizeObjectJsonSchema } from '../antigravity/JsonSchemaUtils';
-import { classifyStreamError } from '../antigravity/stream-error-utils';
 import { mapGeminiFinishReasonToOpenAI } from '../antigravity/gemini-finish-reason';
 import {
   OpenAIChatRequest,
@@ -57,6 +56,7 @@ import {
   InvalidFunctionCallArgumentsError,
   normalizeFunctionCallArgs,
 } from '../antigravity/function-call-args';
+import { preflightNativeGeminiRequest } from './native-gemini-request';
 
 interface StreamIdleTimer {
   reset: () => void;
@@ -67,6 +67,11 @@ interface StreamIdleTimer {
 interface StreamHealthLifecycle {
   markUsableOutput: () => void;
   recordFailure: (error: unknown) => void;
+}
+
+interface UpstreamAttempt<T> {
+  result: T;
+  startedAt: number;
 }
 
 type OpenAIOutputProtocol = 'chat-completions' | 'responses' | 'text-completions';
@@ -85,6 +90,15 @@ interface OpenAIStreamUsage {
   completion_tokens: number;
   total_tokens: number;
 }
+
+const UPSTREAM_STREAM_STATUS_CODES: Readonly<Record<string, HttpStatus>> = {
+  DEADLINE_EXCEEDED: HttpStatus.REQUEST_TIMEOUT,
+  INTERNAL: HttpStatus.INTERNAL_SERVER_ERROR,
+  PERMISSION_DENIED: HttpStatus.FORBIDDEN,
+  RESOURCE_EXHAUSTED: HttpStatus.TOO_MANY_REQUESTS,
+  UNAUTHENTICATED: HttpStatus.UNAUTHORIZED,
+  UNAVAILABLE: HttpStatus.SERVICE_UNAVAILABLE,
+};
 
 @Injectable()
 export class ProxyService {
@@ -153,7 +167,6 @@ export class ProxyService {
       idleTimer = setTimeout(() => {
         this.logger.error(`[${label}] Idle timeout after 300s, terminating stream`);
         onTimeout();
-        this.destroyUpstreamStream(upstreamStream);
       }, this.streamIdleTimeoutMs);
     };
 
@@ -167,7 +180,11 @@ export class ProxyService {
     };
   }
 
-  private createStreamHealthLifecycle(accountId: string, model: string): StreamHealthLifecycle {
+  private createStreamHealthLifecycle(
+    accountId: string,
+    model: string,
+    startedAt: number,
+  ): StreamHealthLifecycle {
     let hasMarkedSuccess = false;
     let hasRecordedFailure = false;
 
@@ -178,15 +195,59 @@ export class ProxyService {
         }
         hasMarkedSuccess = true;
         this.retryPolicy.markUpstreamSuccess(accountId, model);
+        this.accountLeaseService.recordPerformanceSuccess?.(
+          accountId,
+          model,
+          performance.now() - startedAt,
+        );
       },
       recordFailure: (error: unknown) => {
         if (hasRecordedFailure) {
           return;
         }
         hasRecordedFailure = true;
+        if (!hasMarkedSuccess) {
+          this.recordPerformanceFailureForAttempt(accountId, model, error);
+        }
         this.recordBoundedStreamPenalty(accountId, model, error);
       },
     };
+  }
+
+  private markUpstreamSuccess(accountId: string, model: string): void {
+    this.retryPolicy.markUpstreamSuccess(accountId, model);
+    this.accountLeaseService.recordPerformanceSuccess?.(accountId, model);
+  }
+
+  private async executeUpstreamAttempt<T>(
+    accountId: string,
+    model: string,
+    request: () => Promise<T>,
+  ): Promise<UpstreamAttempt<T>> {
+    const startedAt = performance.now();
+    try {
+      return { result: await request(), startedAt };
+    } catch (error) {
+      this.recordPerformanceFailureForAttempt(accountId, model, error);
+      throw error;
+    }
+  }
+
+  private recordPerformanceFailureForAttempt(accountId: string, model: string, error: unknown): void {
+    if (!this.isPerformanceFailure(error)) {
+      return;
+    }
+    this.accountLeaseService.recordPerformanceFailure?.(accountId, model);
+  }
+
+  private isPerformanceFailure(error: unknown): boolean {
+    if (error instanceof BadRequestException || error instanceof OpenAIProtocolException) {
+      return false;
+    }
+    if (error instanceof Error) {
+      return error.name !== 'AbortError' && (error as { code?: unknown }).code !== 'ERR_CANCELED';
+    }
+    return false;
   }
 
   private recordBoundedStreamPenalty(accountId: string, model: string, error: unknown): void {
@@ -194,8 +255,8 @@ export class ProxyService {
       error instanceof UpstreamRequestError
         ? error
         : new UpstreamRequestError({
-            message: error instanceof Error ? error.message : String(error),
             status: HttpStatus.SERVICE_UNAVAILABLE,
+            reason: 'upstream_error',
           });
     let timeout: NodeJS.Timeout | undefined;
     const timeoutPromise = new Promise<void>((resolve) => {
@@ -240,7 +301,7 @@ export class ProxyService {
     const accountCount = await this.accountLeaseService.getRefreshedModelCapableAccountCount(model);
     if (accountCount === 0) {
       throw new AccountPoolUnavailableException(
-        `No account advertises a compatible upstream model for ${model}`,
+        'No account advertises a compatible upstream model.',
         HttpStatus.SERVICE_UNAVAILABLE,
       );
     }
@@ -265,9 +326,7 @@ export class ProxyService {
       );
     }
     const extraHeaders = this.createModelSpecificHeaders(request.model);
-    this.logger.log(
-      `Anthropic request received: model=${request.model}, mappedModel=${targetModel}, stream=${request.stream}`,
-    );
+    this.logger.log(`Anthropic request received: operation=anthropic_request stream=${request.stream}`);
 
     // Retry loop
     let lastError: unknown = null;
@@ -310,38 +369,43 @@ export class ProxyService {
         this.applyInternalGenerationConstraints(geminiBody, effectiveTargetModel, token.id);
 
         if (request.stream) {
-          const stream = await this.geminiClient.streamGenerateInternal(
-            geminiBody,
-            token.token.access_token,
-            token.token.upstream_proxy_url,
-            extraHeaders,
+          const { result: stream, startedAt } = await this.executeUpstreamAttempt(
             token.id,
+            effectiveTargetModel,
+            () => this.geminiClient.streamGenerateInternal(
+              geminiBody,
+              token.token.access_token,
+              token.token.upstream_proxy_url,
+              extraHeaders,
+              token.id,
+            ),
           );
           return this.processAnthropicInternalStream(
             stream,
             geminiBody.model,
-            this.createStreamHealthLifecycle(token.id, effectiveTargetModel),
+            this.createStreamHealthLifecycle(token.id, effectiveTargetModel, startedAt),
             signatureContext,
             request.model,
           );
         } else {
-          const response = await this.generateInternalWithStreamFallback(
+          const { result: response } = await this.generateInternalWithStreamFallback(
             geminiBody,
             token.token.access_token,
             token.token.upstream_proxy_url,
             extraHeaders,
             token.id,
+            effectiveTargetModel,
           );
-          this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
+          this.markUpstreamSuccess(token.id, effectiveTargetModel);
           return this.toAnthropicChatResponse(
             transformResponse(response, signatureContext, request.model),
           );
         }
       } catch (error) {
         let effectiveError: unknown = error;
-        if (error instanceof Error && this.isQuotaExhaustedError(error.message)) {
+        if (this.isQuotaExhaustedError(error)) {
           this.logger.warn(
-            `Anthropic request hit quota exhaustion on mapped model, retrying with fallback model gemini-3-flash: ${error.message}`,
+            'Anthropic request retrying with fallback: operation=anthropic_request reason=quota_exhausted',
           );
           try {
             const downgradedRequest: ClaudeRequest = {
@@ -361,29 +425,34 @@ export class ProxyService {
             );
             this.applyInternalGenerationConstraints(downgradedBody, 'gemini-3-flash', token.id);
             if (request.stream) {
-              const stream = await this.geminiClient.streamGenerateInternal(
-                downgradedBody,
-                token.token.access_token,
-                token.token.upstream_proxy_url,
-                extraHeaders,
+              const { result: stream, startedAt } = await this.executeUpstreamAttempt(
                 token.id,
+                'gemini-3-flash',
+                () => this.geminiClient.streamGenerateInternal(
+                  downgradedBody,
+                  token.token.access_token,
+                  token.token.upstream_proxy_url,
+                  extraHeaders,
+                  token.id,
+                ),
               );
               return this.processAnthropicInternalStream(
                 stream,
                 downgradedBody.model,
-                this.createStreamHealthLifecycle(token.id, 'gemini-3-flash'),
+                this.createStreamHealthLifecycle(token.id, 'gemini-3-flash', startedAt),
                 downgradedSignatureContext,
                 request.model,
               );
             } else {
-              const response = await this.generateInternalWithStreamFallback(
+              const { result: response } = await this.generateInternalWithStreamFallback(
                 downgradedBody,
                 token.token.access_token,
                 token.token.upstream_proxy_url,
                 extraHeaders,
                 token.id,
+                'gemini-3-flash',
               );
-              this.retryPolicy.markUpstreamSuccess(token.id, 'gemini-3-flash');
+              this.markUpstreamSuccess(token.id, 'gemini-3-flash');
               const transformed = this.toAnthropicChatResponse(
                 transformResponse(response, downgradedSignatureContext, request.model),
               );
@@ -448,7 +517,8 @@ export class ProxyService {
           this.destroyUpstreamStream(upstreamStream);
         }
         streamHealth.recordFailure(error);
-        subscriber.error(error);
+        void error;
+        subscriber.error(new Error('Upstream stream failed'));
       };
 
       const processLine = (line: string): void => {
@@ -511,7 +581,8 @@ export class ProxyService {
             failStream(error, true);
             return;
           }
-          this.logger.error('Stream parse error', error);
+          void error;
+          this.logger.error('Stream parse error: operation=anthropic_stream reason=invalid_payload');
           const errorChunks = state.handleParseError(dataStr);
           errorChunks.forEach((chunk) => subscriber.next(chunk));
           if (state.getErrorCount() > 3) {
@@ -562,15 +633,13 @@ export class ProxyService {
       };
 
       const onError = (err: unknown): void => {
-        const cleanError = err instanceof Error ? err : new Error(String(err));
-        const { type } = classifyStreamError(cleanError);
-
-        this.logger.error(`Stream error: ${type} - ${cleanError.message}`);
-        failStream(cleanError);
+        void err;
+        this.logger.error('Stream error: operation=anthropic_stream reason=upstream_error');
+        failStream(new Error('Upstream stream failed'));
       };
 
       const idleTimer = this.createStreamIdleTimer(upstreamStream, 'Claude-SSE', () => {
-        failStream(new Error('Upstream stream idle timeout after 300s'));
+        failStream(new Error('Upstream stream idle timeout after 300s'), true);
       });
 
       upstreamStream.on('data', onData);
@@ -594,12 +663,18 @@ export class ProxyService {
     model: string,
     request: GeminiRequest,
   ): Promise<GeminiResponse> {
+    return this.handlePreflightedGeminiGenerateContent(model, preflightNativeGeminiRequest(request));
+  }
+
+  /** Controller callers must run the shared structural preflight before invoking this method. */
+  async handlePreflightedGeminiGenerateContent(
+    model: string,
+    preflightRequest: GeminiInternalRequest['request'],
+  ): Promise<GeminiResponse> {
     const normalizedModel = this.normalizeGeminiModel(model);
     const targetModel = this.resolveTargetModel(normalizedModel);
     const extraHeaders = this.createModelSpecificHeaders(normalizedModel);
-    this.logger.log(
-      `Gemini generate request received: model=${normalizedModel}, mappedModel=${targetModel}`,
-    );
+    this.logger.log('Gemini generate request received: operation=gemini_generate');
 
     let lastError: unknown = null;
     const maxRetries = await this.getModelRetryBudget(targetModel);
@@ -627,24 +702,29 @@ export class ProxyService {
         const requestUserAgent = await resolveRequestUserAgent();
         const internalBody = this.createGeminiInternalRequest(
           effectiveTargetModel,
-          request,
+          preflightRequest,
           token.token.project_id ?? '',
           'generate-content',
           requestUserAgent,
+          { accountId: token.id, model: effectiveTargetModel },
         );
         this.applyInternalGenerationConstraints(internalBody, effectiveTargetModel, token.id);
 
-        const response = await this.generateInternalWithStreamFallback(
+        const { result: response } = await this.generateInternalWithStreamFallback(
           internalBody,
           token.token.access_token,
           token.token.upstream_proxy_url,
           extraHeaders,
           token.id,
+          effectiveTargetModel,
         );
 
-        this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
+        this.markUpstreamSuccess(token.id, effectiveTargetModel);
         return this.normalizeGeminiGenerateResponse(response);
       } catch (err) {
+        if (err instanceof BadRequestException) {
+          throw err;
+        }
         lastError = err;
 
         const shouldRetry = await this.applyUpstreamPenalty(
@@ -665,12 +745,18 @@ export class ProxyService {
     model: string,
     request: GeminiRequest,
   ): Promise<Observable<string>> {
+    return this.handlePreflightedGeminiStreamGenerateContent(model, preflightNativeGeminiRequest(request));
+  }
+
+  /** Controller callers must run the shared structural preflight before invoking this method. */
+  async handlePreflightedGeminiStreamGenerateContent(
+    model: string,
+    preflightRequest: GeminiInternalRequest['request'],
+  ): Promise<Observable<string>> {
     const normalizedModel = this.normalizeGeminiModel(model);
     const targetModel = this.resolveTargetModel(normalizedModel);
     const extraHeaders = this.createModelSpecificHeaders(normalizedModel);
-    this.logger.log(
-      `Gemini stream request received: model=${normalizedModel}, mappedModel=${targetModel}`,
-    );
+    this.logger.log('Gemini stream request received: operation=gemini_stream');
 
     let lastError: unknown = null;
     const maxRetries = await this.getModelRetryBudget(targetModel);
@@ -702,25 +788,33 @@ export class ProxyService {
         const requestUserAgent = await resolveRequestUserAgent();
         const internalBody = this.createGeminiInternalRequest(
           effectiveTargetModel,
-          request,
+          preflightRequest,
           token.token.project_id ?? '',
           'generate-content',
           requestUserAgent,
+          { accountId: token.id, model: effectiveTargetModel },
         );
         this.applyInternalGenerationConstraints(internalBody, effectiveTargetModel, token.id);
 
-        const stream = await this.geminiClient.streamGenerateInternal(
-          internalBody,
-          token.token.access_token,
-          token.token.upstream_proxy_url,
-          extraHeaders,
+        const { result: stream, startedAt } = await this.executeUpstreamAttempt(
           token.id,
+          effectiveTargetModel,
+          () => this.geminiClient.streamGenerateInternal(
+            internalBody,
+            token.token.access_token,
+            token.token.upstream_proxy_url,
+            extraHeaders,
+            token.id,
+          ),
         );
         return this.passthroughSseStream(
           stream,
-          this.createStreamHealthLifecycle(token.id, effectiveTargetModel),
+          this.createStreamHealthLifecycle(token.id, effectiveTargetModel, startedAt),
         );
       } catch (err) {
+        if (err instanceof BadRequestException) {
+          throw err;
+        }
         lastError = err;
 
         const shouldRetry = await this.applyUpstreamPenalty(
@@ -763,12 +857,20 @@ export class ProxyService {
         return true;
       };
 
-      const failStream = (error: Error): void => {
+      const failStream = (error: unknown): void => {
         if (!terminate()) {
           return;
         }
-        streamHealth.recordFailure(error);
-        subscriber.error(error);
+        const safeError = new Error('Upstream stream failed');
+        streamHealth.recordFailure(
+          error instanceof UpstreamRequestError
+            ? error
+            : new UpstreamRequestError({
+                status: HttpStatus.SERVICE_UNAVAILABLE,
+                reason: 'upstream_error',
+              }),
+        );
+        subscriber.error(safeError);
       };
       const idleTimer = this.createStreamIdleTimer(upstreamStream, 'Gemini-SSE', () => {
         failStream(new Error('Upstream stream idle timeout after 300s'));
@@ -776,37 +878,49 @@ export class ProxyService {
 
       idleTimer.reset();
 
-      const processLine = (line: string): void => {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data:')) {
+      const processFrame = (frame: string): void => {
+        const validation = this.validateNativeGeminiSseFrame(frame);
+        if (validation.error) {
+          failStream(validation.error);
           return;
         }
-        const data = trimmed.slice('data:'.length).trim();
-        if (data.length === 0 || data === '[DONE]') {
-          return;
+        if (validation.hasUsableOutput) {
+          receivedUsableOutput = true;
+          streamHealth.markUsableOutput();
         }
-        try {
-          const rawPayload = JSON.parse(data);
-          const upstreamError = this.getUpstreamStreamError(rawPayload);
-          if (upstreamError) {
-            failStream(upstreamError);
+        subscriber.next(frame);
+      };
+
+      const findCompletedFrameEnd = (allowTrailingCr: boolean): number => {
+        let lineStart = 0;
+        for (let index = 0; index < buffer.length; index += 1) {
+          const character = buffer[index];
+          if (character !== '\r' && character !== '\n') {
+            continue;
+          }
+
+          if (character === '\r' && index + 1 === buffer.length && !allowTrailingCr) {
+            return -1;
+          }
+          const lineEndingLength = character === '\r' && buffer[index + 1] === '\n' ? 2 : 1;
+          if (index === lineStart) {
+            return index + lineEndingLength;
+          }
+          lineStart = index + lineEndingLength;
+          index += lineEndingLength - 1;
+        }
+        return -1;
+      };
+
+      const processCompletedFrames = (allowTrailingCr = false): void => {
+        let frameEnd: number;
+        while ((frameEnd = findCompletedFrameEnd(allowTrailingCr)) !== -1) {
+          const frame = buffer.slice(0, frameEnd);
+          buffer = buffer.slice(frameEnd);
+          processFrame(frame);
+          if (terminated) {
             return;
           }
-          const response = unwrapInternalGeminiResponse(rawPayload);
-          const candidate = response?.candidates?.[0];
-          const hasUsableCandidate =
-            (Array.isArray(candidate?.content?.parts) &&
-              candidate.content.parts.some((part: unknown) => this.normalizeGeminiPart(part))) ||
-            Boolean(candidate?.groundingMetadata) ||
-            (isString(candidate?.finishReason) && candidate.finishReason.length > 0);
-          if (hasUsableCandidate) {
-            receivedUsableOutput = true;
-            streamHealth.markUsableOutput();
-          }
-        } catch (error) {
-          failStream(
-            error instanceof Error ? error : new Error('Malformed upstream stream payload'),
-          );
         }
       };
 
@@ -815,32 +929,19 @@ export class ProxyService {
           return;
         }
         idleTimer.reset();
-        const forwardedChunk = decoder.decode(chunk, { stream: true });
-        if (forwardedChunk) {
-          subscriber.next(forwardedChunk);
-          buffer += forwardedChunk;
-        }
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          processLine(line);
-          if (terminated) {
-            return;
-          }
-        }
+        buffer += decoder.decode(chunk, { stream: true });
+        processCompletedFrames();
       };
 
       const onEnd = (): void => {
         if (terminated) {
           return;
         }
-        const forwardedChunk = decoder.decode();
-        if (forwardedChunk) {
-          subscriber.next(forwardedChunk);
-          buffer += forwardedChunk;
-        }
-        if (buffer.trim()) {
-          processLine(buffer);
+        buffer += decoder.decode();
+        processCompletedFrames(true);
+        if (!terminated && buffer.length > 0) {
+          processFrame(buffer);
+          buffer = '';
         }
         if (terminated) {
           return;
@@ -854,8 +955,8 @@ export class ProxyService {
       };
 
       const onError = (err: unknown): void => {
-        const cleanError = err instanceof Error ? new Error(err.message) : new Error(String(err));
-        failStream(cleanError);
+        void err;
+        failStream(new Error('Upstream stream failed'));
       };
 
       upstreamStream.on('data', onData);
@@ -868,6 +969,66 @@ export class ProxyService {
     });
   }
 
+  private validateNativeGeminiSseFrame(frame: string): {
+    error?: UpstreamRequestError;
+    hasUsableOutput: boolean;
+  } {
+    const data = this.getSseFrameData(frame);
+    if (data === null || data.length === 0 || data === '[DONE]') {
+      return { hasUsableOutput: false };
+    }
+
+    let rawPayload: unknown;
+    try {
+      rawPayload = JSON.parse(data);
+    } catch {
+      return {
+        error: new UpstreamRequestError({
+          status: HttpStatus.SERVICE_UNAVAILABLE,
+          reason: 'upstream_error',
+        }),
+        hasUsableOutput: false,
+      };
+    }
+
+    const upstreamError = this.getUpstreamStreamError(rawPayload);
+    if (upstreamError) {
+      return { error: upstreamError, hasUsableOutput: false };
+    }
+
+    const response = unwrapInternalGeminiResponse(rawPayload);
+    if (!this.isValidGeminiFallbackFrame(response)) {
+      return {
+        error: new UpstreamRequestError({
+          status: HttpStatus.SERVICE_UNAVAILABLE,
+          reason: 'upstream_error',
+        }),
+        hasUsableOutput: false,
+      };
+    }
+
+    const hasUsableOutput = response.candidates?.some((candidate) => {
+      const parts = candidate.content?.parts;
+      return (
+        (Array.isArray(parts) && parts.some((part) => this.normalizeGeminiPart(part))) ||
+        Boolean(candidate.groundingMetadata) ||
+        (isString(candidate.finishReason) && candidate.finishReason.length > 0)
+      );
+    }) ?? false;
+    return { hasUsableOutput };
+  }
+
+  private getSseFrameData(frame: string): string | null {
+    const dataLines = frame
+      .split(/\r\n|\n|\r/)
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => {
+        const value = line.slice('data:'.length);
+        return value.startsWith(' ') ? value.slice(1) : value;
+      });
+    return dataLines.length > 0 ? dataLines.join('\n') : null;
+  }
+
   private normalizeGeminiModel(model: string): string {
     return this.modelRoutingPolicy.normalizeGeminiModel(model);
   }
@@ -878,20 +1039,27 @@ export class ProxyService {
     accountId: string,
   ): void {
     this.generationConstraints.applyInternalGenerationConstraints(body, model, accountId);
+    const safetySettings = resolveSafetySettings(model);
+    if (safetySettings.length === 0) {
+      delete body.request.safetySettings;
+      return;
+    }
+    body.request.safetySettings = safetySettings;
   }
 
   private createGeminiInternalRequest(
     model: string,
-    request: GeminiRequest,
+    request: GeminiInternalRequest['request'],
     projectId: string | undefined,
     requestType: string,
     requestUserAgent: string,
+    signatureContext?: SignatureContext,
   ): GeminiInternalRequest {
     const normalizedProjectId = projectId?.trim();
 
     const internalRequest: GeminiInternalRequest = {
       requestId: this.createOfficialRequestId(),
-      request: this.toInternalGeminiRequest(request),
+      request: this.applyNativeGeminiSignatureTransform(request, model, signatureContext),
       model,
       userAgent: requestUserAgent,
       requestType,
@@ -960,7 +1128,7 @@ export class ProxyService {
     const targetModel = this.resolveTargetModel(request.model);
     const extraHeaders = this.createModelSpecificHeaders(request.model);
     this.logger.log(
-      `OpenAI-compatible request received: model=${request.model}, mappedModel=${targetModel}, stream=${request.stream}`,
+      `OpenAI-compatible request received: operation=openai_request stream=${request.stream}`,
     );
 
     // Deterministic request conversion happens before any account is leased so a local
@@ -1016,12 +1184,16 @@ export class ProxyService {
         // Use v1internal API (same as Anthropic handler)
         if (request.stream) {
           try {
-            const stream = await this.geminiClient.streamGenerateInternal(
-              geminiBody,
-              token.token.access_token,
-              token.token.upstream_proxy_url,
-              extraHeaders,
+            const { result: stream, startedAt } = await this.executeUpstreamAttempt(
               token.id,
+              effectiveTargetModel,
+              () => this.geminiClient.streamGenerateInternal(
+                geminiBody,
+                token.token.access_token,
+                token.token.upstream_proxy_url,
+                extraHeaders,
+                token.id,
+              ),
             );
             return this.createOpenAIProtocolStream(
               stream,
@@ -1030,26 +1202,25 @@ export class ProxyService {
               streamOptions,
               signatureContext,
               responsesConfiguration,
-              this.createStreamHealthLifecycle(token.id, effectiveTargetModel),
+              this.createStreamHealthLifecycle(token.id, effectiveTargetModel, startedAt),
             );
           } catch (streamError) {
             if (this.retryPolicy.shouldFailoverImmediately(streamError)) {
               throw streamError;
             }
             this.logger.warn(
-              `Stream path failed for model=${request.model}; falling back to non-stream generation: ${
-                streamError instanceof Error ? streamError.message : String(streamError)
-              }`,
+              'Stream path fallback: operation=openai_request reason=stream_to_non_stream',
             );
 
-            const response = await this.generateInternalWithStreamFallback(
+            const { result: response } = await this.generateInternalWithStreamFallback(
               geminiBody,
               token.token.access_token,
               token.token.upstream_proxy_url,
               extraHeaders,
               token.id,
+              effectiveTargetModel,
             );
-            this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
+            this.markUpstreamSuccess(token.id, effectiveTargetModel);
             const claudeResponse = transformResponse(response, signatureContext);
             const openaiResponse = this.convertClaudeToOpenAIResponse(
               claudeResponse,
@@ -1062,14 +1233,15 @@ export class ProxyService {
               : this.createSyntheticOpenAIStream(openaiResponse, streamOptions);
           }
         } else {
-          const response = await this.generateInternalWithStreamFallback(
+          const { result: response } = await this.generateInternalWithStreamFallback(
             geminiBody,
             token.token.access_token,
             token.token.upstream_proxy_url,
             extraHeaders,
             token.id,
+            effectiveTargetModel,
           );
-          this.retryPolicy.markUpstreamSuccess(token.id, effectiveTargetModel);
+          this.markUpstreamSuccess(token.id, effectiveTargetModel);
           // Transform Gemini response to OpenAI format
           const claudeResponse = transformResponse(response, signatureContext);
           return this.convertClaudeToOpenAIResponse(
@@ -1098,30 +1270,38 @@ export class ProxyService {
   private async generateInternalWithStreamFallback(
     body: GeminiInternalRequest,
     accessToken: string,
-    upstreamProxyUrl?: string,
-    extraHeaders?: Record<string, string>,
-    accountKey?: string,
-  ): Promise<GeminiResponse> {
-    const direct = await this.geminiClient.generateInternal(
+    upstreamProxyUrl: string | undefined,
+    extraHeaders: Record<string, string> | undefined,
+    accountId: string,
+    effectiveModel: string,
+  ): Promise<UpstreamAttempt<GeminiResponse>> {
+    const direct = await this.executeUpstreamAttempt(accountId, effectiveModel, () => this.geminiClient.generateInternal(
       body,
       accessToken,
       upstreamProxyUrl,
       extraHeaders,
-      accountKey,
-    );
-    if (this.hasUsableGeminiCandidate(direct)) {
+      accountId,
+    ));
+    if (this.hasUsableGeminiCandidate(direct.result)) {
       return direct;
     }
 
-    this.logger.warn('Empty non-stream response detected, falling back to stream aggregation.');
-    const stream = await this.geminiClient.streamGenerateInternal(
-      body,
-      accessToken,
-      upstreamProxyUrl,
-      extraHeaders,
-      accountKey,
+    this.recordPerformanceFailureForAttempt(
+      accountId,
+      effectiveModel,
+      new UpstreamRequestError({ reason: 'upstream_error' }),
     );
-    return this.collectGeminiStreamAsResponse(stream);
+    this.logger.warn('Empty non-stream response detected, falling back to stream aggregation.');
+    return this.executeUpstreamAttempt(accountId, effectiveModel, async () => {
+      const stream = await this.geminiClient.streamGenerateInternal(
+        body,
+        accessToken,
+        upstreamProxyUrl,
+        extraHeaders,
+        accountId,
+      );
+      return this.collectGeminiStreamAsResponse(stream);
+    });
   }
 
   private hasUsableGeminiCandidate(response: GeminiResponse): boolean {
@@ -1150,17 +1330,76 @@ export class ProxyService {
     const error = record.error;
     const errorRecord = this.toUnknownRecord(error);
     if (errorRecord) {
-      const message = isString(errorRecord.message) ? errorRecord.message : 'Upstream stream error';
       const status =
-        isNumber(errorRecord.code) && errorRecord.code >= 400 && errorRecord.code <= 599
-          ? errorRecord.code
-          : undefined;
-      return new UpstreamRequestError({ message, status });
+        this.normalizeUpstreamStreamStatus(errorRecord.code) ??
+        this.normalizeUpstreamStreamStatus(errorRecord.status);
+      return new UpstreamRequestError({
+        status,
+        headers: { retryAfter: this.extractUpstreamStreamRetryAfter(errorRecord, record) },
+        reason: this.resolveUpstreamFailureReason(status),
+      });
     }
 
     return new UpstreamRequestError({
-      message: isString(error) ? error : `Upstream stream error: ${String(error)}`,
+      reason: 'upstream_error',
     });
+  }
+
+  private normalizeUpstreamStreamStatus(value: unknown): number | undefined {
+    if (isNumber(value) && value >= 400 && value <= 599) {
+      return value;
+    }
+    if (!isString(value)) {
+      return undefined;
+    }
+
+    const normalized = value.trim().toUpperCase();
+    if (/^[4-5]\d{2}$/.test(normalized)) {
+      return Number(normalized);
+    }
+    return UPSTREAM_STREAM_STATUS_CODES[normalized];
+  }
+
+  private resolveUpstreamFailureReason(
+    status: number | undefined,
+  ): UpstreamRequestError['reason'] {
+    if (status === HttpStatus.UNAUTHORIZED || status === HttpStatus.FORBIDDEN) {
+      return 'authentication';
+    }
+    if (status === HttpStatus.NOT_FOUND) {
+      return 'model_not_found';
+    }
+    if (status === HttpStatus.TOO_MANY_REQUESTS) {
+      return 'rate_limited';
+    }
+    return 'upstream_error';
+  }
+
+  private extractUpstreamStreamRetryAfter(
+    error: Record<string, unknown>,
+    payload: Record<string, unknown>,
+  ): string | undefined {
+    for (const source of [
+      error,
+      this.toUnknownRecord(error.headers),
+      payload,
+      this.toUnknownRecord(payload.headers),
+    ]) {
+      if (!source) {
+        continue;
+      }
+      const value = Object.entries(source).find(([name]) => {
+        const normalized = name.toLowerCase();
+        return normalized === 'retry-after' || normalized === 'retryafter' || normalized === 'retry_after';
+      })?.[1];
+      if (isString(value)) {
+        return value;
+      }
+      if (Array.isArray(value) && isString(value[0])) {
+        return value[0];
+      }
+    }
+    return undefined;
   }
 
   private collectGeminiStreamAsResponse(
@@ -1175,6 +1414,11 @@ export class ProxyService {
       const toolCallIdIntegrity = new ToolCallIdIntegrityTracker();
       let finishReason: string | undefined;
       let usageMetadata: GeminiResponse['usageMetadata'];
+      let modelVersion: GeminiResponse['modelVersion'];
+      let promptFeedback: GeminiResponse['promptFeedback'];
+      let responseId: GeminiResponse['responseId'];
+      let receivedCandidate = false;
+      let receivedValidFrame = false;
       let settled = false;
 
       const cleanup = (): void => {
@@ -1206,7 +1450,7 @@ export class ProxyService {
       };
 
       const idleTimer = this.createStreamIdleTimer(upstreamStream, 'Gemini-Collect', () => {
-        rejectOnce(new Error('Stream idle timeout'));
+        rejectOnce(new UpstreamRequestError({ reason: 'upstream_error' }), true);
       });
 
       const onData = (chunk: Buffer): void => {
@@ -1246,8 +1490,16 @@ export class ProxyService {
             return;
           }
           const parsed = unwrapInternalGeminiResponse(rawPayload);
+          if (!this.isValidGeminiFallbackFrame(parsed)) {
+            rejectOnce(new UpstreamRequestError({ reason: 'upstream_error' }), true);
+            return;
+          }
+          receivedValidFrame = true;
 
           const candidate = parsed?.candidates?.[0];
+          if (candidate) {
+            receivedCandidate = true;
+          }
           groundingMetadata = this.mergeGroundingMetadata(
             groundingMetadata,
             candidate?.groundingMetadata,
@@ -1279,15 +1531,24 @@ export class ProxyService {
           if (parsed?.usageMetadata) {
             usageMetadata = parsed.usageMetadata;
           }
+          if (parsed.modelVersion) {
+            modelVersion = parsed.modelVersion;
+          }
+          if (parsed.promptFeedback) {
+            promptFeedback = parsed.promptFeedback;
+          }
+          if (parsed.responseId) {
+            responseId = parsed.responseId;
+          }
         } catch (error) {
           if (
             error instanceof ToolCallIdConflictError ||
             error instanceof InvalidFunctionCallArgumentsError
           ) {
-            rejectOnce(error, true);
+            rejectOnce(new UpstreamRequestError({ reason: 'upstream_error' }), true);
             return;
           }
-          // Ignore malformed chunks and continue collecting valid parts.
+          rejectOnce(new UpstreamRequestError({ reason: 'upstream_error' }), true);
         }
       };
 
@@ -1302,29 +1563,39 @@ export class ProxyService {
         if (settled) {
           return;
         }
-        if (!receivedData || (mergedParts.length === 0 && !groundingMetadata)) {
-          rejectOnce(new Error('Empty response stream'));
+        if (!receivedData || !receivedValidFrame) {
+          rejectOnce(new UpstreamRequestError({ reason: 'upstream_error' }));
           return;
         }
 
-        const candidate: NonNullable<GeminiResponse['candidates']>[number] & {
-          groundingMetadata?: GroundingMetadata;
-        } = {
-          content: {
-            role: 'model',
-            parts: mergedParts,
-          },
-          finishReason,
-          groundingMetadata,
-        };
         resolveOnce({
-          candidates: [candidate],
-          usageMetadata,
+          ...(receivedCandidate
+            ? {
+                candidates: [
+                  {
+                    content: {
+                      role: 'model',
+                      parts: mergedParts,
+                    },
+                    finishReason,
+                    groundingMetadata,
+                  },
+                ],
+              }
+            : {}),
+          ...(usageMetadata ? { usageMetadata } : {}),
+          ...(modelVersion ? { modelVersion } : {}),
+          ...(promptFeedback ? { promptFeedback } : {}),
+          ...(responseId ? { responseId } : {}),
         });
       };
 
       const onError = (error: unknown): void => {
-        rejectOnce(error instanceof Error ? error : new Error(String(error)));
+        rejectOnce(
+          error instanceof UpstreamRequestError
+            ? error
+            : new UpstreamRequestError({ reason: 'transport' }),
+        );
       };
 
       upstreamStream.on('data', onData);
@@ -1332,6 +1603,160 @@ export class ProxyService {
       upstreamStream.on('error', onError);
       idleTimer.reset();
     });
+  }
+
+  private isValidGeminiFallbackFrame(value: unknown): value is GeminiResponse {
+    const frame = this.toUnknownRecord(value);
+    if (!frame) {
+      return false;
+    }
+
+    let hasValidResponseField = false;
+    if (Object.hasOwn(frame, 'candidates')) {
+      if (!this.hasValidGeminiFallbackCandidates(frame.candidates)) {
+        return false;
+      }
+      hasValidResponseField = true;
+    }
+    if (Object.hasOwn(frame, 'usageMetadata')) {
+      if (!this.isValidGeminiFallbackUsageMetadata(frame.usageMetadata)) {
+        return false;
+      }
+      hasValidResponseField = true;
+    }
+    if (Object.hasOwn(frame, 'promptFeedback')) {
+      if (!this.isValidGeminiFallbackPromptFeedback(frame.promptFeedback)) {
+        return false;
+      }
+      hasValidResponseField = true;
+    }
+    for (const field of ['modelVersion', 'responseId'] as const) {
+      if (Object.hasOwn(frame, field)) {
+        if (!isString(frame[field]) || isEmpty(frame[field].trim())) {
+          return false;
+        }
+        hasValidResponseField = true;
+      }
+    }
+    return hasValidResponseField;
+  }
+
+  private hasValidGeminiFallbackCandidates(value: unknown): boolean {
+    if (!Array.isArray(value) || value.length === 0) {
+      return false;
+    }
+    return value.every((candidate) => this.isValidGeminiFallbackCandidate(candidate));
+  }
+
+  private isValidGeminiFallbackCandidate(value: unknown): boolean {
+    const candidate = this.toUnknownRecord(value);
+    if (!candidate) {
+      return false;
+    }
+
+    let hasValidCandidateField = false;
+    if (Object.hasOwn(candidate, 'content')) {
+      const content = this.toUnknownRecord(candidate.content);
+      if (
+        !content ||
+        !Array.isArray(content.parts) ||
+        content.parts.length === 0 ||
+        !content.parts.every((part) => this.isGeminiPart(part)) ||
+        (Object.hasOwn(content, 'role') && !isString(content.role))
+      ) {
+        return false;
+      }
+      hasValidCandidateField = true;
+    }
+    if (Object.hasOwn(candidate, 'finishReason')) {
+      if (!isString(candidate.finishReason) || isEmpty(candidate.finishReason.trim())) {
+        return false;
+      }
+      hasValidCandidateField = true;
+    }
+    if (Object.hasOwn(candidate, 'finishMessage') && !isString(candidate.finishMessage)) {
+      return false;
+    }
+    if (Object.hasOwn(candidate, 'index') && !isNumber(candidate.index)) {
+      return false;
+    }
+    if (Object.hasOwn(candidate, 'safetyRatings')) {
+      if (!Array.isArray(candidate.safetyRatings) || !candidate.safetyRatings.every(isPlainObject)) {
+        return false;
+      }
+      hasValidCandidateField = true;
+    }
+    if (Object.hasOwn(candidate, 'groundingMetadata')) {
+      if (!this.toUnknownRecord(candidate.groundingMetadata)) {
+        return false;
+      }
+      hasValidCandidateField = true;
+    }
+    return hasValidCandidateField;
+  }
+
+  private isValidGeminiFallbackUsageMetadata(value: unknown): boolean {
+    const usage = this.toUnknownRecord(value);
+    if (!usage) {
+      return false;
+    }
+
+    const numericFields = [
+      'promptTokenCount',
+      'candidatesTokenCount',
+      'totalTokenCount',
+      'thoughtsTokenCount',
+    ] as const;
+    const detailFields = ['promptTokensDetails', 'candidatesTokensDetails'] as const;
+    let hasValidUsageField = false;
+    for (const field of numericFields) {
+      if (Object.hasOwn(usage, field)) {
+        if (!isNumber(usage[field])) {
+          return false;
+        }
+        hasValidUsageField = true;
+      }
+    }
+    for (const field of detailFields) {
+      if (Object.hasOwn(usage, field)) {
+        if (!Array.isArray(usage[field]) || !usage[field].every(isPlainObject)) {
+          return false;
+        }
+        hasValidUsageField = true;
+      }
+    }
+    if (Object.hasOwn(usage, 'trafficType')) {
+      if (!isString(usage.trafficType)) {
+        return false;
+      }
+      hasValidUsageField = true;
+    }
+    return hasValidUsageField;
+  }
+
+  private isValidGeminiFallbackPromptFeedback(value: unknown): boolean {
+    const promptFeedback = this.toUnknownRecord(value);
+    if (!promptFeedback) {
+      return false;
+    }
+
+    let hasValidPromptFeedbackField = false;
+    if (Object.hasOwn(promptFeedback, 'blockReason')) {
+      if (!isString(promptFeedback.blockReason) || isEmpty(promptFeedback.blockReason.trim())) {
+        return false;
+      }
+      hasValidPromptFeedbackField = true;
+    }
+    if (Object.hasOwn(promptFeedback, 'safetyRatings')) {
+      if (
+        !Array.isArray(promptFeedback.safetyRatings) ||
+        !promptFeedback.safetyRatings.every(isPlainObject)
+      ) {
+        return false;
+      }
+      hasValidPromptFeedbackField = true;
+    }
+    return hasValidPromptFeedbackField;
   }
 
   private createOpenAIProtocolStream(
@@ -1463,11 +1888,18 @@ export class ProxyService {
         subscriber.complete();
       };
 
-      const fail = (message: string, code = 'upstream_error'): void => {
+      const fail = (
+        message: string,
+        code = 'upstream_error',
+        error: UpstreamRequestError = new UpstreamRequestError({
+          status: HttpStatus.SERVICE_UNAVAILABLE,
+          reason: 'upstream_error',
+        }),
+      ): void => {
         if (!terminate()) {
           return;
         }
-        streamHealth?.recordFailure(new Error(message));
+        streamHealth?.recordFailure(error);
         for (const event of mapper.fail(message, code)) {
           subscriber.next(event);
         }
@@ -1501,14 +1933,12 @@ export class ProxyService {
             fail('Upstream Responses stream payload was not an object', 'invalid_upstream_payload');
             return;
           }
-          const upstreamError = this.toUnknownRecord(payload.error);
+          const upstreamError = this.getUpstreamStreamError(payload);
           if (upstreamError) {
-            fail(
-              isString(upstreamError.message)
-                ? upstreamError.message
-                : 'Upstream Responses stream returned an error',
-              'upstream_error',
-            );
+            // Upstream error payloads can contain credentials, account identifiers, or
+            // provider diagnostics. The Responses stream has already started, so retain
+            // its terminal SSE shape while exposing only this bounded public message.
+            fail('Upstream Responses stream failed', 'upstream_error', upstreamError);
             return;
           }
           const responsePayload = this.toUnknownRecord(payload.response) ?? payload;
@@ -1573,9 +2003,8 @@ export class ProxyService {
             complete(candidate.finishReason);
           }
         } catch (error) {
-          const message =
-            error instanceof Error ? error.message : 'Malformed upstream Responses JSON';
-          fail(`Malformed upstream Responses JSON: ${message}`, 'invalid_upstream_payload');
+          void error;
+          fail('Malformed upstream Responses payload', 'invalid_upstream_payload');
         }
       };
 
@@ -1622,10 +2051,9 @@ export class ProxyService {
         if (completed) {
           return;
         }
-        const cleanError =
-          error instanceof Error ? new Error(error.message) : new Error(String(error));
-        this.logger.error(`OpenAI Responses stream error: ${cleanError.message}`);
-        fail(cleanError.message, 'upstream_error');
+        void error;
+        this.logger.error('OpenAI Responses stream error: operation=responses_stream reason=upstream_error');
+        fail('Upstream Responses stream failed', 'upstream_error');
       };
 
       upstreamStream.on('data', onData);
@@ -1933,9 +2361,11 @@ export class ProxyService {
         if (!terminate()) {
           return;
         }
-        this.logger.error(`OpenAI-compatible stream error: ${error.message}`);
-        streamHealth?.recordFailure(error);
-        subscriber.error(error);
+        void error;
+        const safeError = new Error('Upstream stream failed');
+        this.logger.error('OpenAI-compatible stream error: operation=openai_stream reason=upstream_error');
+        streamHealth?.recordFailure(safeError);
+        subscriber.error(safeError);
       };
 
       // An idle stream is a failed stream: terminate through the error path so the
@@ -2180,8 +2610,8 @@ export class ProxyService {
       };
 
       const onError = (err: unknown): void => {
-        // Convert to clean Error to avoid circular reference issues (socket objects)
-        failStream(err instanceof Error ? new Error(err.message) : new Error(String(err)));
+        void err;
+        failStream(new Error('Upstream stream failed'));
       };
 
       upstreamStream.on('data', onData);
@@ -2423,20 +2853,6 @@ export class ProxyService {
     };
   }
 
-  private toInternalGeminiRequest(request: GeminiRequest): GeminiInternalRequest['request'] {
-    return {
-      contents: request.contents,
-      generationConfig: request.generationConfig,
-      systemInstruction: request.systemInstruction
-        ? {
-            parts: request.systemInstruction.parts
-              .filter((part): part is { text: string } => isString(part.text))
-              .map((part) => ({ text: part.text })),
-          }
-        : undefined,
-    };
-  }
-
   // Convert OpenAI request format to Claude/Anthropic format
   private convertOpenAIToClaude(request: OpenAIChatRequest): ClaudeRequest {
     const messages = request.messages || [];
@@ -2515,6 +2931,51 @@ export class ProxyService {
         source: 'openai',
       },
     };
+  }
+
+  private applyNativeGeminiSignatureTransform(
+    request: GeminiInternalRequest['request'],
+    model: string,
+    signatureContext?: SignatureContext,
+  ): GeminiInternalRequest['request'] {
+    if (!this.isGeminiFlashToolHistoryModel(model)) {
+      return request;
+    }
+
+    return {
+      ...request,
+      contents: request.contents.map((content) => ({
+        ...content,
+        parts: content.parts.map((part) => {
+          if (
+            content.role !== 'model' ||
+            !part.functionCall ||
+            part.thoughtSignature ||
+            part.thought_signature
+          ) {
+            return part;
+          }
+
+          const toolCallId = part.functionCall.id;
+          const storedSignature =
+            signatureContext && toolCallId
+              ? SignatureStore.get({ ...signatureContext, toolCallId })
+              : null;
+          const effectiveSignature = storedSignature ?? 'skip_thought_signature_validator';
+          return {
+            ...part,
+            thoughtSignature: effectiveSignature,
+            thought_signature: effectiveSignature,
+          };
+        }),
+      })),
+    };
+  }
+
+  private isGeminiFlashToolHistoryModel(model: string): boolean {
+    return /^(?:models\/)?gemini-3(?:\.\d+)?-flash(?!-image(?:-|$))(?:-|$)/.test(
+      model.toLowerCase(),
+    );
   }
 
   private convertOpenAIToolChoice(
@@ -2882,23 +3343,17 @@ export class ProxyService {
     if (modelWasNotFound && !model.toLowerCase().includes('-image')) {
       // Quota metadata can advertise ids the generation API rejects; mark the
       // id so the in-flight retry loop and later requests reroute to a sibling.
-      this.accountLeaseService.markModelUnrequestable(model);
+      this.accountLeaseService.markModelUnrequestable(accountId, model);
     }
     const shouldRetry = await this.retryPolicy.applyUpstreamPenalty(accountId, model, error);
     return modelWasNotFound || shouldRetry;
   }
 
   private isModelNotFoundError(error: unknown): boolean {
-    const notFoundMarker = 'Requested entity was not found';
     if (error instanceof UpstreamRequestError) {
-      return (
-        error.status === HttpStatus.NOT_FOUND ||
-        error.message.includes(notFoundMarker) ||
-        Boolean(error.body?.includes(notFoundMarker))
-      );
+      return error.status === HttpStatus.NOT_FOUND || error.reason === 'model_not_found';
     }
-    const message = error instanceof Error ? error.message : String(error ?? '');
-    return message.includes(notFoundMarker);
+    return false;
   }
 
   private classifyUpstreamFailure(errorMessage: string): ProxyUpstreamFailureClassification {
@@ -2909,13 +3364,8 @@ export class ProxyService {
     return this.modelRoutingPolicy.createModelSpecificHeaders(model);
   }
 
-  private isQuotaExhaustedError(errorMessage: string): boolean {
-    const msg = errorMessage.toLowerCase();
-    return (
-      msg.includes('resource has been exhausted') ||
-      msg.includes('resource_exhausted') ||
-      msg.includes('quota')
-    );
+  private isQuotaExhaustedError(error: unknown): boolean {
+    return error instanceof UpstreamRequestError && error.reason === 'quota_exhausted';
   }
 
   private extractAnthropicSessionKey(request: AnthropicChatRequest): string | undefined {
@@ -2953,6 +3403,8 @@ export class ProxyService {
       isString(functionCall.name) &&
       !isEmpty(functionCall.name) &&
       (!Object.hasOwn(functionCall, 'args') || isPlainObject(functionCall.args));
+    const hasServerToolCombination =
+      isPlainObject(part.toolCall) || isPlainObject(part.toolResponse);
     const inlineData = this.toUnknownRecord(part.inlineData);
     const hasInlineData =
       inlineData !== null &&
@@ -2961,7 +3413,7 @@ export class ProxyService {
       isString(inlineData.data) &&
       !isEmpty(inlineData.data);
 
-    return hasText || hasSignature || hasFunctionCall || hasInlineData;
+    return hasText || hasSignature || hasFunctionCall || hasServerToolCombination || hasInlineData;
   }
 
   private normalizeGeminiPart(value: unknown): InternalGeminiPart | null {

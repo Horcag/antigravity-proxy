@@ -14,6 +14,11 @@ import {
   type OAuthClientDescriptor,
   OAuthClientRegistryService,
 } from './OAuthClientRegistryService';
+import {
+  AICreditsAuthenticationError,
+  isAICreditsAuthenticationError,
+} from './ai-credits-authentication-error';
+import { isStrictAuthenticationFailure } from './strict-authentication-classifier';
 
 // --- Constants & Config ---
 const URLS = {
@@ -53,13 +58,80 @@ function isClientMismatchError(status: number, errorText: string): boolean {
   );
 }
 
-/**
- * Creates an AbortSignal that times out after the specified duration.
- */
-function createTimeoutSignal(ms: number): AbortSignal {
+function getErrorStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') {
+    return undefined;
+  }
+
+  const candidate = error as {
+    status?: unknown;
+    statusCode?: unknown;
+    response?: { status?: unknown; statusCode?: unknown };
+  };
+  const status =
+    candidate.status ??
+    candidate.statusCode ??
+    candidate.response?.status ??
+    candidate.response?.statusCode;
+  return typeof status === 'number' && Number.isInteger(status) ? status : undefined;
+}
+
+function toSafeRequestError(error: unknown): Error {
+  if (isAICreditsAuthenticationError(error)) {
+    return error;
+  }
+
+  if (
+    error instanceof Error &&
+    /^(?:FORBIDDEN|UNAUTHORIZED|TIMEOUT|REQUEST_FAILED|HTTP [1-5]\d{2})$/.test(error.message)
+  ) {
+    return new Error(error.message);
+  }
+
+  const status = getErrorStatus(error);
+  if (status !== undefined) {
+    return new Error(`HTTP ${status}`);
+  }
+  if (error instanceof Error && error.name === 'AbortError') {
+    return new Error('TIMEOUT');
+  }
+  return new Error('REQUEST_FAILED');
+}
+
+function toSafeHttpError(status: number): Error {
+  return new Error(`HTTP ${status}`);
+}
+
+interface DisposableRequestSignal {
+  signal: AbortSignal;
+  dispose(): void;
+}
+
+function createDisposableRequestSignal(
+  ms: number,
+  parentSignal?: AbortSignal,
+): DisposableRequestSignal {
   const controller = new AbortController();
-  setTimeout(() => controller.abort(), ms);
-  return controller.signal;
+  const abortFromParent = () => controller.abort(parentSignal?.reason);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+
+  if (parentSignal?.aborted) {
+    abortFromParent();
+  } else {
+    timeout = setTimeout(() => controller.abort(), ms);
+    parentSignal?.addEventListener('abort', abortFromParent, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      if (timeout !== undefined) {
+        clearTimeout(timeout);
+        timeout = undefined;
+      }
+      parentSignal?.removeEventListener('abort', abortFromParent);
+    },
+  };
 }
 
 // --- Types ---
@@ -400,9 +472,9 @@ export class GoogleAPIService {
           dispatcher: new ProxyAgent(config.proxy.upstream_proxy.url),
         };
       }
-    } catch (e) {
-      logger.error('[GoogleAPIService] Proxy configuration error', e);
-      throw e;
+    } catch (error) {
+      logger.error('[GoogleAPIService] Proxy configuration error');
+      throw toSafeRequestError(error);
     }
 
     const httpProxy = process.env.http_proxy?.trim() || process.env.HTTP_PROXY?.trim();
@@ -412,9 +484,7 @@ export class GoogleAPIService {
 
     if (httpProxy || httpsProxy) {
       if (proxyTraceEnabled) {
-        logger.info(
-          `[GoogleAPIService] Proxy source: HTTP(S)_PROXY env (http: ${httpProxy ?? 'none'}, https: ${httpsProxy ?? 'none'})`,
-        );
+        logger.info('[GoogleAPIService] Proxy source: HTTP(S)_PROXY env');
       }
       return {
         dispatcher: new EnvHttpProxyAgent({
@@ -427,9 +497,7 @@ export class GoogleAPIService {
 
     if (electronProxyServer) {
       if (proxyTraceEnabled) {
-        logger.info(
-          `[GoogleAPIService] Proxy source: ELECTRON_PROXY_SERVER env (${electronProxyServer})`,
-        );
+        logger.info('[GoogleAPIService] Proxy source: ELECTRON_PROXY_SERVER env');
       }
       return {
         dispatcher: new ProxyAgent(electronProxyServer),
@@ -448,6 +516,7 @@ export class GoogleAPIService {
    */
   static getAuthUrl(oauthClientKey?: string): string {
     const scopes = [
+      'openid',
       'https://www.googleapis.com/auth/cloud-platform',
       'https://www.googleapis.com/auth/userinfo.email',
       'https://www.googleapis.com/auth/userinfo.profile',
@@ -487,8 +556,6 @@ export class GoogleAPIService {
       throw new Error('No OAuth clients configured');
     }
 
-    const attemptErrors: string[] = [];
-
     for (const client of candidates) {
       const params = new URLSearchParams({
         client_id: client.client_id,
@@ -498,32 +565,31 @@ export class GoogleAPIService {
         grant_type: 'authorization_code',
       });
 
-      logger.info(
-        `[GoogleAPIService] Attempting token exchange with client=${client.key}, endpoint=${URLS.TOKEN}`,
-      );
+      logger.info('[GoogleAPIService] OAuth request: operation=token_exchange');
       const fetchOpts = this.getFetchOptions(proxyUrl);
-      logger.info(
-        `[GoogleAPIService] Fetch options: ${JSON.stringify(fetchOpts ? { hasDispatcher: !!fetchOpts.dispatcher } : {})}`,
-      );
+      logger.info('[GoogleAPIService] OAuth request options: operation=token_exchange');
 
+      const request = createDisposableRequestSignal(REQUEST_TIMEOUT_MS);
       const response = await fetch(URLS.TOKEN, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: params,
-        signal: createTimeoutSignal(REQUEST_TIMEOUT_MS),
+        signal: request.signal,
         ...fetchOpts,
-      }).catch((err: unknown) => {
-        logger.error(`[GoogleAPIService] Fetch error for client=${client.key}:`, err);
-        if (err instanceof Error && err.name === 'AbortError') {
-          throw new Error(
-            'Token exchange timed out. Please check your network connection and try again.',
-          );
-        }
-        throw err;
-      });
+      })
+        .catch((error: unknown) => {
+          logger.error('[GoogleAPIService] OAuth request failed: operation=token_exchange');
+          if (error instanceof Error && error.name === 'AbortError') {
+            throw new Error(
+              'Token exchange timed out. Please check your network connection and try again.',
+            );
+          }
+          throw toSafeRequestError(error);
+        })
+        .finally(() => request.dispose());
 
       logger.info(
-        `[GoogleAPIService] Fetch response received for client=${client.key}: ok=${response.ok}, status=${response.status}`,
+        `[GoogleAPIService] OAuth response: operation=token_exchange status=${response.status}`,
       );
 
       if (response.ok) {
@@ -533,18 +599,18 @@ export class GoogleAPIService {
       }
 
       const text = await response.text();
-      attemptErrors.push(`${client.key} => ${text}`);
+      const failure = toSafeHttpError(response.status);
       if (isClientMismatchError(response.status, text)) {
         logger.warn(
-          `[GoogleAPIService] Token exchange failed for OAuth client '${client.key}', trying next client`,
+          `[GoogleAPIService] OAuth client rejected: operation=token_exchange status=${response.status} action=retry_next_client`,
         );
         continue;
       }
 
-      throw new Error(`Token exchange failed for client [${client.key}]: ${text}`);
+      throw new Error(`Token exchange failed: ${failure.message}`);
     }
 
-    throw new Error(`Token exchange failed for all OAuth clients: ${attemptErrors.join(' | ')}`);
+    throw new Error('Token exchange failed: configured clients rejected');
   }
 
   /**
@@ -560,8 +626,6 @@ export class GoogleAPIService {
       throw new Error('No OAuth clients configured');
     }
 
-    const attemptErrors: string[] = [];
-
     for (const client of candidates) {
       const params = new URLSearchParams({
         client_id: client.client_id,
@@ -570,20 +634,29 @@ export class GoogleAPIService {
         grant_type: 'refresh_token',
       });
 
+      logger.info('[GoogleAPIService] OAuth request: operation=token_refresh');
+      const request = createDisposableRequestSignal(REQUEST_TIMEOUT_MS);
       const response = await fetch(URLS.TOKEN, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: params,
-        signal: createTimeoutSignal(REQUEST_TIMEOUT_MS),
+        signal: request.signal,
         ...this.getFetchOptions(proxyUrl),
-      }).catch((err: unknown) => {
-        if (err instanceof Error && err.name === 'AbortError') {
-          throw new Error(
-            'Token refresh timed out. Please check your network connection and try again.',
-          );
-        }
-        throw err;
-      });
+      })
+        .catch((error: unknown) => {
+          logger.error('[GoogleAPIService] OAuth request failed: operation=token_refresh');
+          if (error instanceof Error && error.name === 'AbortError') {
+            throw new Error(
+              'Token refresh timed out. Please check your network connection and try again.',
+            );
+          }
+          throw toSafeRequestError(error);
+        })
+        .finally(() => request.dispose());
+
+      logger.info(
+        `[GoogleAPIService] OAuth response: operation=token_refresh status=${response.status}`,
+      );
 
       if (response.ok) {
         const tokenResponse = (await response.json()) as TokenResponse;
@@ -592,42 +665,42 @@ export class GoogleAPIService {
       }
 
       const text = await response.text();
-      attemptErrors.push(`${client.key} => ${text}`);
+      const failure = toSafeHttpError(response.status);
       if (isClientMismatchError(response.status, text)) {
         logger.warn(
-          `[GoogleAPIService] Token refresh failed for OAuth client '${client.key}', trying next client`,
+          `[GoogleAPIService] OAuth client rejected: operation=token_refresh status=${response.status} action=retry_next_client`,
         );
         continue;
       }
 
-      throw new Error(`Token refresh failed for client [${client.key}]: ${text}`);
+      throw new Error(`Token refresh failed: ${failure.message}`);
     }
 
-    throw new Error(`Token refresh failed for all OAuth clients: ${attemptErrors.join(' | ')}`);
+    throw new Error('Token refresh failed: configured clients rejected');
   }
 
   /**
    * Fetches user profile information.
    */
   static async getUserInfo(accessToken: string, proxyUrl?: string): Promise<UserInfo> {
+    const request = createDisposableRequestSignal(REQUEST_TIMEOUT_MS);
     const response = await fetch(URLS.USER_INFO, {
       headers: { Authorization: `Bearer ${accessToken}` },
-      signal: createTimeoutSignal(REQUEST_TIMEOUT_MS),
+      signal: request.signal,
       ...this.getFetchOptions(proxyUrl),
-    }).catch((err: unknown) => {
-      if (err instanceof Error) {
-        if (err.name === 'AbortError') {
+    })
+      .catch((error: unknown) => {
+        if (error instanceof Error && error.name === 'AbortError') {
           throw new Error(
             'User info request timed out. Please check your network connection and try again.',
           );
         }
-      }
-      throw err;
-    });
+        throw toSafeRequestError(error);
+      })
+      .finally(() => request.dispose());
 
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Failed to fetch user info: ${text}`);
+      throw new Error(`Failed to fetch user info: HTTP ${response.status}`);
     }
 
     const data = await response.json();
@@ -639,8 +712,8 @@ export class GoogleAPIService {
         // Google may omit profile claims such as family_name for accounts with limited profile data.
         name: parsed.name ?? parsed.email,
       };
-    } catch (err) {
-      logger.error('[GoogleAPIService] Malformed user info response:', err);
+    } catch {
+      logger.error('[GoogleAPIService] Malformed user info response');
       throw new Error('Received malformed user info from Google APIs');
     }
   }
@@ -655,18 +728,19 @@ export class GoogleAPIService {
 
     let projectId: string | undefined;
     let subscriptionTier: string | undefined;
-    let lastError: any;
+    let lastError: Error | undefined;
     const endpoints = [URLS.LOAD_PROJECT, URLS.SANDBOX_LOAD_PROJECT] as const;
 
     for (const endpoint of endpoints) {
       try {
+        const request = createDisposableRequestSignal(REQUEST_TIMEOUT_MS);
         const response = await fetch(endpoint, {
           method: 'POST',
           headers: buildInternalApiHeaders(accessToken),
           body: JSON.stringify(body),
-          signal: createTimeoutSignal(REQUEST_TIMEOUT_MS),
+          signal: request.signal,
           ...this.getFetchOptions(proxyUrl),
-        });
+        }).finally(() => request.dispose());
 
         if (response.ok) {
           const data = (await response.json()) as LoadProjectResponse;
@@ -676,7 +750,7 @@ export class GoogleAPIService {
           subscriptionTier = resolveSubscriptionTier(data);
           break;
         } else {
-          lastError = new Error(`HTTP ${response.status}: ${await response.text()}`);
+          lastError = toSafeHttpError(response.status);
           if (endpoint === URLS.LOAD_PROJECT && response.status === 429) {
             logger.warn(
               '[GoogleAPIService] Prod loadCodeAssist returned 429, falling back to sandbox endpoint',
@@ -685,8 +759,10 @@ export class GoogleAPIService {
           }
         }
       } catch (error) {
-        lastError = error;
-        logger.warn(`[GoogleAPIService] Failed to fetch project ID from ${endpoint} `, error);
+        lastError = toSafeRequestError(error);
+        logger.warn(
+          `[GoogleAPIService] Project context request failed at endpoint #${endpoints.indexOf(endpoint) + 1}: ${lastError.message}`,
+        );
         await sleep(500);
       }
 
@@ -694,7 +770,7 @@ export class GoogleAPIService {
         break;
       }
 
-      if (endpoint !== URLS.LOAD_PROJECT || !String(lastError?.message).startsWith('HTTP 429')) {
+      if (endpoint !== URLS.LOAD_PROJECT || lastError?.message !== 'HTTP 429') {
         break;
       }
     }
@@ -720,10 +796,12 @@ export class GoogleAPIService {
   static async fetchAICredits(
     accessToken: string,
     proxyUrl?: string,
+    parentSignal?: AbortSignal,
   ): Promise<{ credits: number; expiryDate: string } | null> {
     try {
       const fetchOptions = this.getFetchOptions(proxyUrl);
       const discoveryVersion = resolveLocalInstalledVersion() ?? FALLBACK_VERSION;
+      const request = createDisposableRequestSignal(REQUEST_TIMEOUT_MS, parentSignal);
       const fallbackResponse = await fetch(URLS.DAILY_LOAD_PROJECT, {
         method: 'POST',
         headers: buildInternalApiHeaders(accessToken),
@@ -734,17 +812,26 @@ export class GoogleAPIService {
             ide_name: 'antigravity',
           },
         }),
-        signal: createTimeoutSignal(REQUEST_TIMEOUT_MS),
+        signal: request.signal,
         ...fetchOptions,
-      });
+      }).finally(() => request.dispose());
 
       if (!fallbackResponse.ok) {
+        if (fallbackResponse.status === 401 || fallbackResponse.status === 403) {
+          throw new AICreditsAuthenticationError();
+        }
         return null;
       }
 
       const fallbackData = (await fallbackResponse.json()) as LoadProjectResponse;
       return extractAiCreditsFromProjectContext(fallbackData);
-    } catch {
+    } catch (error) {
+      if (isAICreditsAuthenticationError(error)) {
+        throw error;
+      }
+      if (isStrictAuthenticationFailure(error)) {
+        throw new AICreditsAuthenticationError();
+      }
       return null;
     }
   }
@@ -792,7 +879,7 @@ export class GoogleAPIService {
     } catch (error) {
       logger.warn(
         '[GoogleAPIService] Project context unavailable; continuing quota lookup without project',
-        error instanceof Error ? error.message : String(error),
+        toSafeRequestError(error).message,
       );
     }
 
@@ -810,13 +897,14 @@ export class GoogleAPIService {
 
       while (true) {
         try {
+          const request = createDisposableRequestSignal(REQUEST_TIMEOUT_MS);
           const response = await fetch(endpoint, {
             method: 'POST',
             headers: buildInternalApiHeaders(accessToken),
             body: JSON.stringify(currentPayload),
-            signal: createTimeoutSignal(REQUEST_TIMEOUT_MS),
+            signal: request.signal,
             ...fetchOptions,
-          });
+          }).finally(() => request.dispose());
 
           if (!response.ok) {
             const status = response.status;
@@ -837,26 +925,48 @@ export class GoogleAPIService {
               throw new Error('UNAUTHORIZED');
             }
 
-            const text = await response.text();
-            const errorMsg = `HTTP ${status} - ${text}`;
+            const quotaError = toSafeHttpError(status);
             if (hasNextEndpoint && this.shouldFallbackQuotaEndpoint(status)) {
               logger.warn(
-                `[GoogleAPIService] Quota API ${endpoint} returned ${status}, falling back to next endpoint`,
+                `[GoogleAPIService] Quota API endpoint #${endpointIndex + 1} returned ${status}, falling back to next endpoint`,
               );
-              lastError = new Error(errorMsg);
+              lastError = quotaError;
 
               await sleep(1000);
               break;
             }
 
-            throw new Error(errorMsg);
+            throw quotaError;
           }
 
           const data = (await response.json()) as FetchModelsResponse;
           const result = this.toQuotaData(data, subscriptionTier);
-          const quotaGroups = await this.fetchQuotaSummary(accessToken, projectId, fetchOptions);
+          const enrichmentController = new AbortController();
+          const quotaGroupsPromise = this.fetchQuotaSummary(
+            accessToken,
+            projectId,
+            fetchOptions,
+            enrichmentController.signal,
+          );
+          const aiCreditsPromise = this.fetchAICredits(
+            accessToken,
+            proxyUrl,
+            enrichmentController.signal,
+          );
+          let quotaGroups: QuotaGroup[] | undefined;
+          let aiCredits: { credits: number; expiryDate: string } | null;
+          try {
+            [quotaGroups, aiCredits] = await Promise.all([quotaGroupsPromise, aiCreditsPromise]);
+          } catch (error) {
+            enrichmentController.abort(error);
+            await Promise.allSettled([quotaGroupsPromise, aiCreditsPromise]);
+            throw error;
+          }
           if (quotaGroups) {
             result.quota_groups = quotaGroups;
+          }
+          if (aiCredits) {
+            result.ai_credits = aiCredits;
           }
 
           if (endpointIndex > 0) {
@@ -867,8 +977,11 @@ export class GoogleAPIService {
 
           return result;
         } catch (error: unknown) {
-          const errorMsg = error instanceof Error ? error.message : String(error);
-          lastError = error instanceof Error ? error : new Error(String(error));
+          if (isAICreditsAuthenticationError(error)) {
+            throw error;
+          }
+          lastError = toSafeRequestError(error);
+          const errorMsg = lastError.message;
 
           // Abort retries for auth errors
           if (errorMsg === 'FORBIDDEN' || errorMsg === 'UNAUTHORIZED') {
@@ -877,7 +990,7 @@ export class GoogleAPIService {
 
           if (hasNextEndpoint && !this.isPermanentQuotaHttp4xx(errorMsg)) {
             logger.warn(
-              `[GoogleAPIService] Quota API request failed at ${endpoint}: ${errorMsg}. Falling back to next endpoint`,
+              `[GoogleAPIService] Quota API request failed at endpoint #${endpointIndex + 1}: ${errorMsg}. Falling back to next endpoint`,
             );
             await sleep(1000);
             break;
@@ -895,26 +1008,36 @@ export class GoogleAPIService {
     accessToken: string,
     projectId: string | undefined,
     fetchOptions: ReturnType<typeof GoogleAPIService.getFetchOptions>,
+    parentSignal?: AbortSignal,
   ): Promise<QuotaGroup[] | undefined> {
     const payload: Record<string, unknown> = projectId ? { project: projectId } : {};
 
-    for (const endpoint of QUOTA_SUMMARY_ENDPOINTS) {
+    for (let endpointIndex = 0; endpointIndex < QUOTA_SUMMARY_ENDPOINTS.length; endpointIndex++) {
+      if (parentSignal?.aborted) {
+        return undefined;
+      }
+      const endpoint = QUOTA_SUMMARY_ENDPOINTS[endpointIndex];
       let currentPayload = { ...payload };
       let retriedWithoutProject = false;
 
       while (true) {
         try {
+          const request = createDisposableRequestSignal(REQUEST_TIMEOUT_MS, parentSignal);
           const response = await fetch(endpoint, {
             method: 'POST',
             headers: buildInternalApiHeaders(accessToken),
             body: JSON.stringify(currentPayload),
-            signal: createTimeoutSignal(REQUEST_TIMEOUT_MS),
+            signal: request.signal,
             ...fetchOptions,
-          });
+          }).finally(() => request.dispose());
+
+          if (parentSignal?.aborted) {
+            return undefined;
+          }
 
           if (!response.ok) {
             logger.warn(
-              `[GoogleAPIService] Quota summary API ${endpoint} returned ${response.status}`,
+              `[GoogleAPIService] Quota summary API endpoint #${endpointIndex + 1} returned ${response.status}`,
             );
             if (response.status === 403 && 'project' in currentPayload && !retriedWithoutProject) {
               logger.warn(
@@ -932,7 +1055,12 @@ export class GoogleAPIService {
 
           return toQuotaGroups((await response.json()) as QuotaSummaryResponse);
         } catch (error) {
-          logger.warn(`[GoogleAPIService] Quota summary API request failed at ${endpoint}`, error);
+          if (parentSignal?.aborted) {
+            return undefined;
+          }
+          logger.warn(
+            `[GoogleAPIService] Quota summary API request failed at endpoint #${endpointIndex + 1}: ${toSafeRequestError(error).message}`,
+          );
           break;
         }
       }

@@ -13,10 +13,14 @@ Current surface:
 - `GET /health`
 - `GET /admin/status`
 - `GET /admin/accounts`
+- `GET /admin/accounts/preferred`
+- `PUT /admin/accounts/preferred` with `{ "account_id": "..." }`
+- `DELETE /admin/accounts/preferred`
 - `POST /admin/accounts/import`
 - `GET /admin/accounts/export`
 - `DELETE /admin/accounts/:accountId`
 - `POST /admin/accounts/reload`
+- `GET /admin/accounts/quota-diagnostics`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - OpenAI Responses, Anthropic-compatible, Gemini, streaming, image/audio routes copied from the
@@ -39,44 +43,109 @@ npm run lint
 npm test
 ```
 
-## Ubuntu 24.04 / WSL2 systemd
+## Ubuntu 24.04 / WSL2 systemd releases
 
-Install as an unprivileged service user with state under `/var/lib/antigravity-proxy` and secrets
-under `/etc/antigravity-proxy/antigravity-proxy.env`:
+The system service runs as the unprivileged `antigravity-proxy` user. Each deployment creates an
+immutable release in `/opt/antigravity-proxy/releases/<release-id>` and atomically selects it via
+`/opt/antigravity-proxy/current`. Persistent state stays in `/var/lib/antigravity-proxy`; the
+restricted environment file stays in `/etc/antigravity-proxy/antigravity-proxy.env` and is never
+rewritten during an update.
+
+The installer keeps `/etc/antigravity-proxy` owned by `root:antigravity-proxy` with mode `0750`,
+and its environment file owned by the same pair with mode `0640`. The service account can read the
+file through its group, but cannot replace the directory or file. Set `SERVICE_GROUP` if the
+dedicated service account uses a different group.
+
+Build before installing. The default installer copies the Node executable used for the build into
+each release, so it does not depend on `/usr/bin/node`. To use a managed system Node instead, set
+`BUNDLE_NODE=0 NODE_BINARY=/absolute/path/to/node`; the installer validates that path first.
 
 ```bash
 cd /home/nikit/projects/antigravity-proxy
-npm install
+npm ci
 npm run build
-sudo env IMPORT_SUDO_USER="$USER" ./scripts/install-systemd.sh
+RELEASE_OPERATOR="$(id -un)" sudo -E ./scripts/install-systemd.sh install
 ```
 
-Environment file:
+The installer stages release dependencies with lifecycle scripts enabled under `RELEASE_OPERATOR`
+(normally the invoking non-root user), then makes the immutable release root-owned. It never runs
+package lifecycle scripts as root. Before moving `current`, it uses that release's selected Node
+runtime and `node_modules` as the service user to instantiate an in-memory `better-sqlite3`
+database and exercise the built CLI. `RELEASE_OPERATOR` is required for a live install; it is
+intentionally unnecessary for `ROOT_PREFIX` test mode.
+
+The first install creates separate proxy and admin keys without printing them. Use `sudoedit
+/etc/antigravity-proxy/antigravity-proxy.env` to add the authorized OAuth client ID and secret;
+never paste or print that file in a terminal transcript. Existing keys, OAuth settings,
+`accounts.db`, `accounts.db-wal`, `accounts.db-shm`, and `.master-key` are preserved.
+
+### Update, rollback, and migration
+
+Choose a release ID that identifies the source revision and update atomically. `current` and
+`previous` are sibling links under `/opt/antigravity-proxy`, both resolving into `releases/`.
+A failed post-start smoke check restores both links and the system unit to their exact pre-update
+targets, then restarts the prior release and runs the same smoke check against it. Unit generation
+selects the executable layout in the release being activated, so legacy immutable releases with
+`runtime/node` remain rollback-compatible with newer `bin/node` releases. Release
+transactions (install, update, migration, recovery, and rollback) use one non-blocking,
+root-owned lock; a concurrent transaction fails without changing topology.
 
 ```bash
-sudo cat /etc/antigravity-proxy/antigravity-proxy.env
+RELEASE_OPERATOR="$(id -un)" RELEASE_ID=20260904-eb39352 sudo -E ./scripts/install-systemd.sh update
+sudo ./scripts/rollback-systemd.sh                 # recorded previous release
+sudo ./scripts/rollback-systemd.sh 20260904-eb39352 # explicit release
 ```
 
-Before importing accounts, set `AG_PROXY_OAUTH_CLIENT_ID` and
-`AG_PROXY_OAUTH_CLIENT_SECRET` in that file from an OAuth client you are authorized to use. These
-values are intentionally not committed to this repository; without them, expired access tokens
-cannot be renewed from refresh tokens.
-
-State directory:
+To migrate a legacy user unit, the installer first validates and stages the complete immutable
+release. Only then does it stop the exact configured legacy unit for the state-copy/cutover window,
+copy the environment, SQLite database (including WAL/SHM), key material, and `config.json` as one
+migration set, then start and smoke-check the system unit. A migration target whose state directory
+contains any member of that set fails closed before copying; use the separately validated `update`
+path for an already-migrated target.
+If the cutover or legacy-unit disable fails, the script restores the prior service topology or
+leaves a precise failure; it never reports success after a failed cutover. Run it only while the
+legacy user's systemd runtime is available:
 
 ```bash
-sudo ls -la /var/lib/antigravity-proxy
-sudo ls -la /var/lib/antigravity-proxy/accounts.db /var/lib/antigravity-proxy/.master-key
+LEGACY_SERVICE_USER=nikit \
+LEGACY_DATA_DIR=/home/nikit/.local/share/antigravity-proxy \
+LEGACY_ENV_FILE=/home/nikit/.config/antigravity-proxy/antigravity-proxy.env \
+LEGACY_USER_UNIT=antigravity-proxy.service \
+RELEASE_ID=20260904-eb39352 \
+RELEASE_OPERATOR="$(id -un)" \
+sudo -E ./scripts/install-systemd.sh migrate
 ```
 
-Status/logs:
+`LEGACY_ENV_FILE` is required only when the restricted system environment file does not already
+exist; it is copied as a file and never echoed.
+
+For deterministic, non-live inspection or tests, use `DRY_RUN=1` (no files or secrets are
+created) or set `ROOT_PREFIX=/tmp/antigravity-proxy-root RELEASE_TEST_MODE=1`.
+`RELEASE_TEST_MODE=1` rejects a missing, relative, root, or root-resolving `ROOT_PREFIX`
+before it writes anything. Never point `ROOT_PREFIX` at a live filesystem root.
+
+### Post-cutover verification
+
+The installer checks that the exact systemd `MainPID` owns the configured listener, `/health`,
+unauthenticated admin rejection, and enabled/active state under the dedicated service user. Re-run
+the same checks after a manual rollback:
 
 ```bash
-systemctl status antigravity-proxy.service --no-pager
+systemctl is-enabled --quiet antigravity-proxy.service
+systemctl is-active --quiet antigravity-proxy.service
+ss -ltn '( sport = :8045 )'                         # expect 127.0.0.1:8045 by default
+curl --fail --silent --show-error http://127.0.0.1:8045/health
+curl --silent --output /dev/null --write-out '%{http_code}\n' http://127.0.0.1:8045/admin/status
+# expect 401 or 403 without an admin credential
 journalctl -u antigravity-proxy.service -n 100 --no-pager
 ```
 
-Uninstall service only:
+The unit enables filesystem, device, privilege, namespace, process, and kernel hardening while
+leaving outbound IPv4/IPv6 HTTPS available for OAuth and upstream requests. It deliberately omits
+`MemoryDenyWriteExecute`, restrictive syscall filters, and network-deny settings because they can
+break Node JIT/native addons or required outbound HTTPS.
+
+Uninstall only the system unit and helper (not releases, state, or environment):
 
 ```bash
 sudo ./scripts/uninstall-systemd.sh
@@ -129,6 +198,27 @@ Refresh the cached account quota/model catalog without exporting tokens:
 
 ```bash
 antigravity-proxy accounts refresh-quota --force
+```
+
+Inspect the cached quota and current account/model availability without triggering a refresh. This
+admin-key-only read returns a request-local ordinal label (for example, `account-1`) for each active
+account, freshness, advertised public/physical model IDs, remaining percentages, reset times, and
+temporary blocks. Labels are not stable across requests and cannot identify an account. The response
+never returns account IDs, tokens, personal account metadata, proxy URLs, project/session IDs, raw
+quota payloads, or configuration values.
+
+```bash
+antigravity-proxy accounts quota-diagnostics
+```
+
+Read or manage the durable proxy-only preferred account with the separate admin key. The response
+contains only the account id, provider, display metadata, and status; it never includes email or
+token fields. Setting an unknown account id returns `404` without changing the saved config.
+
+```bash
+antigravity-proxy accounts preferred get
+antigravity-proxy accounts preferred set --id <account-id>
+antigravity-proxy accounts preferred clear
 ```
 
 Headless deployments can set `AG_PROXY_UPSTREAM_VERSION` to the verified installed

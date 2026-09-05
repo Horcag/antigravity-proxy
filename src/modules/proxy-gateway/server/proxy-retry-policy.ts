@@ -1,9 +1,9 @@
-import { isString } from 'lodash-es';
 import { CloudAccount } from '@/modules/cloud-account/types';
 import { calculateRetryDelay, sleep } from '../antigravity/retry-utils';
-import { parseRetryDelayMilliseconds } from './rate-limit-tracker';
 import { UpstreamRequestError } from './clients/upstream-error';
 import { proxyModelAvailabilityStore } from './proxy-model-availability-store';
+import { isStrictAuthenticationFailure } from '@/modules/cloud-account/services/strict-authentication-classifier';
+import { RateLimitReason } from './rate-limit-tracker';
 
 export interface ProxyTokenRetryState {
   attemptedAccountIds: Set<string>;
@@ -22,7 +22,7 @@ export interface ProxyRetryAccountLeaseService {
     accountIdOrEmail: string;
     status?: number;
     retryAfter?: string;
-    body?: string;
+    reason?: RateLimitReason;
     model?: string;
   }): Promise<void>;
   markModelSuccess?(accountIdOrEmail: string, model: string): void;
@@ -116,17 +116,12 @@ export class ProxyRetryPolicy {
         return true;
       }
       if (status === 429) {
-        const retryDelayMs = parseRetryDelayMilliseconds(
-          [error.body, error.message].filter(isString).join('\n'),
-        );
-        const lowerBody = error.body?.toLowerCase() ?? '';
         proxyModelAvailabilityStore.mark(
           accountId,
           model,
-          lowerBody.includes('quota') || lowerBody.includes('exhausted')
+          error.reason === 'quota_exhausted'
             ? 'quota_exhausted'
             : 'rate_limited',
-          retryDelayMs === null ? undefined : Date.now() + retryDelayMs,
         );
       }
       if (status === 401 || status === 403) {
@@ -141,15 +136,13 @@ export class ProxyRetryPolicy {
         status === 502 ||
         status === 503 ||
         status === 504 ||
-        this.classifyUpstreamFailure(
-          [error.message, error.body].filter(isString).join('\n'),
-        ).retry;
+        error.reason === 'transport';
       if (retryable) {
         await this.accountLeaseService.markFromUpstreamError({
           accountIdOrEmail: accountId,
           status,
           retryAfter: error.headers?.retryAfter,
-          body: error.body,
+          reason: this.toRateLimitReason(error),
           model,
         });
       }
@@ -160,7 +153,15 @@ export class ProxyRetryPolicy {
       return false;
     }
 
-    this.logger.warn(`Upstream request failed for account ${accountId}: ${error.message}`);
+    this.logger.warn(
+      `Upstream request failed: operation=proxy_request reason=${
+        isStrictAuthenticationFailure(error) ? 'authentication' : 'generic_failure'
+      }`,
+    );
+    if (isStrictAuthenticationFailure(error)) {
+      this.accountLeaseService.markAsForbidden(accountId);
+      return true;
+    }
     const penaltyDecision = this.classifyUpstreamFailure(error.message);
     if (!penaltyDecision.retry) {
       return false;
@@ -177,17 +178,19 @@ export class ProxyRetryPolicy {
     return true;
   }
 
+  private toRateLimitReason(error: UpstreamRequestError): RateLimitReason {
+    if (error.reason === 'quota_exhausted') {
+      return RateLimitReason.QuotaExhausted;
+    }
+    if (error.reason === 'rate_limited') {
+      return RateLimitReason.RateLimitExceeded;
+    }
+    return error.status === 429 ? RateLimitReason.Unknown : RateLimitReason.ServerError;
+  }
+
   classifyUpstreamFailure(errorMessage: string): ProxyUpstreamFailureClassification {
     const normalizedErrorMessage = errorMessage.toLowerCase();
-    const isForbidden =
-      normalizedErrorMessage.includes('401') ||
-      normalizedErrorMessage.includes('unauthorized') ||
-      normalizedErrorMessage.includes('invalid_grant') ||
-      normalizedErrorMessage.includes('403') ||
-      normalizedErrorMessage.includes('permission_denied') ||
-      normalizedErrorMessage.includes('forbidden');
-
-    if (isForbidden) {
+    if (isStrictAuthenticationFailure(errorMessage)) {
       return {
         retry: true,
         markAsForbidden: true,

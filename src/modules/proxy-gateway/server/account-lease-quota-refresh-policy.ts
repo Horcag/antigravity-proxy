@@ -1,13 +1,13 @@
 import type { AccountLeaseAccountStore, AccountLeaseUpstream } from './account-lease-adapters';
 import type { CloudQuotaData } from '@/modules/cloud-account/types';
+import { isAICreditsAuthenticationError } from '@/modules/cloud-account/services/ai-credits-authentication-error';
 import {
   buildAccountLeaseQuotaSnapshot,
   findEarliestQuotaResetTime,
-  type AccountLeaseQuotaSnapshot,
 } from './account-lease-quota-policy';
 import type { AccountLeaseTokenData } from './account-lease-token-types';
 import { RateLimitReason } from './rate-limit-tracker';
-import { updateDynamicForwardingRules } from '../antigravity/ModelMapping';
+import { proxyModelAvailabilityStore } from './proxy-model-availability-store';
 
 interface AccountLeaseQuotaRefreshLogger {
   log(message: string): void;
@@ -29,12 +29,12 @@ interface AccountLeaseQuotaRefreshPolicyOptions {
     accountId: string,
     tokenData: AccountLeaseTokenData,
     nowSeconds: number,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
   hydrateTokenAfterAuthFailure: (
     accountId: string,
     tokenData: AccountLeaseTokenData,
     nowSeconds: number,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
   setLockoutUntilIso: (
     accountId: string,
     resetTime: string,
@@ -44,7 +44,7 @@ interface AccountLeaseQuotaRefreshPolicyOptions {
   logger: AccountLeaseQuotaRefreshLogger;
 }
 
-const QUOTA_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
+export const QUOTA_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 const QUOTA_REFRESH_FAILURE_COOLDOWN_MS = 60 * 1000;
 const QUOTA_REFRESH_FORCE_COOLDOWN_MS = 60 * 1000;
 const QUOTA_REFRESH_CONCURRENCY = 2;
@@ -56,19 +56,30 @@ export class AccountLeaseQuotaRefreshPolicy {
   private forceRefreshCooldownUntil = 0;
   private lastCatalogRefreshMs = 0;
   private generation = 0;
+  private snapshotReloadGeneration?: number;
 
   constructor(private readonly options: AccountLeaseQuotaRefreshPolicyOptions) {}
-
-  applyModelForwardingRules(snapshot: AccountLeaseQuotaSnapshot): void {
-    for (const [oldModel, newModel] of Object.entries(snapshot.modelForwardingRules)) {
-      updateDynamicForwardingRules(oldModel, newModel);
-    }
-  }
 
   invalidateActiveRefreshes(): void {
     this.generation += 1;
     this.lastCatalogRefreshMs = 0;
     this.forceRefreshCooldownUntil = 0;
+  }
+
+  beginSnapshotReload(): number {
+    this.invalidateActiveRefreshes();
+    this.snapshotReloadGeneration = this.generation;
+    return this.generation;
+  }
+
+  canInstallSnapshot(generation: number): boolean {
+    return this.snapshotReloadGeneration === generation && this.generation === generation;
+  }
+
+  finishSnapshotReload(generation: number): void {
+    if (this.snapshotReloadGeneration === generation) {
+      this.snapshotReloadGeneration = undefined;
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -107,6 +118,14 @@ export class AccountLeaseQuotaRefreshPolicy {
   } = {}): Promise<AccountLeaseQuotaCatalogRefreshResult> {
     const nowMs = options.nowMs ?? Date.now();
     const force = options.force ?? false;
+    if (this.snapshotReloadGeneration !== undefined) {
+      return {
+        refreshed: 0,
+        skipped: this.options.getTokenCache().size,
+        failed: 0,
+        account_ids: [],
+      };
+    }
     if (this.catalogRefreshLock) {
       return this.catalogRefreshLock;
     }
@@ -201,6 +220,9 @@ export class AccountLeaseQuotaRefreshPolicy {
     accountId: string,
     options: { force: boolean; nowMs: number; generation: number },
   ): Promise<boolean | null> {
+    if (this.snapshotReloadGeneration !== undefined) {
+      return null;
+    }
     const existingLock = this.accountRefreshLocks.get(accountId);
     if (existingLock) {
       return existingLock;
@@ -233,7 +255,14 @@ export class AccountLeaseQuotaRefreshPolicy {
     }
 
     try {
-      await this.options.hydrateTokenIfNeeded(accountId, tokenData, Math.floor(nowMs / 1000));
+      const hydrated = await this.options.hydrateTokenIfNeeded(
+        accountId,
+        tokenData,
+        Math.floor(nowMs / 1000),
+      );
+      if (!hydrated) {
+        return null;
+      }
       const latestToken = this.options.getTokenCache().get(accountId) ?? tokenData;
       const latestQuota = await this.options.upstream.fetchQuota(
         latestToken.access_token,
@@ -242,17 +271,22 @@ export class AccountLeaseQuotaRefreshPolicy {
       if (!this.canApplyQuotaRefresh(accountId, latestToken, generation)) {
         return null;
       }
-      await this.applyQuotaRefresh(accountId, latestToken, latestQuota, generation);
+      if (!this.applyQuotaRefresh(accountId, latestToken, latestQuota, nowMs, generation)) {
+        return null;
+      }
       this.accountFailureCooldownUntil.delete(accountId);
       return true;
     } catch (error) {
       if (isQuotaAuthError(error)) {
         try {
-          await this.options.hydrateTokenAfterAuthFailure(
+          const refreshedAfterAuthFailure = await this.options.hydrateTokenAfterAuthFailure(
             accountId,
             tokenData,
             Math.floor(nowMs / 1000),
           );
+          if (!refreshedAfterAuthFailure) {
+            return null;
+          }
           const latestToken = this.options.getTokenCache().get(accountId) ?? tokenData;
           const latestQuota = await this.options.upstream.fetchQuota(
             latestToken.access_token,
@@ -261,47 +295,64 @@ export class AccountLeaseQuotaRefreshPolicy {
           if (!this.canApplyQuotaRefresh(accountId, latestToken, generation)) {
             return null;
           }
-          await this.applyQuotaRefresh(accountId, latestToken, latestQuota, generation);
+          if (!this.applyQuotaRefresh(accountId, latestToken, latestQuota, nowMs, generation)) {
+            return null;
+          }
           this.accountFailureCooldownUntil.delete(accountId);
           return true;
-        } catch (retryError) {
+        } catch {
           this.accountFailureCooldownUntil.set(
             accountId,
             nowMs + QUOTA_REFRESH_FAILURE_COOLDOWN_MS,
           );
           this.options.logger.warn(
-            `Failed to refresh quota catalog for account ${accountId} after token refresh`,
-            retryError,
+            'Quota refresh failed: operation=refresh_account reason=auth_retry_failed',
           );
           return false;
         }
       }
       this.accountFailureCooldownUntil.set(accountId, nowMs + QUOTA_REFRESH_FAILURE_COOLDOWN_MS);
-      this.options.logger.warn(`Failed to refresh quota catalog for account ${accountId}`, error);
+      this.options.logger.warn(
+        'Quota refresh failed: operation=refresh_account reason=quota_fetch_failed',
+      );
       return false;
     }
   }
 
-  private async applyQuotaRefresh(
+  private applyQuotaRefresh(
     accountId: string,
     tokenData: AccountLeaseTokenData,
     latestQuota: CloudQuotaData,
+    refreshedAt: number,
     generation: number,
-  ): Promise<void> {
-    const extractedState = buildAccountLeaseQuotaSnapshot(latestQuota);
+  ): boolean {
+    const quotaSnapshot: CloudQuotaData = {
+      ...latestQuota,
+      last_successful_refresh_at: refreshedAt,
+    };
+    const extractedState = buildAccountLeaseQuotaSnapshot(quotaSnapshot);
 
-    await this.options.accountStore.updateQuota(accountId, latestQuota);
-    if (!this.canApplyQuotaRefresh(accountId, tokenData, generation)) {
-      return;
+    if (
+      !this.options.accountStore.updateQuotaIfCurrent(accountId, quotaSnapshot, () =>
+        this.canApplyQuotaRefresh(accountId, tokenData, generation),
+      )
+    ) {
+      return false;
     }
 
-    tokenData.quota = latestQuota;
+    tokenData.quota = quotaSnapshot;
+    tokenData.last_successful_quota_refresh_at = refreshedAt;
     tokenData.model_quotas = extractedState.modelQuotas;
     tokenData.model_limits = extractedState.modelLimits;
     tokenData.model_reset_times = extractedState.modelResetTimes;
     tokenData.model_forwarding_rules = extractedState.modelForwardingRules;
-    this.applyModelForwardingRules(extractedState);
-    this.options.getTokenCache().set(accountId, tokenData);
+    const tokenCache = this.options.getTokenCache();
+    tokenCache.set(accountId, tokenData);
+    proxyModelAvailabilityStore.clearCapabilityFailuresForModels(
+      accountId,
+      Object.keys(extractedState.modelQuotas),
+    );
+    return true;
   }
 
   private canApplyQuotaRefresh(
@@ -331,6 +382,17 @@ export class AccountLeaseQuotaRefreshPolicy {
 }
 
 function isQuotaAuthError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return message === 'UNAUTHORIZED' || message.includes('HTTP 401');
+  if (isAICreditsAuthenticationError(error)) {
+    return true;
+  }
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const normalizedMessage = error.message.trim().toUpperCase();
+  return (
+    normalizedMessage === 'UNAUTHORIZED' ||
+    normalizedMessage === 'HTTP 401' ||
+    normalizedMessage === 'FORBIDDEN' ||
+    normalizedMessage === 'HTTP 403'
+  );
 }

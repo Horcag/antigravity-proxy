@@ -12,7 +12,23 @@ export interface AccountLeaseAccountStore {
   getAccounts(): Promise<CloudAccount[]>;
   getAccount(accountId: string): Promise<CloudAccount | undefined>;
   updateToken(accountId: string, token: CloudAccount['token']): Promise<void>;
+  updateTokenIfCurrent(
+    accountId: string,
+    token: CloudAccount['token'],
+    isCurrent: () => boolean,
+  ): boolean;
   updateQuota(accountId: string, quota: CloudQuotaData): Promise<void>;
+  updateQuotaIfCurrent(
+    accountId: string,
+    quota: CloudQuotaData,
+    isCurrent: () => boolean,
+  ): boolean;
+  updateLastUsed(accountId: string, lastUsed: number): Promise<void>;
+  updateLastUsedIfCurrent(
+    accountId: string,
+    lastUsed: number,
+    isCurrent: () => boolean,
+  ): boolean;
 }
 
 export interface AccountLeaseUpstream {
@@ -33,7 +49,14 @@ export const cloudAccountStoreAdapter: AccountLeaseAccountStore = {
   getAccounts: () => CloudAccountRepo.getAccounts(),
   getAccount: (accountId) => CloudAccountRepo.getAccount(accountId),
   updateToken: (accountId, token) => CloudAccountRepo.updateToken(accountId, token),
+  updateTokenIfCurrent: (accountId, token, isCurrent) =>
+    CloudAccountRepo.updateTokenIfCurrent(accountId, token, isCurrent),
   updateQuota: (accountId, quota) => CloudAccountRepo.updateQuota(accountId, quota),
+  updateQuotaIfCurrent: (accountId, quota, isCurrent) =>
+    CloudAccountRepo.updateQuotaIfCurrent(accountId, quota, isCurrent),
+  updateLastUsed: (accountId, lastUsed) => CloudAccountRepo.updateLastUsed(accountId, lastUsed),
+  updateLastUsedIfCurrent: (accountId, lastUsed, isCurrent) =>
+    CloudAccountRepo.updateLastUsedIfCurrent(accountId, lastUsed, isCurrent),
 };
 
 export const googleAccountLeaseUpstreamAdapter: AccountLeaseUpstream = {

@@ -16,6 +16,14 @@ interface RateLimitInfo {
   model?: string;
 }
 
+export interface ActiveRateLimitLockout {
+  accountId: string;
+  modelId?: string;
+  reason: RateLimitReason;
+  unavailableUntil: number;
+  remainingSeconds: number;
+}
+
 type FailureCountEntry = {
   count: number;
   lastFailureMs: number;
@@ -377,8 +385,7 @@ export class RateLimitTracker {
     return size;
   }
 
-  cleanupExpired(): number {
-    const now = Date.now();
+  cleanupExpired(now = Date.now()): number {
     let deleted = 0;
     for (const [key, info] of this.lockoutByKey.entries()) {
       if (info.resetTimeMs <= now) {
@@ -387,6 +394,28 @@ export class RateLimitTracker {
       }
     }
     return deleted;
+  }
+
+  getActiveLockouts(now = Date.now()): ActiveRateLimitLockout[] {
+    this.cleanupExpired(now);
+    return this.peekActiveLockouts(now);
+  }
+
+  peekActiveLockouts(now = Date.now()): ActiveRateLimitLockout[] {
+    return [...this.lockoutByKey.entries()]
+      .filter(([, info]) => info.resetTimeMs > now)
+      .map(([key, info]) => {
+      const separator = key.indexOf(':');
+      const accountId = separator === -1 ? key : key.slice(0, separator);
+      const modelId = separator === -1 ? undefined : key.slice(separator + 1);
+      return {
+        accountId,
+        modelId,
+        reason: info.reason,
+        unavailableUntil: info.resetTimeMs,
+        remainingSeconds: Math.max(0, Math.ceil((info.resetTimeMs - now) / 1000)),
+      };
+      });
   }
 
   markSuccess(accountId: string): void {
@@ -417,6 +446,7 @@ export class RateLimitTracker {
     status?: number;
     retryAfter?: string;
     body?: string;
+    reason?: RateLimitReason;
     model?: string;
     backoffSteps: number[];
   }): RateLimitInfo | null {
@@ -425,7 +455,7 @@ export class RateLimitTracker {
       return null;
     }
 
-    const reason = this.detectRateLimitReason(status, params.body);
+    const reason = params.reason ?? this.detectRateLimitReason(status, params.body);
     const retryAfterSec = this.computeRetryAfterSeconds({
       reason,
       status,
@@ -457,6 +487,7 @@ export class RateLimitTracker {
     status?: number;
     retryAfter?: string;
     body?: string;
+    reason?: RateLimitReason;
     model?: string;
     backoffSteps: number[];
   }): RateLimitInfo | null {

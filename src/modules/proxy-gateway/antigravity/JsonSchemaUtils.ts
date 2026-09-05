@@ -155,20 +155,16 @@ function cleanJsonSchemaRecursive(value: any) {
       } else {
         const primitiveEnumValues = enumValues.filter(
           (enumValue: unknown) =>
-            isString(enumValue) || isNumber(enumValue) || isBoolean(enumValue),
+            isGeminiCompatibleEnumValue(enumValue, map.type),
         );
 
         if (primitiveEnumValues.length === 0) {
           delete map.enum;
-        } else if (primitiveEnumValues.every(isString)) {
-          if (primitiveEnumValues.length !== enumValues.length) {
-            map.enum = primitiveEnumValues;
-          }
-        } else if (isString(map.type) && map.type.toLowerCase() === 'string') {
-          map.enum = primitiveEnumValues.map(String);
         } else {
-          constraints.push(`enum: ${primitiveEnumValues.join(', ')}`);
-          delete map.enum;
+          // Gemini's function declaration schema represents every primitive enum member as a
+          // string, including numeric and boolean members. Keep the constraint instead of
+          // reducing it to description text, and discard malformed members deterministically.
+          map.enum = primitiveEnumValues.map(String);
         }
       }
     }
@@ -240,18 +236,51 @@ function cleanJsonSchemaRecursive(value: any) {
     if (map['type']) {
       const typeVal = map['type'];
       if (isString(typeVal)) {
-        map['type'] = typeVal.toLowerCase();
+        map['type'] = normalizeSchemaTypeToken(typeVal);
       } else if (isArray(typeVal)) {
         // Union type downgrade: take the first non-null type
-        let selectedType = 'string';
-        for (const item of typeVal) {
-          if (isString(item) && item !== 'null') {
-            selectedType = item.toLowerCase();
-            break;
-          }
-        }
-        map['type'] = selectedType;
+        map['type'] = resolveSchemaPrimitiveType(typeVal) ?? 'string';
       }
     }
   }
+}
+
+function isGeminiCompatibleEnumValue(value: unknown, schemaType: unknown): boolean {
+  const declaredType = resolveSchemaPrimitiveType(schemaType);
+
+  if (declaredType === 'string') {
+    return isString(value);
+  }
+  if (declaredType === 'boolean') {
+    return isBoolean(value);
+  }
+  if (declaredType === 'integer') {
+    return isNumber(value) && Number.isFinite(value) && Number.isInteger(value);
+  }
+  if (declaredType === 'number') {
+    return isNumber(value) && Number.isFinite(value);
+  }
+
+  return isString(value) || isBoolean(value) || (isNumber(value) && Number.isFinite(value));
+}
+
+function resolveSchemaPrimitiveType(value: unknown): string | null {
+  if (isString(value)) {
+    return normalizeSchemaTypeToken(value);
+  }
+  if (!isArray(value)) {
+    return null;
+  }
+
+  for (const type of value) {
+    const normalizedType = normalizeSchemaTypeToken(type);
+    if (normalizedType !== null && normalizedType !== 'null') {
+      return normalizedType;
+    }
+  }
+  return null;
+}
+
+function normalizeSchemaTypeToken(value: unknown): string | null {
+  return isString(value) ? value.toLowerCase() : null;
 }

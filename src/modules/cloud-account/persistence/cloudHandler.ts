@@ -149,15 +149,56 @@ export class CloudAccountRepo {
       .run(encryptJson(token), accountId);
   }
 
+  static updateTokenIfCurrent(
+    accountId: string,
+    token: CloudAccount['token'],
+    isCurrent: () => boolean,
+  ): boolean {
+    const statement = this.getDatabase().prepare('UPDATE accounts SET token_json = ? WHERE id = ?');
+    const encryptedToken = encryptJson(token);
+    if (!isCurrent()) {
+      return false;
+    }
+    statement.run(encryptedToken, accountId);
+    return true;
+  }
+
   static async updateQuota(accountId: string, quota: CloudQuotaData): Promise<void> {
     this.getDatabase()
       .prepare('UPDATE accounts SET quota_json = ? WHERE id = ?')
       .run(encryptJson(quota), accountId);
   }
 
-  static async updateLastUsed(accountId: string): Promise<void> {
+  static updateQuotaIfCurrent(
+    accountId: string,
+    quota: CloudQuotaData,
+    isCurrent: () => boolean,
+  ): boolean {
+    if (!isCurrent()) {
+      return false;
+    }
+    this.getDatabase()
+      .prepare('UPDATE accounts SET quota_json = ? WHERE id = ?')
+      .run(encryptJson(quota), accountId);
+    return true;
+  }
+
+  static async updateLastUsed(accountId: string, lastUsed: number): Promise<void> {
     this.getDatabase()
       .prepare('UPDATE accounts SET last_used = ? WHERE id = ?')
-      .run(Math.floor(Date.now() / 1000), accountId);
+      .run(lastUsed, accountId);
+  }
+
+  static updateLastUsedIfCurrent(
+    accountId: string,
+    lastUsed: number,
+    isCurrent: () => boolean,
+  ): boolean {
+    const statement = this.getDatabase().prepare('UPDATE accounts SET last_used = ? WHERE id = ?');
+    if (!isCurrent()) {
+      return false;
+    }
+    statement.run(lastUsed, accountId);
+    return true;
   }
 }

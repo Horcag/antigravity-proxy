@@ -19,18 +19,83 @@ function createAccountLeaseService(models: string[] = ['gemini-3-flash']) {
   };
 }
 
+const validNativeBody = { contents: [{ parts: [{ text: 'hello' }], role: 'user' }] };
+const malformedNativeBodies = [
+  { contents: [] },
+  { contents: [{ parts: [] }] },
+  { contents: [{ parts: [{ text: '' }] }] },
+  { contents: [{ parts: [{ inlineData: [] }] }] },
+  { contents: [{ parts: [{ fileData: { fileUri: '' } }] }] },
+  { contents: [{ parts: [{ functionCall: null }] }] },
+  { contents: [{ parts: [{ functionResponse: [] }] }] },
+  { contents: [{ parts: [{ executableCode: { code: '', language: 'PYTHON' } }] }] },
+  { contents: [{ parts: [{ codeExecutionResult: { outcome: 'OUTCOME_UNSPECIFIED' } }] }] },
+  {
+    contents: [{ parts: [{ text: 'hello' }] }],
+    systemInstruction: {
+      parts: [{ inlineData: { data: 'aGVsbG8=', mimeType: 'text/plain' }, text: 'system' }],
+    },
+  },
+  { contents: [{ parts: [{ futureDataVariant: {}, anotherFutureDataVariant: {} }] }] },
+  { contents: [{ parts: [{ text: 'hello', futureDataVariant: {} }] }] },
+  {
+    contents: [
+      {
+        parts: [{
+          functionResponse: {
+            name: 'weather',
+            parts: [{ inlineData: { data: 'aGVsbG8=', mimeType: 'text/plain' }, futureDataVariant: {} }],
+            response: {},
+          },
+        }],
+      },
+    ],
+  },
+  {
+    contents: [
+      {
+        parts: [{
+          functionResponse: {
+            name: 'weather',
+            parts: [{ futureDataVariant: {} }],
+            response: {},
+          },
+        }],
+      },
+    ],
+  },
+  ...[
+    { thought: 'true' },
+    { thoughtSignature: '' },
+    { thought_signature: '' },
+    { thoughtSignature: 'camel', thought_signature: 'snake' },
+  ].map((metadata) => ({
+    contents: [
+      {
+        parts: [{
+          functionResponse: {
+            name: 'weather',
+            parts: [{ inlineData: { data: 'aGVsbG8=', mimeType: 'text/plain' }, ...metadata }],
+            response: {},
+          },
+        }],
+      },
+    ],
+  })),
+  { contents: [{ parts: [{ futureDataVariant: {}, thought: 'true' }] }] },
+];
+
 describe('GeminiController upstream errors', () => {
   it.each([
     ['INVALID_ARGUMENT', 400],
     ['PERMISSION_DENIED', 403],
     ['RESOURCE_EXHAUSTED', 429],
     ['UNAVAILABLE', 503],
-  ])('uses the native %s status when the upstream HTTP status is absent', async (status, code) => {
+  ])('uses the upstream HTTP status without exposing upstream diagnostics: %s', async (status, code) => {
     const proxyService = {
-      handleGeminiGenerateContent: vi.fn().mockRejectedValue(
+      handlePreflightedGeminiGenerateContent: vi.fn().mockRejectedValue(
         new UpstreamRequestError({
-          message: 'native Gemini error',
-          body: JSON.stringify({ error: { status } }),
+          status: code,
         }),
       ),
     };
@@ -39,7 +104,7 @@ describe('GeminiController upstream errors', () => {
 
     await controller.modelAction(
       'gemini-3-flash:generateContent',
-      {} as never,
+      validNativeBody,
       reply as never,
     );
 
@@ -47,6 +112,83 @@ describe('GeminiController upstream errors', () => {
     expect(reply.send).toHaveBeenCalledWith(
       expect.objectContaining({ error: expect.objectContaining({ status }) }),
     );
+  });
+
+  it.each(['generateContent', 'streamGenerateContent'])(
+    'rejects every malformed native request before quota refresh or %s service dispatch',
+    async (action) => {
+      for (const body of malformedNativeBodies) {
+        const proxyService = {
+          handlePreflightedGeminiGenerateContent: vi.fn(),
+          handlePreflightedGeminiStreamGenerateContent: vi.fn(),
+        };
+        const accountLeaseService = createAccountLeaseService();
+        const controller = new GeminiController(proxyService as never, accountLeaseService as never);
+        const reply = createReply();
+
+        await controller.modelAction(
+          `gemini-3-flash:${action}`,
+          body as never,
+          reply as never,
+        );
+
+        expect(reply.status).toHaveBeenCalledWith(400);
+        expect(reply.send).toHaveBeenCalledWith(
+          expect.objectContaining({
+            error: expect.objectContaining({
+              code: 400,
+              status: 'INVALID_ARGUMENT',
+            }),
+          }),
+        );
+        expect(accountLeaseService.refreshQuotaCatalog).not.toHaveBeenCalled();
+        expect(proxyService.handlePreflightedGeminiGenerateContent).not.toHaveBeenCalled();
+        expect(proxyService.handlePreflightedGeminiStreamGenerateContent).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it.each([
+    [
+      'function call',
+      { contents: [{ parts: [{ functionCall: { args: {}, name: 'bad name' } }], role: 'model' }] },
+    ],
+    [
+      'function response',
+      { contents: [{ parts: [{ functionResponse: { name: 'bad name', response: {} } }], role: 'user' }] },
+    ],
+    [
+      'function declaration',
+      {
+        contents: validNativeBody.contents,
+        tools: [{ functionDeclarations: [{ name: 'bad name' }] }],
+      },
+    ],
+    [
+      'allowed function name',
+      {
+        contents: validNativeBody.contents,
+        toolConfig: { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['bad name'] } },
+      },
+    ],
+  ])('rejects an invalid %s before quota refresh or service dispatch', async (_location, body) => {
+    const proxyService = {
+      handlePreflightedGeminiGenerateContent: vi.fn(),
+      handlePreflightedGeminiStreamGenerateContent: vi.fn(),
+    };
+    const accountLeaseService = createAccountLeaseService();
+    const controller = new GeminiController(proxyService as never, accountLeaseService as never);
+    const reply = createReply();
+
+    await controller.modelAction('gemini-3-flash:generateContent', body as never, reply as never);
+
+    expect(reply.status).toHaveBeenCalledWith(400);
+    expect(reply.send).toHaveBeenCalledWith(
+      expect.objectContaining({ error: expect.objectContaining({ status: 'INVALID_ARGUMENT' }) }),
+    );
+    expect(accountLeaseService.refreshQuotaCatalog).not.toHaveBeenCalled();
+    expect(proxyService.handlePreflightedGeminiGenerateContent).not.toHaveBeenCalled();
+    expect(proxyService.handlePreflightedGeminiStreamGenerateContent).not.toHaveBeenCalled();
   });
 
   it('returns an advertised Gemini model metadata object unchanged from the list response', async () => {
@@ -71,14 +213,14 @@ describe('GeminiController upstream errors', () => {
     'rejects an unadvertised native model before %s dispatch',
     async (action) => {
       const proxyService = {
-        handleGeminiGenerateContent: vi.fn(),
-        handleGeminiStreamGenerateContent: vi.fn(),
+        handlePreflightedGeminiGenerateContent: vi.fn(),
+        handlePreflightedGeminiStreamGenerateContent: vi.fn(),
       };
       const accountLeaseService = createAccountLeaseService();
       const controller = new GeminiController(proxyService as never, accountLeaseService as never);
       const reply = createReply();
 
-      await controller.modelAction(`not-advertised:${action}`, {} as never, reply as never);
+      await controller.modelAction(`not-advertised:${action}`, validNativeBody, reply as never);
 
       expect(accountLeaseService.refreshQuotaCatalog).toHaveBeenCalledWith({
         force: true,
@@ -88,22 +230,25 @@ describe('GeminiController upstream errors', () => {
       expect(reply.send).toHaveBeenCalledWith(
         expect.objectContaining({ error: expect.objectContaining({ status: 'NOT_FOUND' }) }),
       );
-      expect(proxyService.handleGeminiGenerateContent).not.toHaveBeenCalled();
-      expect(proxyService.handleGeminiStreamGenerateContent).not.toHaveBeenCalled();
+      expect(proxyService.handlePreflightedGeminiGenerateContent).not.toHaveBeenCalled();
+      expect(proxyService.handlePreflightedGeminiStreamGenerateContent).not.toHaveBeenCalled();
     },
   );
 
   it('dispatches an advertised native model after refreshing its catalog entry', async () => {
     const proxyService = {
-      handleGeminiGenerateContent: vi.fn().mockResolvedValue({ candidates: [] }),
+      handlePreflightedGeminiGenerateContent: vi.fn().mockResolvedValue({ candidates: [] }),
     };
     const accountLeaseService = createAccountLeaseService();
     const controller = new GeminiController(proxyService as never, accountLeaseService as never);
     const reply = createReply();
 
-    await controller.modelAction('gemini-3-flash:generateContent', {} as never, reply as never);
+    await controller.modelAction('gemini-3-flash:generateContent', validNativeBody, reply as never);
 
-    expect(proxyService.handleGeminiGenerateContent).toHaveBeenCalledWith('models/gemini-3-flash', {});
+    expect(proxyService.handlePreflightedGeminiGenerateContent).toHaveBeenCalledWith(
+      'models/gemini-3-flash',
+      validNativeBody,
+    );
     expect(reply.status).toHaveBeenCalledWith(200);
   });
 });

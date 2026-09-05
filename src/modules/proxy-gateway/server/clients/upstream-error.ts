@@ -4,36 +4,86 @@ export interface UpstreamErrorHeaders {
   retryAfter?: string;
 }
 
+export const UPSTREAM_FAILURE_REASONS = [
+  'authentication',
+  'model_not_found',
+  'quota_exhausted',
+  'rate_limited',
+  'transport',
+  'upstream_error',
+] as const;
+
+export type UpstreamFailureReason = (typeof UPSTREAM_FAILURE_REASONS)[number];
+
+const MAX_RETRY_AFTER_SECONDS = 24 * 60 * 60;
+
+/**
+ * Carries only public-safe upstream failure metadata across retry and protocol
+ * boundaries. Raw upstream payloads and messages must be classified before
+ * constructing this error, then discarded.
+ */
 export class UpstreamRequestError extends Error {
   readonly status?: number;
   readonly headers?: UpstreamErrorHeaders;
-  readonly body?: string;
+  readonly reason: UpstreamFailureReason;
 
   constructor(params: {
-    message: string;
     status?: number;
     headers?: UpstreamErrorHeaders;
-    body?: string;
+    reason?: UpstreamFailureReason;
   }) {
-    super(params.message);
-    this.name = 'UpstreamRequestError';
-
-    if (params.status && !isNumber(params.status)) {
-      throw new TypeError('status must be a number');
+    if (params.status !== undefined && (!isNumber(params.status) || !Number.isInteger(params.status))) {
+      throw new TypeError('status must be an integer');
     }
-    if (params.headers && !isObjectLike(params.headers)) {
+    if (params.headers !== undefined && !isObjectLike(params.headers)) {
       throw new TypeError('headers must be an object');
     }
+    if (
+      params.reason !== undefined &&
+      !UPSTREAM_FAILURE_REASONS.includes(params.reason)
+    ) {
+      throw new TypeError('reason must be a supported upstream failure reason');
+    }
 
-    this.status = params.status;
-    this.headers = params.headers;
+    const status = params.status;
+    super(status === undefined ? 'Upstream request failed' : `Upstream request failed (HTTP ${status})`);
+    this.name = 'UpstreamRequestError';
+    this.status = status;
+    this.reason = params.reason ?? 'upstream_error';
 
-    // Sanitize and limit body size
-    if (isString(params.body)) {
-      const sanitized = params.body.replace(/<[^>]*>?/gm, '');
-      this.body = sanitized.substring(0, 1000);
-    } else {
-      this.body = undefined;
+    const retryAfter = normalizeRetryAfter(params.headers?.retryAfter);
+    this.headers = retryAfter ? { retryAfter } : undefined;
+  }
+}
+
+function normalizeRetryAfter(value: unknown): string | undefined {
+  if (!isString(value)) {
+    return undefined;
+  }
+
+  const normalized = value.trim();
+  if (/^\d{1,5}$/.test(normalized)) {
+    const seconds = Number(normalized);
+    if (Number.isSafeInteger(seconds) && seconds > 0 && seconds <= MAX_RETRY_AFTER_SECONDS) {
+      return String(seconds);
     }
   }
+
+  if (!isImfFixdate(normalized)) {
+    return undefined;
+  }
+
+  const retryAt = Date.parse(normalized);
+  if (!Number.isFinite(retryAt)) {
+    return undefined;
+  }
+
+  const canonical = new Date(retryAt).toUTCString();
+  return canonical === normalized ? canonical : undefined;
+}
+
+function isImfFixdate(value: string): boolean {
+  return /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat), \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/.test(
+    value,
+  );
 }

@@ -23,6 +23,7 @@ import { getAllDynamicModels } from '../antigravity/ModelMapping';
 import { AccountLeaseService } from './account-lease.service';
 import { UpstreamRequestError } from './clients/upstream-error';
 import { createGoogleErrorEnvelope } from './fastify-multipart.provider';
+import { preflightNativeGeminiRequest } from './native-gemini-request';
 
 type GeminiModelMetadata = {
   name: string;
@@ -30,18 +31,6 @@ type GeminiModelMetadata = {
   displayName: string;
   supportedGenerationMethods: string[];
   version: string;
-};
-
-const NATIVE_GEMINI_STATUS_TO_HTTP: Record<string, HttpStatus> = {
-  INVALID_ARGUMENT: HttpStatus.BAD_REQUEST,
-  UNAUTHENTICATED: HttpStatus.UNAUTHORIZED,
-  PERMISSION_DENIED: HttpStatus.FORBIDDEN,
-  NOT_FOUND: HttpStatus.NOT_FOUND,
-  RESOURCE_EXHAUSTED: HttpStatus.TOO_MANY_REQUESTS,
-  FAILED_PRECONDITION: HttpStatus.BAD_REQUEST,
-  ABORTED: HttpStatus.CONFLICT,
-  UNIMPLEMENTED: HttpStatus.NOT_IMPLEMENTED,
-  UNAVAILABLE: HttpStatus.SERVICE_UNAVAILABLE,
 };
 
 @Controller('v1beta')
@@ -113,6 +102,19 @@ export class GeminiController {
     body: GeminiRequest,
     res: FastifyReply,
   ): Promise<void> {
+    let preflightRequest;
+    try {
+      // Reject locally knowable malformed requests before quota refresh can contact upstream.
+      preflightRequest = preflightNativeGeminiRequest(body);
+    } catch (error) {
+      this.sendGoogleErrorResponse(
+        res,
+        this.resolveErrorStatus(error) ?? HttpStatus.INTERNAL_SERVER_ERROR,
+        error instanceof HttpException ? error.message : 'Internal Server Error',
+      );
+      return;
+    }
+
     if (action === 'countTokens') {
       this.sendGoogleErrorResponse(
         res,
@@ -131,7 +133,10 @@ export class GeminiController {
 
     try {
       if (action === 'streamGenerateContent') {
-        const stream = await this.proxyService.handleGeminiStreamGenerateContent(model, body);
+        const stream = await this.proxyService.handlePreflightedGeminiStreamGenerateContent(
+          model,
+          preflightRequest,
+        );
         if (stream instanceof Observable) {
           this.writeObservableSseResponse(res, stream);
           return;
@@ -139,7 +144,10 @@ export class GeminiController {
       }
 
       if (action === 'generateContent') {
-        const result = await this.proxyService.handleGeminiGenerateContent(model, body);
+        const result = await this.proxyService.handlePreflightedGeminiGenerateContent(
+          model,
+          preflightRequest,
+        );
         res.status(HttpStatus.OK).send(this.buildNormalizedGeminiGenerateResponse(result));
         return;
       }
@@ -260,15 +268,6 @@ export class GeminiController {
       return error.status;
     }
 
-    try {
-      const parsed = JSON.parse(error.body ?? '') as { error?: { status?: unknown } };
-      const nativeStatus = parsed.error?.status;
-      if (isString(nativeStatus)) {
-        return NATIVE_GEMINI_STATUS_TO_HTTP[nativeStatus.trim().toUpperCase()];
-      }
-    } catch {
-      // A malformed upstream body must preserve the generic error fallback.
-    }
     return undefined;
   }
 
@@ -331,11 +330,11 @@ export class GeminiController {
         if (res.raw.writableEnded) {
           return;
         }
-        const message = error instanceof Error ? error.message : String(error);
+        void error;
         res.raw.write(
           `data: ${JSON.stringify({
             error: {
-              message,
+              message: 'Internal Server Error',
               type: 'server_error',
             },
           })}\n\n`,

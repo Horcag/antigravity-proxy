@@ -23,8 +23,11 @@ interface AccountLeaseSelectionLogger {
 
 export interface AccountLeaseSelectionRequest<T> {
   allTokens: Array<AccountLeaseSelectionEntry<T>>;
+  getCurrentCandidates?: () => Promise<Array<AccountLeaseSelectionEntry<T>>>;
   sessionKey?: string;
   model?: string;
+  getEffectiveModelForAccount?: (accountId: string) => string | undefined;
+  getPerformanceScore?: (accountId: string, effectiveModel: string | undefined) => number;
   now: number;
   accountCooldowns: Map<string, number>;
   rateLimitTracker: AccountLeaseRateLimitReader;
@@ -36,6 +39,10 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 export class AccountLeaseSelectionPolicy {
@@ -57,6 +64,14 @@ export class AccountLeaseSelectionPolicy {
 
   clearSessions(): void {
     this.sessionBindings.clear();
+  }
+
+  clearSessionBindingsForUnavailableAccounts(availableAccountIds: ReadonlySet<string>): void {
+    for (const [sessionKey, binding] of this.sessionBindings.entries()) {
+      if (!availableAccountIds.has(binding.accountId)) {
+        this.sessionBindings.delete(sessionKey);
+      }
+    }
   }
 
   resetSelectionState(): void {
@@ -124,18 +139,32 @@ export class AccountLeaseSelectionPolicy {
 
   private collectEligibleTokens<T>(
     allTokens: Array<AccountLeaseSelectionEntry<T>>,
-    model: string | undefined,
+    request: AccountLeaseSelectionRequest<T>,
     now: number,
-    accountCooldowns: Map<string, number>,
-    rateLimitTracker: AccountLeaseRateLimitReader,
   ): Array<AccountLeaseSelectionEntry<T>> {
-    return allTokens.filter(([accountId]) => {
-      const cooldownUntil = accountCooldowns.get(accountId);
-      if (cooldownUntil && cooldownUntil > now) {
-        return false;
-      }
-      return !rateLimitTracker.isRateLimited(accountId, model);
+    return this.collectRateLimitEligibleTokens(allTokens, request).filter(([accountId]) => {
+      const cooldownUntil = request.accountCooldowns.get(accountId);
+      return !cooldownUntil || cooldownUntil <= now;
     });
+  }
+
+  private collectRateLimitEligibleTokens<T>(
+    allTokens: Array<AccountLeaseSelectionEntry<T>>,
+    request: AccountLeaseSelectionRequest<T>,
+  ): Array<AccountLeaseSelectionEntry<T>> {
+    return allTokens.filter(([accountId]) =>
+      !request.rateLimitTracker.isRateLimited(
+        accountId,
+        this.getEffectiveModelForAccount(request, accountId),
+      ),
+    );
+  }
+
+  private getEffectiveModelForAccount<T>(
+    request: AccountLeaseSelectionRequest<T>,
+    accountId: string,
+  ): string | undefined {
+    return request.getEffectiveModelForAccount?.(accountId) ?? request.model;
   }
 
   private getValidSessionBinding(
@@ -188,21 +217,27 @@ export class AccountLeaseSelectionPolicy {
   private selectLegacyTokenCandidate<T>(
     request: AccountLeaseSelectionRequest<T>,
   ): AccountLeaseSelectionEntry<T> | null {
-    const availableByCooldown = request.allTokens.filter(([accountId]) => {
-      const cooldownUntil = request.accountCooldowns.get(accountId);
-      return !cooldownUntil || cooldownUntil <= request.now;
-    });
-
+    const availableTokens = this.collectEligibleTokens(request.allTokens, request, request.now);
     const candidateAccountPool =
-      availableByCooldown.length > 0 ? availableByCooldown : request.allTokens;
+      availableTokens.length > 0
+        ? availableTokens
+        : this.collectRateLimitEligibleTokens(request.allTokens, request);
     if (candidateAccountPool.length === 0) {
       return null;
     }
 
-    if (availableByCooldown.length === 0) {
+    if (availableTokens.length === 0) {
       request.logger.warn(
         'All accounts are cooling down; temporarily bypassing cooldown gate to preserve availability',
       );
+    }
+
+    const preferred = this.findPreferredToken(
+      candidateAccountPool,
+      request.config.preferredAccountId,
+    );
+    if (preferred) {
+      return preferred;
     }
 
     const stickyToken = this.findStickySessionToken(
@@ -220,75 +255,111 @@ export class AccountLeaseSelectionPolicy {
   private async selectParityTokenCandidate<T>(
     request: AccountLeaseSelectionRequest<T>,
   ): Promise<AccountLeaseSelectionEntry<T> | null> {
-    const availableTokens = this.collectEligibleTokens(
-      request.allTokens,
-      request.model,
-      request.now,
-      request.accountCooldowns,
-      request.rateLimitTracker,
-    );
-    if (availableTokens.length === 0) {
-      return null;
+    const availableTokens = this.collectEligibleTokens(request.allTokens, request, request.now);
+    const preferred = this.findPreferredToken(availableTokens, request.config.preferredAccountId);
+    if (preferred) {
+      return preferred;
     }
 
-    const preferredAccountId = request.config.preferredAccountId;
-    if (preferredAccountId) {
-      const preferred = availableTokens.find(([accountId]) => accountId === preferredAccountId);
-      if (preferred) {
-        return preferred;
+    if (request.config.schedulingMode !== 'balance') {
+      const stickyToken = this.findStickySessionToken(
+        availableTokens,
+        request.sessionKey,
+        request.now,
+      );
+      if (stickyToken) {
+        return stickyToken;
       }
     }
 
-    const stickyToken = this.findStickySessionToken(
-      availableTokens,
-      request.sessionKey,
-      request.now,
-    );
-    if (stickyToken) {
-      return stickyToken;
+    if (request.config.schedulingMode === 'performance-first') {
+      return this.pickHighestPerformanceEntry(availableTokens, request);
     }
 
     const stickyBinding = this.getValidSessionBinding(request.sessionKey, request.now);
-    if (stickyBinding && request.config.schedulingMode === 'cache-first') {
+    const hasBoundCandidate = request.allTokens.some(
+      ([accountId]) => accountId === stickyBinding?.accountId,
+    );
+    if (stickyBinding && hasBoundCandidate && request.config.schedulingMode === 'cache-first') {
       const waitSec = request.rateLimitTracker.getRemainingWaitSeconds(
         stickyBinding.accountId,
-        request.model,
+        this.getEffectiveModelForAccount(request, stickyBinding.accountId),
       );
       const waitMs = waitSec * 1000;
       if (waitMs > 0 && waitMs <= request.config.maxWaitMs) {
         await delay(waitMs);
+        const postWaitNow = Date.now();
+        this.clearExpiredSessionBindings(postWaitNow);
+        const currentCandidates = request.getCurrentCandidates
+          ? await request.getCurrentCandidates()
+          : request.allTokens;
         const refreshedAvailable = this.collectEligibleTokens(
-          request.allTokens,
-          request.model,
-          Date.now(),
-          request.accountCooldowns,
-          request.rateLimitTracker,
+          currentCandidates,
+          request,
+          postWaitNow,
         );
-        const stickyAfterWait =
-          refreshedAvailable.find(([accountId]) => accountId === stickyBinding.accountId) ?? null;
+        const refreshedBinding = this.getValidSessionBinding(request.sessionKey, postWaitNow);
+        const stickyAfterWait = refreshedBinding
+          ? refreshedAvailable.find(([accountId]) => accountId === refreshedBinding.accountId) ?? null
+          : null;
         if (stickyAfterWait) {
           return stickyAfterWait;
         }
-        if (refreshedAvailable.length > 0) {
-          return this.pickRoundRobinEntry(refreshedAvailable);
-        }
+        return this.pickRoundRobinEntry(refreshedAvailable);
       }
     }
 
     return this.pickRoundRobinEntry(availableTokens);
   }
 
+  private pickHighestPerformanceEntry<T>(
+    candidates: Array<AccountLeaseSelectionEntry<T>>,
+    request: AccountLeaseSelectionRequest<T>,
+  ): AccountLeaseSelectionEntry<T> | null {
+    if (candidates.length === 0) {
+      return null;
+    }
+    return [...candidates].sort(([leftAccountId], [rightAccountId]) => {
+      const leftScore = request.getPerformanceScore?.(
+        leftAccountId,
+        this.getEffectiveModelForAccount(request, leftAccountId),
+      ) ?? 0;
+      const rightScore = request.getPerformanceScore?.(
+        rightAccountId,
+        this.getEffectiveModelForAccount(request, rightAccountId),
+      ) ?? 0;
+      return rightScore - leftScore || compareCodeUnits(leftAccountId, rightAccountId);
+    })[0];
+  }
+
+  private findPreferredToken<T>(
+    candidates: Array<AccountLeaseSelectionEntry<T>>,
+    preferredAccountId: string | undefined,
+  ): AccountLeaseSelectionEntry<T> | null {
+    if (!preferredAccountId) {
+      return null;
+    }
+    return candidates.find(([accountId]) => accountId === preferredAccountId) ?? null;
+  }
+
   private predictLegacyAccountCandidateId<T>(
     request: AccountLeaseSelectionRequest<T>,
   ): string | null {
-    const availableByCooldown = request.allTokens.filter(([accountId]) => {
-      const cooldownUntil = request.accountCooldowns.get(accountId);
-      return !cooldownUntil || cooldownUntil <= request.now;
-    });
+    const availableTokens = this.collectEligibleTokens(request.allTokens, request, request.now);
     const candidateAccountPool =
-      availableByCooldown.length > 0 ? availableByCooldown : request.allTokens;
+      availableTokens.length > 0
+        ? availableTokens
+        : this.collectRateLimitEligibleTokens(request.allTokens, request);
     if (candidateAccountPool.length === 0) {
       return null;
+    }
+
+    const preferred = this.findPreferredToken(
+      candidateAccountPool,
+      request.config.preferredAccountId,
+    );
+    if (preferred) {
+      return preferred[0];
     }
 
     const stickyToken = this.findStickySessionToken(
@@ -306,32 +377,29 @@ export class AccountLeaseSelectionPolicy {
   private predictParityAccountCandidateId<T>(
     request: AccountLeaseSelectionRequest<T>,
   ): string | null {
-    const availableTokens = this.collectEligibleTokens(
-      request.allTokens,
-      request.model,
-      request.now,
-      request.accountCooldowns,
-      request.rateLimitTracker,
-    );
+    const availableTokens = this.collectEligibleTokens(request.allTokens, request, request.now);
     if (availableTokens.length === 0) {
       return null;
     }
 
-    const preferredAccountId = request.config.preferredAccountId;
-    if (preferredAccountId) {
-      const preferred = availableTokens.find(([accountId]) => accountId === preferredAccountId);
-      if (preferred) {
-        return preferred[0];
+    const preferred = this.findPreferredToken(availableTokens, request.config.preferredAccountId);
+    if (preferred) {
+      return preferred[0];
+    }
+
+    if (request.config.schedulingMode !== 'balance') {
+      const stickyToken = this.findStickySessionToken(
+        availableTokens,
+        request.sessionKey,
+        request.now,
+      );
+      if (stickyToken) {
+        return stickyToken[0];
       }
     }
 
-    const stickyToken = this.findStickySessionToken(
-      availableTokens,
-      request.sessionKey,
-      request.now,
-    );
-    if (stickyToken) {
-      return stickyToken[0];
+    if (request.config.schedulingMode === 'performance-first') {
+      return this.pickHighestPerformanceEntry(availableTokens, request)?.[0] ?? null;
     }
 
     return this.peekRoundRobinCandidateAccountId(availableTokens);
@@ -354,7 +422,7 @@ export class AccountLeaseSelectionPolicy {
     if (legacyId !== parityId) {
       this.shadowMismatchCount++;
       request.logger.warn(
-        `Parity shadow mismatch detected: legacy=${legacyId ?? 'n/a'}, parity=${parityId ?? 'n/a'}`,
+        `Parity shadow mismatch detected: legacy_candidate=${legacyId !== null}, parity_candidate=${parityId !== null}`,
       );
     }
 

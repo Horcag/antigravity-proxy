@@ -1,9 +1,6 @@
 import type { CloudAccount } from '@/modules/cloud-account/types';
 import type { AccountLeaseAccountStore } from './account-lease-adapters';
-import {
-  buildAccountLeaseQuotaSnapshot,
-  type AccountLeaseQuotaSnapshot,
-} from './account-lease-quota-policy';
+import { buildAccountLeaseQuotaSnapshot } from './account-lease-quota-policy';
 import { type AccountLeaseTokenData, normalizeClientKey } from './account-lease-token-types';
 
 interface AccountLeaseTokenCacheLogger {
@@ -13,46 +10,49 @@ interface AccountLeaseTokenCacheLogger {
 
 interface AccountLeaseTokenCacheOptions {
   accountStore: AccountLeaseAccountStore;
-  getTokenCache: () => Map<string, AccountLeaseTokenData>;
-  applyQuotaSnapshot: (snapshot: AccountLeaseQuotaSnapshot) => void;
   logger: AccountLeaseTokenCacheLogger;
+}
+
+export interface AccountLeaseTokenCacheSnapshot {
+  count: number;
+  tokens: Map<string, AccountLeaseTokenData>;
 }
 
 export class AccountLeaseTokenCache {
   constructor(private readonly options: AccountLeaseTokenCacheOptions) {}
 
-  async loadAccounts(): Promise<number> {
+  async loadAccounts(): Promise<AccountLeaseTokenCacheSnapshot | null> {
     try {
       const accounts = await this.options.accountStore.getAccounts();
       let count = 0;
-      const tokenCache = this.options.getTokenCache();
-
-      tokenCache.clear();
+      const tokens = new Map<string, AccountLeaseTokenData>();
 
       for (const account of accounts) {
         const tokenData = this.mapAccountToTokenData(account);
         if (tokenData) {
-          tokenCache.set(account.id, tokenData);
+          tokens.set(account.id, tokenData);
           count++;
         }
       }
 
       this.options.logger.log(`Account lease loaded ${count} cloud accounts into cache`);
-      return count;
+      return {
+        count,
+        tokens,
+      };
     } catch (error) {
       this.options.logger.error('Failed to load cloud accounts into token cache', error);
-      return 0;
+      return null;
     }
   }
 
   mapAccountToTokenData(account: CloudAccount): AccountLeaseTokenData | null {
-    if (!account.token) {
+    if (!account.token || account.status === 'expired') {
       return null;
     }
 
     const quota = account.quota;
     const extractedState = buildAccountLeaseQuotaSnapshot(quota);
-    this.options.applyQuotaSnapshot(extractedState);
 
     return {
       account_id: account.id,
@@ -68,10 +68,13 @@ export class AccountLeaseTokenCache {
       session_id: account.token.session_id || this.generateSessionId(),
       upstream_proxy_url: account.token.upstream_proxy_url || account.proxy_url || undefined,
       quota,
+      last_successful_quota_refresh_at: quota?.last_successful_refresh_at,
+      status: account.status ?? 'active',
       model_quotas: extractedState.modelQuotas,
       model_limits: extractedState.modelLimits,
       model_reset_times: extractedState.modelResetTimes,
       model_forwarding_rules: extractedState.modelForwardingRules,
+      last_used: account.last_used,
     };
   }
 

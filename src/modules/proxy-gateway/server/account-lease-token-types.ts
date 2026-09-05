@@ -1,5 +1,5 @@
 import { isString } from 'lodash-es';
-import type { CloudQuotaData } from '@/modules/cloud-account/types';
+import type { CloudAccount, CloudQuotaData } from '@/modules/cloud-account/types';
 
 export interface AccountLeaseTokenData {
   email: string;
@@ -15,10 +15,13 @@ export interface AccountLeaseTokenData {
   session_id?: string;
   upstream_proxy_url?: string;
   quota?: CloudQuotaData;
+  last_successful_quota_refresh_at?: number;
+  status?: CloudAccount['status'];
   model_quotas: Record<string, number>;
   model_limits: Record<string, number>;
   model_reset_times: Record<string, string>;
   model_forwarding_rules: Record<string, string>;
+  last_used?: number;
 }
 
 export function normalizeProjectId(projectId: string | null | undefined): string | undefined {

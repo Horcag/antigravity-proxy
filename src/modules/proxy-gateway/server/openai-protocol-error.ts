@@ -117,10 +117,7 @@ export function mapAnthropicProtocolError(error: unknown): {
   };
 }
 
-export function mapOpenAIProtocolError(
-  error: unknown,
-  options: { preserveUnexpected5xxMessage?: boolean } = {},
-): {
+export function mapOpenAIProtocolError(error: unknown): {
   status: HttpStatus;
   retryAfter?: string;
   error: { message: string; type: OpenAIErrorType; param: string | null; code: string | null };
@@ -138,7 +135,7 @@ export function mapOpenAIProtocolError(
     status,
     retryAfter: upstream?.headers?.retryAfter,
     error: {
-      message: sanitizeMessage(error, status, options),
+      message: sanitizeMessage(error, status),
       type: mapOpenAIErrorType(status),
       param: protocolError.param ?? null,
       code: protocolError.code ?? null,
@@ -220,17 +217,8 @@ function mapOpenAIErrorType(status: HttpStatus): OpenAIErrorType {
   return 'server_error';
 }
 
-function sanitizeMessage(
-  error: unknown,
-  status: HttpStatus,
-  options: { preserveUnexpected5xxMessage?: boolean },
-): string {
-  if (
-    status >= HttpStatus.INTERNAL_SERVER_ERROR &&
-    !options.preserveUnexpected5xxMessage &&
-    !(error instanceof OpenAIProtocolException) &&
-    !(error instanceof UpstreamRequestError)
-  ) {
+function sanitizeMessage(error: unknown, status: HttpStatus): string {
+  if (status >= HttpStatus.INTERNAL_SERVER_ERROR) {
     return 'Internal Server Error';
   }
 

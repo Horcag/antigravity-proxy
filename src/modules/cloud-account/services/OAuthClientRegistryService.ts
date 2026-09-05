@@ -65,7 +65,8 @@ function buildOAuthClientRegistry(): OAuthClientRegistry {
 
   const rawExtraClients = process.env[OAUTH_CLIENTS_ENV];
   if (isString(rawExtraClients) && !isEmpty(rawExtraClients.trim())) {
-    for (const entry of rawExtraClients.split(';')) {
+    const entries = rawExtraClients.split(';');
+    for (const [entryIndex, entry] of entries.entries()) {
       const trimmed = entry.trim();
       if (trimmed === '') {
         continue;
@@ -74,7 +75,7 @@ function buildOAuthClientRegistry(): OAuthClientRegistry {
       const parts = trimmed.split('|').map((part) => part.trim());
       if (parts.length < 3) {
         logger.warn(
-          `[OAuthClientRegistryService] Ignored invalid OAuth client entry in ${OAUTH_CLIENTS_ENV}: ${trimmed}`,
+          `[OAuthClientRegistryService] Ignored OAuth client entry: category=invalid_field_count index=${entryIndex + 1} count=${entries.length}`,
         );
         continue;
       }
@@ -84,7 +85,7 @@ function buildOAuthClientRegistry(): OAuthClientRegistry {
       const clientSecret = parts[2];
       if (key === '' || clientId === '' || clientSecret === '') {
         logger.warn(
-          `[OAuthClientRegistryService] Ignored incomplete OAuth client entry in ${OAUTH_CLIENTS_ENV}: ${trimmed}`,
+          `[OAuthClientRegistryService] Ignored OAuth client entry: category=incomplete_required_fields index=${entryIndex + 1} count=${entries.length}`,
         );
         continue;
       }

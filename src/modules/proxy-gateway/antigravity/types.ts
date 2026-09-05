@@ -228,6 +228,7 @@ export interface GeminiToolDeclaration {
   googleSearch?: Record<string, never>;
   /** Google Search Retrieval Tool */
   googleSearchRetrieval?: Record<string, never>;
+  [key: string]: unknown;
 }
 
 /**
@@ -241,6 +242,7 @@ export interface FunctionDeclaration {
   description?: string;
   /** JSON Schema for parameters */
   parameters?: JsonSchema;
+  [key: string]: unknown;
 }
 
 /**
@@ -253,6 +255,7 @@ export interface FunctionCall {
   args: Record<string, unknown>;
   /** Call ID */
   id?: string;
+  [key: string]: unknown;
 }
 
 /**
@@ -267,6 +270,11 @@ export interface FunctionResponse {
   id?: string;
   /** Media attached to a function response. */
   parts?: GeminiPart[];
+  /** Signals that a non-blocking function will return additional responses. */
+  willContinue?: boolean;
+  /** Controls how a non-blocking function response resumes generation. */
+  scheduling?: 'WHEN_IDLE' | 'SILENT' | 'INTERRUPT';
+  [key: string]: unknown;
 }
 
 export interface GeminiRequest {
@@ -276,16 +284,18 @@ export interface GeminiRequest {
   /** Safety settings */
   safetySettings?: SafetySetting[];
   /** System instruction */
-  systemInstruction?: { parts: { text: string }[] };
+  systemInstruction?: { parts: GeminiPart[]; [key: string]: unknown };
   /** Generation config */
   generationConfig?: GenerationConfig;
   /** Function-calling policy for declared Gemini tools. */
   toolConfig?: { functionCallingConfig: FunctionCallingConfig };
+  [key: string]: unknown;
 }
 
 export interface FunctionCallingConfig {
   mode: 'VALIDATED' | 'NONE' | 'AUTO' | 'ANY';
   allowedFunctionNames?: string[];
+  [key: string]: unknown;
 }
 
 export interface GeminiInternalRequest {
@@ -300,8 +310,9 @@ export interface GeminiInternalRequest {
 }
 
 export interface GeminiContent {
-  role: string;
+  role?: string;
   parts: GeminiPart[];
+  [key: string]: unknown;
 }
 
 export interface GeminiPart {
@@ -316,12 +327,17 @@ export interface GeminiPart {
   functionCall?: FunctionCall;
   /** Function response */
   functionResponse?: FunctionResponse;
+  /** Opaque server-side tool invocation preserved for native Gemini callers. */
+  toolCall?: Record<string, unknown>;
+  /** Opaque server-side tool result preserved for native Gemini callers. */
+  toolResponse?: Record<string, unknown>;
   /** Inline data (images, etc.) */
   inlineData?: {
     mimeType: string;
     data: string;
     displayName?: string;
   };
+  [key: string]: unknown;
 }
 
 // --- Quota Models ---

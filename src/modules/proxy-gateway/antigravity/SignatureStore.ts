@@ -90,6 +90,11 @@ class KeyedSignatureStore {
     if (!entry) {
       return null;
     }
+
+    // A successful read is an LRU touch, but `storedAt` must remain the original
+    // write timestamp so reads cannot extend the entry's TTL.
+    this.entries.delete(storageKey);
+    this.entries.set(storageKey, entry);
     return entry.signature;
   }
 

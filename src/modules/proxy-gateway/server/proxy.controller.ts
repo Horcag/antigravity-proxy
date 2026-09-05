@@ -186,7 +186,8 @@ export class ProxyController {
         data,
       });
     } catch (error) {
-      this.logger.error('Failed to list models', error instanceof Error ? error.stack : undefined);
+      void error;
+      this.logger.error('Failed to list models: operation=list_models reason=upstream_error');
       sendOpenAIProtocolError(res, error);
     }
   }
@@ -1119,6 +1120,7 @@ export class ProxyController {
     const type = this.responsesInputItemType(inputItem);
     if (type === 'reasoning') {
       // Replayed reasoning is model-private context and cannot be represented upstream.
+      this.validateResponsesReasoning(inputItem, index);
       return;
     }
     if (type === 'message') {
@@ -1156,6 +1158,61 @@ export class ProxyController {
       return;
     }
     throw this.invalidRequest('input contains an unsupported item type', 'input');
+  }
+
+  private validateResponsesReasoning(item: Record<string, unknown>, index: number): void {
+    const itemPath = `input[${index}]`;
+    this.requireNonEmptyString(item.id, `${itemPath}.id`);
+
+    if (!Array.isArray(item.summary)) {
+      throw this.invalidRequest('reasoning summary must be an array', `${itemPath}.summary`);
+    }
+    for (const [summaryIndex, summaryValue] of item.summary.entries()) {
+      const summary = this.toRecord(summaryValue);
+      const summaryPath = `${itemPath}.summary[${summaryIndex}]`;
+      if (!summary || summary.type !== 'summary_text' || !isString(summary.text)) {
+        throw this.invalidRequest(
+          'reasoning summary entries must have type summary_text and string text',
+          summaryPath,
+        );
+      }
+    }
+
+    if (Object.hasOwn(item, 'content')) {
+      if (!Array.isArray(item.content)) {
+        throw this.invalidRequest('reasoning content must be an array', `${itemPath}.content`);
+      }
+      for (const [contentIndex, contentValue] of item.content.entries()) {
+        const content = this.toRecord(contentValue);
+        const contentPath = `${itemPath}.content[${contentIndex}]`;
+        if (!content || content.type !== 'reasoning_text' || !isString(content.text)) {
+          throw this.invalidRequest(
+            'reasoning content entries must have type reasoning_text and string text',
+            contentPath,
+          );
+        }
+      }
+    }
+
+    if (
+      Object.hasOwn(item, 'encrypted_content') &&
+      item.encrypted_content !== null &&
+      !isString(item.encrypted_content)
+    ) {
+      throw this.invalidRequest(
+        'reasoning encrypted_content must be a string or null',
+        `${itemPath}.encrypted_content`,
+      );
+    }
+    if (
+      Object.hasOwn(item, 'status') &&
+      !['in_progress', 'completed', 'incomplete'].includes(this.asString(item.status) ?? '')
+    ) {
+      throw this.invalidRequest(
+        'reasoning status must be in_progress, completed, or incomplete',
+        `${itemPath}.status`,
+      );
+    }
   }
 
   private responsesInputItemType(item: Record<string, unknown>): string | null {
@@ -1982,6 +2039,21 @@ export class ProxyController {
     const incomplete = incompleteReason !== null;
     const output: Array<Record<string, unknown>> = [];
     const allocatedOutputIds = new Set<string>();
+    const reasoningContent = choice?.message?.reasoning_content;
+
+    if (isString(reasoningContent) && reasoningContent.trim().length > 0) {
+      output.push({
+        id: this.allocateResponsesOutputId('rs', response.id, allocatedOutputIds),
+        type: 'reasoning',
+        status: incomplete ? 'incomplete' : 'completed',
+        summary: [
+          {
+            type: 'summary_text',
+            text: reasoningContent,
+          },
+        ],
+      });
+    }
 
     if (text) {
       output.push({
@@ -2040,7 +2112,7 @@ export class ProxyController {
   }
 
   private normalizeResponsesId(
-    prefix: 'resp' | 'msg' | 'fc',
+    prefix: 'resp' | 'rs' | 'msg' | 'fc',
     sourceId: string | undefined,
   ): string {
     const normalizedSource = (sourceId ?? 'generated')
@@ -2050,7 +2122,7 @@ export class ProxyController {
   }
 
   private allocateResponsesOutputId(
-    prefix: 'msg' | 'fc',
+    prefix: 'rs' | 'msg' | 'fc',
     sourceId: string | undefined,
     allocatedIds: Set<string>,
   ): string {
@@ -3304,10 +3376,9 @@ export class ProxyController {
     }
     if (error instanceof UpstreamRequestError) {
       return new UpstreamRequestError({
-        message: overrideMessage,
         status: error.status,
         headers: error.headers,
-        body: error.body,
+        reason: error.reason,
       });
     }
     if (error instanceof OpenAIProtocolException) {
@@ -3324,11 +3395,11 @@ export class ProxyController {
     endpoint: string,
     status: HttpStatus,
     message: string,
-    error?: unknown,
+    _error?: unknown,
   ): void {
     const base = `[${endpoint}] status=${status} message=${message}`;
     if (status >= HttpStatus.INTERNAL_SERVER_ERROR) {
-      this.logger.error(base, error instanceof Error ? error.stack : undefined);
+      this.logger.error(base);
       return;
     }
     this.logger.warn(base);

@@ -13,7 +13,10 @@ interface AccountLeaseHydrationPolicyOptions {
   upstream: AccountLeaseUpstream;
   getTokenCache: () => Map<string, AccountLeaseTokenData>;
   logger: AccountLeaseHydrationLogger;
-  persistTokenState?: (accountId: string, tokenData: AccountLeaseTokenData) => Promise<void>;
+  persistTokenState?: (
+    accountId: string,
+    tokenData: AccountLeaseTokenData,
+  ) => Promise<boolean>;
 }
 
 interface HydrateSelectedTokenRequest {
@@ -23,16 +26,34 @@ interface HydrateSelectedTokenRequest {
   fallbackProjectId: string;
 }
 
+type SelectedTokenUseOutcome = 'recorded' | 'stale';
+
+type HydratedSelectedTokenOutcome =
+  | { outcome: 'hydrated'; projectId: string }
+  | { outcome: 'stale' };
+
 export class AccountLeaseHydrationPolicy {
-  private readonly refreshLocks = new Map<string, Promise<void>>();
+  private readonly refreshLocks = new Map<string, Promise<boolean>>();
   private readonly projectIdLocks = new Map<string, Promise<string | undefined>>();
 
   constructor(private readonly options: AccountLeaseHydrationPolicyOptions) {}
 
-  async hydrateSelectedToken(request: HydrateSelectedTokenRequest): Promise<string> {
+  async hydrateSelectedToken(
+    request: HydrateSelectedTokenRequest,
+  ): Promise<HydratedSelectedTokenOutcome> {
     const { accountId, tokenData, nowSeconds, fallbackProjectId } = request;
 
-    await this.refreshSelectedTokenIfNeeded(accountId, tokenData, nowSeconds);
+    if (!this.isCurrentToken(accountId, tokenData)) {
+      return { outcome: 'stale' };
+    }
+
+    if (!(await this.refreshSelectedTokenIfNeeded(accountId, tokenData, nowSeconds))) {
+      return { outcome: 'stale' };
+    }
+
+    if (!this.isCurrentToken(accountId, tokenData)) {
+      return { outcome: 'stale' };
+    }
 
     if (normalizeProjectId(tokenData.project_id) === undefined) {
       tokenData.project_id = undefined;
@@ -41,42 +62,86 @@ export class AccountLeaseHydrationPolicy {
 
     if (!effectiveProjectId) {
       effectiveProjectId = await this.resolveProjectIdWithLock(accountId, tokenData);
+      if (!this.isCurrentToken(accountId, tokenData)) {
+        return { outcome: 'stale' };
+      }
     }
 
     if (!effectiveProjectId) {
       effectiveProjectId = fallbackProjectId;
       this.options.logger.warn(
-        `Using non-persistent fallback project ID for ${tokenData.email}: ${fallbackProjectId}`,
+        'Using non-persistent fallback project ID: operation=project_context reason=fallback_project',
       );
     }
 
-    return effectiveProjectId;
+    return { outcome: 'hydrated', projectId: effectiveProjectId };
+  }
+
+  async recordSelectedTokenUse(
+    accountId: string,
+    tokenData: AccountLeaseTokenData,
+    lastUsed: number,
+  ): Promise<SelectedTokenUseOutcome> {
+    const cachedToken = this.options.getTokenCache().get(accountId);
+    if (cachedToken !== tokenData) {
+      this.options.logger.debug(
+        'Selected token recency update skipped: operation=record_selected_token reason=cache_changed',
+      );
+      return 'stale';
+    }
+
+    try {
+      const persisted = this.options.accountStore.updateLastUsedIfCurrent(
+        accountId,
+        lastUsed,
+        () => this.isCurrentToken(accountId, tokenData),
+      );
+      if (!persisted) {
+        this.options.logger.debug(
+          'Selected token recency update skipped: operation=record_selected_token reason=cache_changed',
+        );
+        return 'stale';
+      }
+      if (!this.isCurrentToken(accountId, tokenData)) {
+        return 'stale';
+      }
+      tokenData.last_used = lastUsed;
+    } catch {
+      this.options.logger.error(
+        'Selected token recency persistence failed: operation=record_selected_token reason=persistence_failed',
+      );
+      if (this.isCurrentToken(accountId, tokenData)) {
+        tokenData.last_used = lastUsed;
+      }
+    }
+
+    return this.isCurrentToken(accountId, tokenData) ? 'recorded' : 'stale';
   }
 
   async refreshSelectedTokenIfNeeded(
     accountId: string,
     tokenData: AccountLeaseTokenData,
     nowSeconds: number,
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (nowSeconds < tokenData.expiry_timestamp - 300) {
-      return;
+      return true;
     }
 
-    await this.runAccountLock(this.refreshLocks, accountId, () =>
+    const refreshed = await this.runAccountLock(this.refreshLocks, accountId, () =>
       this.refreshSelectedTokenLocked(accountId, tokenData, nowSeconds),
     );
-    this.syncTokenDataFromCache(accountId, tokenData);
+    return refreshed && this.isCurrentToken(accountId, tokenData);
   }
 
   async refreshSelectedTokenAfterAuthFailure(
     accountId: string,
     tokenData: AccountLeaseTokenData,
     nowSeconds: number,
-  ): Promise<void> {
-    await this.runAccountLock(this.refreshLocks, accountId, () =>
+  ): Promise<boolean> {
+    const refreshed = await this.runAccountLock(this.refreshLocks, accountId, () =>
       this.refreshSelectedTokenLocked(accountId, tokenData, nowSeconds, true),
     );
-    this.syncTokenDataFromCache(accountId, tokenData);
+    return refreshed && this.isCurrentToken(accountId, tokenData);
   }
 
   async refreshSelectedTokenLocked(
@@ -84,30 +149,36 @@ export class AccountLeaseHydrationPolicy {
     tokenData: AccountLeaseTokenData,
     nowSeconds: number,
     force = false,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const tokenCache = this.options.getTokenCache();
     const latestToken = tokenCache.get(accountId);
-    if (!force && latestToken && nowSeconds < latestToken.expiry_timestamp - 300) {
-      Object.assign(tokenData, latestToken);
+    if (latestToken !== tokenData) {
       this.options.logger.debug(
-        `Access token already refreshed by another request for ${tokenData.email}`,
+        'Token refresh skipped: operation=refresh_token reason=cache_changed',
       );
-      return;
+      return false;
     }
 
-    const tokenToRefresh = latestToken ?? tokenData;
-    this.options.logger.log(`Access token near expiry for ${tokenToRefresh.email}; refreshing`);
+    if (!force && latestToken && nowSeconds < latestToken.expiry_timestamp - 300) {
+      this.options.logger.debug(
+        'Token refresh skipped: operation=refresh_token reason=already_refreshed',
+      );
+      return true;
+    }
+
+    const tokenToRefresh = latestToken;
+    this.options.logger.log('Token refresh started: operation=refresh_token reason=refresh_required');
     try {
       const refreshedToken = await this.options.upstream.refreshAccessToken(
         tokenToRefresh.refresh_token,
         tokenToRefresh.upstream_proxy_url,
         tokenToRefresh.oauth_client_key,
       );
-      if (tokenCache.get(accountId) !== tokenToRefresh) {
+      if (!this.isCurrentToken(accountId, tokenToRefresh)) {
         this.options.logger.debug(
-          `Access token refresh result ignored for ${tokenToRefresh.email}; account cache changed`,
+          'Token refresh result ignored: operation=refresh_token reason=cache_changed',
         );
-        return;
+        return false;
       }
       tokenToRefresh.access_token = refreshedToken.access_token;
       tokenToRefresh.refresh_token = refreshedToken.refresh_token ?? tokenToRefresh.refresh_token;
@@ -119,26 +190,29 @@ export class AccountLeaseHydrationPolicy {
         refreshedToken.oauth_client_key,
       );
       Object.assign(tokenData, tokenToRefresh);
-      if (tokenCache.get(accountId) !== tokenToRefresh) {
+      if (!this.isCurrentToken(accountId, tokenToRefresh)) {
         this.options.logger.debug(
-          `Access token persistence skipped for ${tokenToRefresh.email}; account cache changed`,
+          'Token refresh persistence skipped: operation=refresh_token reason=cache_changed',
         );
-        return;
+        return false;
       }
-      await this.saveTokenState(accountId, tokenToRefresh);
-      if (tokenCache.get(accountId) !== tokenToRefresh) {
+      if (
+        !(await this.saveTokenState(accountId, tokenToRefresh)) ||
+        !this.isCurrentToken(accountId, tokenToRefresh)
+      ) {
         this.options.logger.debug(
-          `Access token cache update skipped for ${tokenToRefresh.email}; account cache changed`,
+          'Token refresh cache update skipped: operation=refresh_token reason=cache_changed',
         );
-        return;
+        return false;
       }
       tokenCache.set(accountId, tokenToRefresh);
-      this.options.logger.log(`Access token refreshed for ${tokenToRefresh.email}`);
-    } catch (error) {
+      this.options.logger.log('Token refresh finished: operation=refresh_token reason=success');
+      return true;
+    } catch {
       this.options.logger.error(
-        `Failed to refresh access token for ${tokenToRefresh.email}`,
-        error,
+        'Token refresh failed: operation=refresh_token reason=refresh_failed',
       );
+      return this.isCurrentToken(accountId, tokenToRefresh);
     }
   }
 
@@ -146,6 +220,10 @@ export class AccountLeaseHydrationPolicy {
     accountId: string,
     tokenData: AccountLeaseTokenData,
   ): Promise<string | undefined> {
+    if (!this.isCurrentToken(accountId, tokenData)) {
+      return undefined;
+    }
+
     const existingProjectId = normalizeProjectId(
       this.options.getTokenCache().get(accountId)?.project_id,
     );
@@ -157,7 +235,7 @@ export class AccountLeaseHydrationPolicy {
     const projectId = await this.runAccountLock(this.projectIdLocks, accountId, () =>
       this.resolveProjectIdLocked(accountId, tokenData),
     );
-    if (projectId) {
+    if (projectId && this.isCurrentToken(accountId, tokenData)) {
       tokenData.project_id = projectId;
     }
 
@@ -186,9 +264,8 @@ export class AccountLeaseHydrationPolicy {
   }
 
   syncTokenDataFromCache(accountId: string, tokenData: AccountLeaseTokenData): void {
-    const latestToken = this.options.getTokenCache().get(accountId);
-    if (latestToken) {
-      Object.assign(tokenData, latestToken);
+    if (!this.isCurrentToken(accountId, tokenData)) {
+      return;
     }
   }
 
@@ -197,7 +274,11 @@ export class AccountLeaseHydrationPolicy {
     tokenData: AccountLeaseTokenData,
   ): Promise<string | undefined> {
     const tokenCache = this.options.getTokenCache();
-    const latestToken = tokenCache.get(accountId) ?? tokenData;
+    const latestToken = tokenCache.get(accountId);
+    if (latestToken !== tokenData) {
+      return undefined;
+    }
+
     const existingProjectId = normalizeProjectId(latestToken.project_id);
     if (existingProjectId) {
       tokenData.project_id = existingProjectId;
@@ -209,31 +290,56 @@ export class AccountLeaseHydrationPolicy {
         latestToken.access_token,
         latestToken.upstream_proxy_url,
       );
+      if (!this.isCurrentToken(accountId, latestToken)) {
+        this.options.logger.debug(
+          'Project ID result ignored: operation=project_context reason=cache_changed',
+        );
+        return undefined;
+      }
+
       const normalizedProjectId = normalizeProjectId(fetchedProjectId);
       if (normalizedProjectId) {
         latestToken.project_id = normalizedProjectId;
         tokenData.project_id = normalizedProjectId;
-        await this.saveTokenState(accountId, latestToken);
+        if (!this.isCurrentToken(accountId, latestToken)) {
+          return undefined;
+        }
+        if (
+          !(await this.saveTokenState(accountId, latestToken)) ||
+          !this.isCurrentToken(accountId, latestToken)
+        ) {
+          return undefined;
+        }
         tokenCache.set(accountId, latestToken);
         this.options.logger.log(
-          `Resolved project ID for ${latestToken.email}: ${normalizedProjectId}`,
+          'Project ID resolved: operation=project_context reason=project_resolved',
         );
         return normalizedProjectId;
       }
 
       this.options.logger.warn(
-        `Project ID unavailable for ${latestToken.email}; continuing without project context`,
+        'Project ID unavailable: operation=project_context reason=project_unavailable',
       );
-    } catch (error) {
-      this.options.logger.warn(`Unable to resolve project ID for ${latestToken.email}`, error);
+    } catch {
+      this.options.logger.warn(
+        'Project ID resolution failed: operation=project_context reason=project_lookup_failed',
+      );
     }
 
     return undefined;
   }
 
-  async persistTokenState(accountId: string, tokenData: AccountLeaseTokenData): Promise<void> {
+  async persistTokenState(accountId: string, tokenData: AccountLeaseTokenData): Promise<boolean> {
     try {
+      if (!this.isCurrentToken(accountId, tokenData)) {
+        return false;
+      }
+
       const persistedAccount = await this.options.accountStore.getAccount(accountId);
+      if (!this.isCurrentToken(accountId, tokenData)) {
+        return false;
+      }
+
       if (persistedAccount?.token) {
         const updatedToken = {
           ...persistedAccount.token,
@@ -251,10 +357,19 @@ export class AccountLeaseHydrationPolicy {
           upstream_proxy_url:
             tokenData.upstream_proxy_url ?? persistedAccount.token.upstream_proxy_url,
         };
-        await this.options.accountStore.updateToken(accountId, updatedToken);
+        if (!this.isCurrentToken(accountId, tokenData)) {
+          return false;
+        }
+        return this.options.accountStore.updateTokenIfCurrent(accountId, updatedToken, () =>
+          this.isCurrentToken(accountId, tokenData),
+        );
       }
-    } catch (error) {
-      this.options.logger.error('Failed to persist token state to database', error);
+      return false;
+    } catch {
+      this.options.logger.error(
+        'Token persistence failed: operation=persist_token reason=persistence_failed',
+      );
+      return false;
     }
   }
 
@@ -265,12 +380,23 @@ export class AccountLeaseHydrationPolicy {
     return this.options.upstream.normalizeRefreshedOAuthClientKey(currentToken, refreshedClientKey);
   }
 
-  private async saveTokenState(accountId: string, tokenData: AccountLeaseTokenData): Promise<void> {
-    if (this.options.persistTokenState) {
-      await this.options.persistTokenState(accountId, tokenData);
-      return;
+  private async saveTokenState(
+    accountId: string,
+    tokenData: AccountLeaseTokenData,
+  ): Promise<boolean> {
+    if (!this.isCurrentToken(accountId, tokenData)) {
+      return false;
     }
 
-    await this.persistTokenState(accountId, tokenData);
+    if (this.options.persistTokenState) {
+      const persisted = await this.options.persistTokenState(accountId, tokenData);
+      return persisted !== false && this.isCurrentToken(accountId, tokenData);
+    }
+
+    return this.persistTokenState(accountId, tokenData);
+  }
+
+  private isCurrentToken(accountId: string, tokenData: AccountLeaseTokenData): boolean {
+    return this.options.getTokenCache().get(accountId) === tokenData;
   }
 }

@@ -51,25 +51,34 @@ const TIER_PREFERENCE = ['tiered', 'high', 'medium', 'low', 'extra-low'] as cons
 type TieredModelSuffix = (typeof TIER_PREFERENCE)[number];
 export type AccountModelAvailability = 'unknown' | 'available' | 'unavailable';
 
-export class AccountLeaseModelPolicy {
-  private readonly unrequestableModels = new Set<string>();
+interface AccountLeaseModelReadOptions {
+  now?: number;
+  readOnly?: boolean;
+}
 
+export class AccountLeaseModelPolicy {
   constructor(private readonly options: AccountLeaseModelPolicyOptions) {}
 
-  markModelUnrequestable(modelId: string): void {
+  markModelUnrequestable(accountId: string, modelId: string): void {
     const normalized = normalizeModelId(modelId)?.toLowerCase();
-    if (!normalized || this.unrequestableModels.has(normalized)) {
+    if (
+      !accountId ||
+      !normalized ||
+      proxyModelAvailabilityStore.hasHardCapabilityFailure(accountId, normalized)
+    ) {
       return;
     }
-    this.unrequestableModels.add(normalized);
+    proxyModelAvailabilityStore.mark(accountId, normalized, 'model_not_supported');
     this.options.logger.log(
-      `[Unrequestable-Model] upstream rejected ${normalized}; future requests will use a family sibling when available`,
+      `[Unrequestable-Model] account=${accountId} upstream rejected ${normalized}; future requests will use an advertised sibling when available`,
     );
   }
 
-  isModelUnrequestable(modelId: string): boolean {
+  isModelUnrequestable(accountId: string, modelId: string): boolean {
     const normalized = normalizeModelId(modelId)?.toLowerCase();
-    return normalized ? this.unrequestableModels.has(normalized) : false;
+    return normalized
+      ? proxyModelAvailabilityStore.hasHardCapabilityFailure(accountId, normalized)
+      : false;
   }
 
   resolveUnrequestableSibling(
@@ -78,7 +87,7 @@ export class AccountLeaseModelPolicy {
     tokenData?: AccountLeaseTokenData,
   ): string | undefined {
     const normalized = normalizeModelId(modelId)?.toLowerCase();
-    if (!normalized || !this.unrequestableModels.has(normalized)) {
+    if (!normalized || !this.isModelUnrequestable(accountId, normalized)) {
       return undefined;
     }
 
@@ -100,7 +109,6 @@ export class AccountLeaseModelPolicy {
       const collectedNormalized = normalizeModelId(collectedModel)?.toLowerCase();
       if (
         !collectedNormalized ||
-        this.unrequestableModels.has(collectedNormalized) ||
         !proxyModelAvailabilityStore.isAvailable(accountId, collectedNormalized)
       ) {
         continue;
@@ -277,7 +285,11 @@ export class AccountLeaseModelPolicy {
     return resolvedModel;
   }
 
-  getModelAvailabilityForAccount(accountId: string, mappedModel: string): AccountModelAvailability {
+  getModelAvailabilityForAccount(
+    accountId: string,
+    mappedModel: string,
+    options: AccountLeaseModelReadOptions = {},
+  ): AccountModelAvailability {
     const tokenData = this.options.getTokenCache().get(accountId);
     if (!tokenData) {
       return 'unknown';
@@ -288,10 +300,7 @@ export class AccountLeaseModelPolicy {
       return 'unknown';
     }
 
-    const availableModels = this.filterCapabilityModels(
-      accountId,
-      advertisedModels,
-    );
+    const availableModels = this.filterCapabilityModels(accountId, advertisedModels, options);
     if (availableModels.size === 0) {
       return 'unavailable';
     }
@@ -306,7 +315,11 @@ export class AccountLeaseModelPolicy {
       : 'unavailable';
   }
 
-  isModelRequestableForAccount(accountId: string, mappedModel: string): boolean {
+  isModelRequestableForAccount(
+    accountId: string,
+    mappedModel: string,
+    options: AccountLeaseModelReadOptions = {},
+  ): boolean {
     const tokenData = this.options.getTokenCache().get(accountId);
     if (!tokenData) {
       return true;
@@ -315,7 +328,7 @@ export class AccountLeaseModelPolicy {
     if (advertisedModels.size === 0) {
       return true;
     }
-    const requestableModels = this.filterRequestableModels(accountId, advertisedModels);
+    const requestableModels = this.filterRequestableModels(accountId, advertisedModels, options);
     const normalizedMappedModel = normalizeModelId(mappedModel)?.toLowerCase();
     return Boolean(
       normalizedMappedModel &&
@@ -328,13 +341,14 @@ export class AccountLeaseModelPolicy {
    * (forwarding rules, display presets, dynamic candidates, tiered family)
    * can land on a model the generation API refuses to serve.
    */
-  private filterRequestableModels(accountId: string, models: Set<string>): Set<string> {
+  private filterRequestableModels(
+    accountId: string,
+    models: Set<string>,
+    options: AccountLeaseModelReadOptions = {},
+  ): Set<string> {
     const filtered = new Set<string>();
     for (const modelId of models) {
-      if (
-        !this.unrequestableModels.has(modelId) &&
-        proxyModelAvailabilityStore.isAvailable(accountId, modelId)
-      ) {
+      if (this.isModelAvailable(accountId, modelId, options)) {
         filtered.add(modelId);
       }
     }
@@ -352,24 +366,43 @@ export class AccountLeaseModelPolicy {
     publicModelId: string,
   ): boolean {
     return (
-      !this.unrequestableModels.has(providerModelId) &&
-      !this.unrequestableModels.has(publicModelId) &&
       proxyModelAvailabilityStore.isCapabilityAvailable(accountId, providerModelId) &&
       proxyModelAvailabilityStore.isCapabilityAvailable(accountId, publicModelId)
     );
   }
 
-  private filterCapabilityModels(accountId: string, models: Set<string>): Set<string> {
+  private filterCapabilityModels(
+    accountId: string,
+    models: Set<string>,
+    options: AccountLeaseModelReadOptions = {},
+  ): Set<string> {
     const filtered = new Set<string>();
     for (const modelId of models) {
-      if (
-        !this.unrequestableModels.has(modelId) &&
-        proxyModelAvailabilityStore.isCapabilityAvailable(accountId, modelId)
-      ) {
+      if (this.isModelCapabilityAvailable(accountId, modelId, options)) {
         filtered.add(modelId);
       }
     }
     return filtered;
+  }
+
+  private isModelAvailable(
+    accountId: string,
+    modelId: string,
+    options: AccountLeaseModelReadOptions,
+  ): boolean {
+    return options.readOnly
+      ? proxyModelAvailabilityStore.peekIsAvailable(accountId, modelId, options.now)
+      : proxyModelAvailabilityStore.isAvailable(accountId, modelId, options.now);
+  }
+
+  private isModelCapabilityAvailable(
+    accountId: string,
+    modelId: string,
+    options: AccountLeaseModelReadOptions,
+  ): boolean {
+    return options.readOnly
+      ? !proxyModelAvailabilityStore.peekHasHardCapabilityFailure(accountId, modelId, options.now)
+      : proxyModelAvailabilityStore.isCapabilityAvailable(accountId, modelId, options.now);
   }
 
   private resolveAvailableModel(

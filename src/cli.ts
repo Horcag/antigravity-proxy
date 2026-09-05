@@ -204,6 +204,39 @@ async function run(parsed: ParsedArgs): Promise<void> {
     return;
   }
 
+  if (primary === 'accounts' && secondary === 'preferred') {
+    const action = parsed.command[2];
+    if (action === 'get') {
+      writeJson(await requestAdmin(options, '/admin/accounts/preferred'));
+      return;
+    }
+
+    if (action === 'set') {
+      const accountId = getStringOption(options, 'id') ?? parsed.command[3];
+      if (!accountId) {
+        throw new Error('Account id is required: accounts preferred set --id <account-id>');
+      }
+      writeJson(
+        await requestAdmin(options, '/admin/accounts/preferred', {
+          method: 'PUT',
+          body: JSON.stringify({ account_id: accountId }),
+        }),
+      );
+      return;
+    }
+
+    if (action === 'clear') {
+      writeJson(
+        await requestAdmin(options, '/admin/accounts/preferred', {
+          method: 'DELETE',
+        }),
+      );
+      return;
+    }
+
+    throw new Error('Usage: antigravity-proxy accounts preferred get|set|clear');
+  }
+
   if (primary === 'accounts' && secondary === 'remove') {
     const accountId = getStringOption(options, 'id') ?? parsed.command[2];
     if (!accountId) {
@@ -234,6 +267,11 @@ async function run(parsed: ParsedArgs): Promise<void> {
         method: 'POST',
       }),
     );
+    return;
+  }
+
+  if (primary === 'accounts' && secondary === 'quota-diagnostics') {
+    writeJson(await requestAdmin(options, '/admin/accounts/quota-diagnostics'));
     return;
   }
 
@@ -269,7 +307,8 @@ async function run(parsed: ParsedArgs): Promise<void> {
       '  antigravity-proxy serve',
       '  antigravity-proxy health [--url http://127.0.0.1:8045]',
       '  antigravity-proxy status [--admin-key key] [--url http://127.0.0.1:8045]',
-      '  antigravity-proxy accounts list|import|export|remove|reload|refresh-quota',
+      '  antigravity-proxy accounts list|import|export|remove|reload|refresh-quota|quota-diagnostics',
+      '  antigravity-proxy accounts preferred get|set|clear',
       '  antigravity-proxy oauth url|exchange',
     ].join('\n'),
   );

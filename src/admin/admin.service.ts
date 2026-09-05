@@ -10,6 +10,7 @@ import {
 import { CloudAccountRepo } from '@/modules/cloud-account/persistence/cloudHandler';
 import { GoogleAPIService } from '@/modules/cloud-account/services/GoogleAPIService';
 import { AccountLeaseService } from '@/modules/proxy-gateway/server/account-lease.service';
+import { ConfigManager, ConfigPersistenceError } from '@/modules/config/ipc/manager';
 import { getDatabasePath } from '@/shared/paths';
 
 export interface SanitizedCloudAccount {
@@ -63,6 +64,20 @@ export interface OAuthExchangeRequest {
   fetch_quota?: boolean;
 }
 
+export interface SanitizedPreferredAccount {
+  id: string;
+  provider: CloudAccount['provider'];
+  name: string | null;
+  avatar_url: string | null;
+  status: CloudAccount['status'];
+  is_active: boolean;
+}
+
+export interface PreferredAccountResult {
+  preferred_account_id: string | null;
+  account: SanitizedPreferredAccount | null;
+}
+
 function requireObjectPayload(payload: unknown): Record<string, unknown> {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
     throw new BadRequestException('Expected a JSON object payload');
@@ -92,6 +107,23 @@ function normalizeImportPayload(payload: unknown): CloudAccountExport {
   return parsed.data;
 }
 
+/**
+ * Account read-backs may confirm the selected proxy without returning credentials
+ * or request-specific URL components. Invalid configured values remain opaque.
+ */
+function toSafeProxyRepresentation(proxyUrl: string | undefined): string | undefined {
+  if (!proxyUrl) {
+    return undefined;
+  }
+
+  try {
+    const url = new URL(proxyUrl);
+    return `${url.protocol}//${url.hostname}${url.port ? `:${url.port}` : ''}`;
+  } catch {
+    return 'configured';
+  }
+}
+
 function toSanitizedAccount(account: CloudAccount): SanitizedCloudAccount {
   return {
     id: account.id,
@@ -105,7 +137,7 @@ function toSanitizedAccount(account: CloudAccount): SanitizedCloudAccount {
     status: account.status ?? 'active',
     status_reason: account.status_reason,
     is_active: account.is_active ?? false,
-    proxy_url: account.proxy_url,
+    proxy_url: toSafeProxyRepresentation(account.proxy_url),
     token: {
       has_access_token: account.token.access_token.length > 0,
       has_refresh_token: account.token.refresh_token.length > 0,
@@ -117,7 +149,7 @@ function toSanitizedAccount(account: CloudAccount): SanitizedCloudAccount {
       oauth_client_key: account.token.oauth_client_key,
       session_id: account.token.session_id,
       has_id_token: Boolean(account.token.id_token),
-      upstream_proxy_url: account.token.upstream_proxy_url,
+      upstream_proxy_url: toSafeProxyRepresentation(account.token.upstream_proxy_url),
       is_gcp_tos: account.token.is_gcp_tos,
     },
   };
@@ -134,9 +166,20 @@ function toExportAccount(
     avatar_url: account.avatar_url,
     token: includeTokens ? account.token : undefined,
     quota: account.quota,
-    proxy_url: account.proxy_url,
+    proxy_url: includeTokens ? account.proxy_url : toSafeProxyRepresentation(account.proxy_url),
     status: account.status,
     status_reason: account.status_reason,
+  };
+}
+
+function toSanitizedPreferredAccount(account: CloudAccount): SanitizedPreferredAccount {
+  return {
+    id: account.id,
+    provider: account.provider,
+    name: account.name ?? null,
+    avatar_url: account.avatar_url ?? null,
+    status: account.status ?? 'active',
+    is_active: account.is_active ?? false,
   };
 }
 
@@ -161,6 +204,74 @@ export class AdminService {
     return accounts.map((account) => toSanitizedAccount(account));
   }
 
+  async getPreferredAccount(): Promise<PreferredAccountResult> {
+    const preferredAccountId = ConfigManager.loadConfig().proxy.preferred_account_id.trim();
+    if (!preferredAccountId) {
+      return {
+        preferred_account_id: null,
+        account: null,
+      };
+    }
+
+    const account = await CloudAccountRepo.getAccount(preferredAccountId);
+    return {
+      preferred_account_id: preferredAccountId,
+      account: account ? toSanitizedPreferredAccount(account) : null,
+    };
+  }
+
+  async setPreferredAccount(accountId: string): Promise<PreferredAccountResult> {
+    const normalizedAccountId = accountId.trim();
+    if (!normalizedAccountId) {
+      throw new BadRequestException('Account id is required');
+    }
+
+    const account = await CloudAccountRepo.getAccount(normalizedAccountId);
+    if (!account) {
+      throw new NotFoundException('Account not found');
+    }
+
+    await this.persistPreferredAccount(normalizedAccountId);
+    return {
+      preferred_account_id: normalizedAccountId,
+      account: toSanitizedPreferredAccount(account),
+    };
+  }
+
+  async clearPreferredAccount(): Promise<PreferredAccountResult> {
+    await this.persistPreferredAccount();
+    return {
+      preferred_account_id: null,
+      account: null,
+    };
+  }
+
+  private async persistPreferredAccount(accountId?: string): Promise<void> {
+    const persist = async () => {
+      if (accountId === undefined) {
+        await ConfigManager.setPreferredAccount();
+      } else {
+        await ConfigManager.setPreferredAccount(accountId);
+      }
+    };
+    const updateLease = () => {
+      if (accountId === undefined) {
+        this.accountLeaseService.setPreferredAccount();
+      } else {
+        this.accountLeaseService.setPreferredAccount(accountId);
+      }
+    };
+    try {
+      await persist();
+    } catch (error) {
+      if (error instanceof ConfigPersistenceError && error.committed) {
+        updateLease();
+      }
+      throw error;
+    }
+    updateLease();
+  }
+
   async importAccounts(payload: unknown): Promise<ImportAccountsResult> {
     const imported: SanitizedCloudAccount[] = [];
     let skipped = 0;
@@ -174,20 +285,30 @@ export class AdminService {
       }
 
       const existing = await CloudAccountRepo.getAccountByEmail(account.email);
+      const name = account.name === undefined ? (existing?.name ?? null) : account.name;
+      const avatarUrl =
+        account.avatar_url === undefined ? (existing?.avatar_url ?? null) : account.avatar_url;
+      const quota = account.quota === undefined ? existing?.quota : account.quota;
+      const statusReason =
+        account.status_reason === undefined ? existing?.status_reason : account.status_reason;
+      const proxyUrl =
+        account.proxy_url === undefined
+          ? existing?.proxy_url
+          : (account.proxy_url ?? undefined);
       const fullAccount = CloudAccountSchema.parse({
         id: existing?.id ?? uuidv4(),
         provider: account.provider,
         email: account.email,
-        name: account.name ?? null,
-        avatar_url: account.avatar_url ?? null,
+        name,
+        avatar_url: avatarUrl,
         token: account.token,
-        quota: account.quota,
+        quota,
         created_at: existing?.created_at ?? now,
-        last_used: now,
+        last_used: existing?.last_used ?? now,
         status: account.status ?? existing?.status ?? 'active',
-        status_reason: account.status_reason,
+        status_reason: statusReason,
         is_active: existing?.is_active ?? false,
-        proxy_url: account.proxy_url ?? undefined,
+        proxy_url: proxyUrl,
       });
 
       await CloudAccountRepo.addAccount(fullAccount);
@@ -240,6 +361,10 @@ export class AdminService {
       refreshed: true,
       quota: await this.accountLeaseService.refreshQuotaCatalog({ force }),
     };
+  }
+
+  getQuotaDiagnostics() {
+    return this.accountLeaseService.getQuotaDiagnostics();
   }
 
   getOAuthUrl(oauthClientKey?: string): { url: string } {

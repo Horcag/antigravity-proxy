@@ -1,9 +1,17 @@
-import { Body, Controller, Delete, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Put, Query, UseGuards } from '@nestjs/common';
 import { AdminGuard } from '@/modules/proxy-gateway/server/guards/admin.guard';
 import { AdminService, OAuthExchangeRequest } from './admin.service';
 
 function isExplicitTrue(value: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes';
+}
+
+function preferredAccountIdFromBody(body: unknown): string {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return '';
+  }
+  const accountId = (body as Record<string, unknown>).account_id;
+  return typeof accountId === 'string' ? accountId : '';
 }
 
 @Controller()
@@ -27,6 +35,30 @@ export class AdminController {
   @UseGuards(AdminGuard)
   listAccounts() {
     return this.adminService.listAccounts();
+  }
+
+  @Get('admin/accounts/preferred')
+  @UseGuards(AdminGuard)
+  getPreferredAccount() {
+    return this.adminService.getPreferredAccount();
+  }
+
+  @Put('admin/accounts/preferred')
+  @UseGuards(AdminGuard)
+  setPreferredAccountFromBody(@Body() body: unknown) {
+    return this.adminService.setPreferredAccount(preferredAccountIdFromBody(body));
+  }
+
+  @Put('admin/accounts/preferred/:accountId')
+  @UseGuards(AdminGuard)
+  setPreferredAccountFromPath(@Param('accountId') accountId: string) {
+    return this.adminService.setPreferredAccount(accountId);
+  }
+
+  @Delete('admin/accounts/preferred')
+  @UseGuards(AdminGuard)
+  clearPreferredAccount() {
+    return this.adminService.clearPreferredAccount();
   }
 
   @Post('admin/accounts/import')
@@ -57,6 +89,12 @@ export class AdminController {
   @UseGuards(AdminGuard)
   refreshQuotaCatalog(@Query('force') force?: string) {
     return this.adminService.refreshQuotaCatalog(isExplicitTrue(force));
+  }
+
+  @Get('admin/accounts/quota-diagnostics')
+  @UseGuards(AdminGuard)
+  quotaDiagnostics() {
+    return this.adminService.getQuotaDiagnostics();
   }
 
   @Get('admin/oauth/url')

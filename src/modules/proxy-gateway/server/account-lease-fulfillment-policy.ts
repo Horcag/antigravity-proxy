@@ -28,16 +28,27 @@ export class AccountLeaseFulfillmentPolicy {
     const { accountId, tokenData, nowSeconds, sessionKey } = request;
 
     try {
-      const effectiveProjectId = await this.options.hydrationPolicy.hydrateSelectedToken({
+      const hydrationResult = await this.options.hydrationPolicy.hydrateSelectedToken({
         accountId,
         tokenData,
         nowSeconds,
         fallbackProjectId: this.options.resolveFallbackProjectId(),
       });
+      if (hydrationResult.outcome === 'stale') {
+        return null;
+      }
+
+      const selectedTokenUse = await this.options.hydrationPolicy.recordSelectedTokenUse(
+        accountId,
+        tokenData,
+        nowSeconds,
+      );
+      if (selectedTokenUse === 'stale') {
+        return null;
+      }
 
       this.options.bindSession(sessionKey, accountId, Date.now() + this.options.stickySessionTtlMs);
 
-      const timestamp = Date.now();
       return {
         id: accountId,
         provider: 'google',
@@ -49,13 +60,13 @@ export class AccountLeaseFulfillmentPolicy {
           token_type: tokenData.token_type,
           expires_in: tokenData.expires_in,
           expiry_timestamp: tokenData.expiry_timestamp,
-          project_id: effectiveProjectId,
+          project_id: hydrationResult.projectId,
           oauth_client_key: tokenData.oauth_client_key,
           session_id: tokenData.session_id,
           upstream_proxy_url: tokenData.upstream_proxy_url,
         },
-        created_at: timestamp,
-        last_used: timestamp,
+        created_at: nowSeconds,
+        last_used: nowSeconds,
       };
     } catch (error) {
       this.options.logger.error('Failed to finalize selected account token', error);

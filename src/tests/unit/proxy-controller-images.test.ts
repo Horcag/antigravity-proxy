@@ -65,7 +65,7 @@ describe('ProxyController OpenAI image endpoints', () => {
 
     expect(reply.statusCode).toBe(502);
     expect(reply.sentBody.error).toMatchObject({
-      message: 'Upstream did not return inline image data',
+      message: 'Internal Server Error',
       type: 'server_error',
     });
   });

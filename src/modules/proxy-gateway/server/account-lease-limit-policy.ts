@@ -13,6 +13,7 @@ export interface AccountLeaseUpstreamErrorParams {
   status?: number;
   retryAfter?: string;
   body?: string;
+  reason?: RateLimitReason;
   model?: string;
 }
 
@@ -39,8 +40,16 @@ interface AccountLeaseLimitPolicyOptions {
   rateLimitTracker?: RateLimitTracker;
 }
 
+export interface ActiveAccountCooldown {
+  accountId: string;
+  reason: string;
+  unavailableUntil: number;
+  remainingSeconds: number;
+}
+
 export class AccountLeaseLimitPolicy {
   private readonly accountCooldowns = new Map<string, number>();
+  private readonly accountCooldownReasons = new Map<string, string>();
   private readonly rateLimitTracker: RateLimitTracker;
 
   constructor(private readonly options: AccountLeaseLimitPolicyOptions) {
@@ -57,7 +66,34 @@ export class AccountLeaseLimitPolicy {
 
   clearAllRateLimits(): void {
     this.accountCooldowns.clear();
+    this.accountCooldownReasons.clear();
     this.rateLimitTracker.clearAll();
+  }
+
+  getActiveAccountCooldowns(now = Date.now()): ActiveAccountCooldown[] {
+    for (const [accountId, unavailableUntil] of this.accountCooldowns) {
+      if (unavailableUntil <= now) {
+        this.accountCooldowns.delete(accountId);
+        this.accountCooldownReasons.delete(accountId);
+      }
+    }
+    return this.peekActiveAccountCooldowns(now);
+  }
+
+  peekActiveAccountCooldowns(now = Date.now()): ActiveAccountCooldown[] {
+    const active: ActiveAccountCooldown[] = [];
+    for (const [accountId, unavailableUntil] of this.accountCooldowns) {
+      if (unavailableUntil <= now) {
+        continue;
+      }
+      active.push({
+        accountId,
+        reason: this.accountCooldownReasons.get(accountId) ?? 'rate_limited',
+        unavailableUntil,
+        remainingSeconds: Math.max(0, Math.ceil((unavailableUntil - now) / 1000)),
+      });
+    }
+    return active;
   }
 
   markModelSuccess(accountIdOrEmail: string, model: string): void {
@@ -91,12 +127,12 @@ export class AccountLeaseLimitPolicy {
       parseRetryDelayMilliseconds(params.body) !== null;
 
     if (!hasExplicitRetryWindow && (params.status ?? 0) === 429) {
-      const reason = this.detectRateLimitReasonFromBody(params.body);
+      const reason = params.reason ?? this.detectRateLimitReasonFromBody(params.body);
       const shouldAttemptPreciseLockout =
         reason === RateLimitReason.QuotaExhausted || reason === RateLimitReason.Unknown;
 
       if (!shouldAttemptPreciseLockout) {
-        this.trackParsedError(params, accountId, normalizedModel, false);
+        this.trackParsedError(params, accountId, normalizedModel, true);
         return;
       }
 
@@ -133,6 +169,7 @@ export class AccountLeaseLimitPolicy {
       status: params.status,
       retryAfter: params.retryAfter,
       body: params.body,
+      reason: params.reason,
       model: normalizedModel,
       backoffSteps: this.options.getCircuitBreakerBackoffSteps(),
     });
@@ -148,11 +185,12 @@ export class AccountLeaseLimitPolicy {
         parsed.reason === RateLimitReason.ModelCapacityExhausted);
     if (!isModelScoped) {
       this.accountCooldowns.set(accountId, Date.now() + parsed.retryAfterSec * 1000);
+      this.accountCooldownReasons.set(accountId, parsed.reason);
     }
 
     if (logResult) {
       this.options.logger.warn(
-        `Recorded upstream limit for account ${accountId}: reason=${parsed.reason}, wait=${parsed.retryAfterSec}s, model=${parsed.model ?? 'n/a'}`,
+        `Recorded upstream limit: operation=account_lease reason=${parsed.reason} cooldown_seconds=${parsed.retryAfterSec}`,
       );
     }
   }
@@ -189,8 +227,9 @@ export class AccountLeaseLimitPolicy {
     const cooldownUntil = Date.now() + durationMs;
 
     this.accountCooldowns.set(accountId, cooldownUntil);
+    this.accountCooldownReasons.set(accountId, reason.replace(' ', '_'));
     this.options.logger.warn(
-      `Applied ${reason} cooldown: source=${accountIdOrEmail}, accountId=${accountId}, until=${new Date(cooldownUntil).toISOString()}`,
+      `Applied account cooldown: operation=account_lease reason=${reason} cooldown_seconds=${Math.ceil(durationMs / 1000)}`,
     );
   }
 }

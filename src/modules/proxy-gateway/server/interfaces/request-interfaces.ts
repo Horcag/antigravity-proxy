@@ -1,4 +1,10 @@
-import type { GroundingMetadata } from '../../antigravity/types';
+import type {
+  FunctionCall,
+  FunctionCallingConfig,
+  FunctionResponse,
+  GeminiToolDeclaration,
+  GroundingMetadata,
+} from '../../antigravity/types';
 
 export interface OpenAIChatRequest {
   model: string;
@@ -191,15 +197,24 @@ export interface AnthropicImageSource {
 }
 
 export interface GeminiContent {
-  role: string;
+  role?: string;
   parts: GeminiPart[];
+  [key: string]: unknown;
 }
 
 export interface GeminiPart {
   text?: string;
   inlineData?: GeminiInlineData;
+  thought?: boolean;
   thoughtSignature?: string;
   thought_signature?: string;
+  functionCall?: FunctionCall;
+  functionResponse?: FunctionResponse;
+  /** Opaque server-side tool invocation preserved for native Gemini callers. */
+  toolCall?: Record<string, unknown>;
+  /** Opaque server-side tool result preserved for native Gemini callers. */
+  toolResponse?: Record<string, unknown>;
+  [key: string]: unknown;
 }
 
 export interface GeminiInlineData {
@@ -211,6 +226,11 @@ export interface GeminiRequest {
   contents: GeminiContent[];
   systemInstruction?: { parts: GeminiPart[] };
   generationConfig?: GeminiGenerationConfig;
+  tools?: GeminiToolDeclaration[];
+  toolConfig?: { functionCallingConfig: FunctionCallingConfig };
+  /** Compatibility alias accepted at the native Gemini boundary. */
+  tool_config?: { functionCallingConfig: FunctionCallingConfig };
+  [key: string]: unknown;
 }
 
 export interface GeminiGenerationConfig {

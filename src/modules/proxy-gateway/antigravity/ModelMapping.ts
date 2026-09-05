@@ -122,8 +122,6 @@ function normalizeCatalogModelId(modelId: unknown): string | undefined {
   return normalized;
 }
 
-const DYNAMIC_MODEL_FORWARDING_RULES = new Map<string, string>();
-
 export const MODEL_LIST_CREATED_AT = 1770652800;
 
 export const MODEL_LIST_OWNER = 'antigravity';
@@ -160,27 +158,6 @@ export function getPublicModelIdForDisplayName(displayName: unknown): string | u
     return undefined;
   }
   return PUBLIC_MODEL_BY_DISPLAY_NAME.get(displayName.trim().toLowerCase());
-}
-
-export function updateDynamicForwardingRules(oldModel: string, newModel: string): void {
-  if (!isString(oldModel) || !isString(newModel)) {
-    return;
-  }
-  const normalizedOld = oldModel.trim().toLowerCase();
-  const normalizedNew = newModel.trim();
-  if (!normalizedOld || !normalizedNew) {
-    return;
-  }
-  if (!DYNAMIC_MODEL_FORWARDING_RULES.has(normalizedOld)) {
-    logger.info(
-      `[Router] Registered dynamic forwarding rule: ${normalizedOld} -> ${normalizedNew}`,
-    );
-  }
-  DYNAMIC_MODEL_FORWARDING_RULES.set(normalizedOld, normalizedNew);
-}
-
-export function getDynamicForwardingTarget(modelId: string): string | undefined {
-  return DYNAMIC_MODEL_FORWARDING_RULES.get(modelId.trim().toLowerCase());
 }
 
 export function getAllDynamicModels(
@@ -252,14 +229,6 @@ export function resolveModelRoute(
   openaiMapping: Record<string, string>,
   anthropicMapping: Record<string, string>,
 ): string {
-  const dynamicForwarded = getDynamicForwardingTarget(originalModel);
-  if (dynamicForwarded) {
-    logger.info(
-      `[Router] Dynamic deprecated-model forwarding: ${originalModel} -> ${dynamicForwarded}`,
-    );
-    return dynamicForwarded;
-  }
-
   // 1. Check custom exact mapping (Highest priority)
   if (customMapping[originalModel]) {
     logger.info(

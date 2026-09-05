@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import axios, { AxiosProxyConfig, AxiosRequestConfig, AxiosResponse } from 'axios';
-import { isEmpty, isFunction, isNil, isObjectLike, isString } from 'lodash-es';
+import axios, { AxiosError, AxiosProxyConfig, AxiosRequestConfig, AxiosResponse } from 'axios';
+import { isObjectLike, isString } from 'lodash-es';
 import { Readable } from 'node:stream';
 import { GeminiRequest, GeminiResponse } from '../interfaces/request-interfaces';
 import { GeminiInternalRequest } from '../../antigravity/types';
@@ -19,9 +19,14 @@ export function unwrapInternalGeminiResponse<T>(payload: T | { response: T }): T
   return payload as T;
 }
 
-export interface NegativeProjectCapabilityEntry {
+interface NegativeProjectCapabilityEntry {
   accountKey: string;
   project: string;
+  cachedAt: number;
+  expiresAt: number;
+}
+
+export interface NegativeProjectCapabilitySnapshot {
   cachedAt: number;
   expiresAt: number;
 }
@@ -113,10 +118,10 @@ export class UserProjectCapabilityCache {
     }
   }
 
-  getSnapshot(): NegativeProjectCapabilityEntry[] {
+  getSnapshot(): NegativeProjectCapabilitySnapshot[] {
     const now = Date.now();
     this.pruneExpired(now);
-    return [...this.entries.values()];
+    return [...this.entries.values()].map(({ cachedAt, expiresAt }) => ({ cachedAt, expiresAt }));
   }
 }
 
@@ -156,15 +161,9 @@ export class GeminiClient {
       return response.data;
     } catch (error) {
       if (axios.isAxiosError(error)) {
-        this.logger.error(`Gemini stream request failed: ${error.message}`);
-        throw new UpstreamRequestError({
-          message: error.response?.data?.error?.message || error.message,
-          status: error.response?.status,
-          headers: {
-            retryAfter: this.extractRetryAfterHeader(error.response?.headers),
-          },
-          body: this.describeAxiosErrorData(error.response?.data),
-        });
+        const upstreamError = this.toUpstreamRequestError(error);
+        this.logUpstreamFailure('stream_generate', upstreamError);
+        throw upstreamError;
       }
       this.throwAsCleanError(error);
     }
@@ -191,17 +190,9 @@ export class GeminiClient {
       return response.data;
     } catch (error) {
       if (axios.isAxiosError(error)) {
-        this.logger.error(
-          `Gemini request failed: ${error.message} - ${this.safeStringify(error.response?.data)}`,
-        );
-        throw new UpstreamRequestError({
-          message: error.response?.data?.error?.message || error.message,
-          status: error.response?.status,
-          headers: {
-            retryAfter: this.extractRetryAfterHeader(error.response?.headers),
-          },
-          body: this.describeAxiosErrorData(error.response?.data),
-        });
+        const upstreamError = this.toUpstreamRequestError(error);
+        this.logUpstreamFailure('generate', upstreamError);
+        throw upstreamError;
       }
       this.throwAsCleanError(error);
     }
@@ -400,7 +391,7 @@ export class GeminiClient {
 
           if (this.shouldRetryWithoutProjectHeader(error, projectHeaders)) {
             this.logger.warn(
-              `[${operation}] received 403 with project context; retrying without project context.`,
+              `[${operation}] project_context_rejected status=403 action=retry_without_project`,
             );
             if (safeProject) {
               this.userProjectCapabilityCache.recordNegativeCapability(safeAccount, safeProject);
@@ -417,9 +408,7 @@ export class GeminiClient {
           }
 
           this.logger.warn(
-            `[${operation}] request failed at ${baseUrl}; trying next endpoint (${index + 2}/${
-              baseUrls.length
-            }).`,
+            `[${operation}] upstream_endpoint_retry attempt=${index + 2} total=${baseUrls.length}`,
           );
         }
       }
@@ -473,138 +462,68 @@ export class GeminiClient {
 
   private async throwUpstreamRequestError(error: unknown, operation: string): Promise<never> {
     if (axios.isAxiosError(error)) {
-      const responseData = error.response?.data;
-      const upstreamMessage = await this.extractAxiosErrorMessage(responseData);
-      this.logger.error(
-        `[${operation}] upstream request error: ${error.message} - ${this.describeAxiosErrorData(
-          responseData,
-        )}`,
-      );
-      throw new UpstreamRequestError({
-        message: upstreamMessage || error.message,
-        status: error.response?.status,
-        headers: {
-          retryAfter: this.extractRetryAfterHeader(error.response?.headers),
-        },
-        body: this.describeAxiosErrorData(responseData),
-      });
+      const upstreamError = this.toUpstreamRequestError(error);
+      this.logUpstreamFailure(operation, upstreamError);
+      throw upstreamError;
     }
     this.throwAsCleanError(error);
   }
 
-  private async extractAxiosErrorMessage(responseData: unknown): Promise<string | null> {
-    const fromObject = this.extractAxiosErrorMessageFromObject(responseData);
-    if (fromObject) {
-      return fromObject;
-    }
-
-    if (isString(responseData)) {
-      return this.extractAxiosErrorMessageFromText(responseData);
-    }
-
-    if (Buffer.isBuffer(responseData)) {
-      return this.extractAxiosErrorMessageFromText(responseData.toString('utf-8'));
-    }
-
-    if (this.isReadableStream(responseData)) {
-      const streamText = await this.readStreamAsText(responseData);
-      return streamText ? this.extractAxiosErrorMessageFromText(streamText) : null;
-    }
-
-    return null;
-  }
-
-  private extractAxiosErrorMessageFromObject(responseData: unknown): string | null {
-    if (!isObjectLike(responseData) || this.isReadableStream(responseData)) {
-      return null;
-    }
-
-    const errorRecord = (responseData as { error?: unknown }).error;
-    if (isObjectLike(errorRecord)) {
-      const message = (errorRecord as { message?: unknown }).message;
-      if (isString(message) && !isEmpty(message.trim())) {
-        return message.trim();
-      }
-    }
-
-    const message = (responseData as { message?: unknown }).message;
-    if (isString(message) && !isEmpty(message.trim())) {
-      return message.trim();
-    }
-
-    return null;
-  }
-
-  private extractAxiosErrorMessageFromText(rawText: string): string | null {
-    const text = rawText.trim();
-    if (!text) {
-      return null;
-    }
-
-    const sseLines = text
-      .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => line.startsWith('data:'));
-
-    for (const line of sseLines) {
-      const payload = line.slice(5).trim();
-      if (!payload || payload === '[DONE]') {
-        continue;
-      }
-      const parsed = this.tryParseJson(payload);
-      const message = this.extractAxiosErrorMessageFromObject(parsed);
-      if (message) {
-        return message;
-      }
-    }
-
-    const parsed = this.tryParseJson(text);
-    const fromJson = this.extractAxiosErrorMessageFromObject(parsed);
-    if (fromJson) {
-      return fromJson;
-    }
-
-    return null;
-  }
-
-  private tryParseJson(value: string): unknown {
-    try {
-      return JSON.parse(value);
-    } catch {
-      return null;
-    }
-  }
-
-  private isReadableStream(value: unknown): value is NodeJS.ReadableStream {
-    return isObjectLike(value) && isFunction((value as { pipe?: unknown }).pipe);
-  }
-
-  private async readStreamAsText(stream: NodeJS.ReadableStream): Promise<string | null> {
-    return new Promise((resolve) => {
-      let buffer = '';
-      const maxChars = 512 * 1024;
-
-      stream.on('data', (chunk: Buffer | string) => {
-        const text = Buffer.isBuffer(chunk) ? chunk.toString('utf-8') : String(chunk);
-        if (buffer.length >= maxChars) {
-          return;
-        }
-        buffer += text;
-        if (buffer.length > maxChars) {
-          buffer = buffer.slice(0, maxChars);
-        }
-      });
-
-      stream.on('end', () => resolve(buffer));
-      stream.on('error', () => resolve(null));
+  private toUpstreamRequestError(error: AxiosError): UpstreamRequestError {
+    const status = error.response?.status;
+    return new UpstreamRequestError({
+      status,
+      headers: { retryAfter: this.extractRetryAfterHeader(error.response?.headers) },
+      reason: this.classifyAxiosFailure(status, error.response?.data, error.message),
     });
   }
 
-  private describeAxiosErrorData(responseData: unknown): string {
-    if (this.isReadableStream(responseData)) {
-      return '[stream]';
+  private classifyAxiosFailure(
+    status: number | undefined,
+    responseData: unknown,
+    transportMessage: string,
+  ): UpstreamRequestError['reason'] {
+    if (status === 401 || status === 403) {
+      return 'authentication';
     }
-    return this.safeStringify(responseData);
+    if (status === 404) {
+      return 'model_not_found';
+    }
+
+    const classificationText = this.toClassificationText(responseData).toLowerCase();
+    if (classificationText.includes('quota')) {
+      return 'quota_exhausted';
+    }
+    if (status === 429 || classificationText.includes('resource_exhausted')) {
+      return 'rate_limited';
+    }
+    if (status === undefined && /timeout|socket|connect|network|reset/i.test(transportMessage)) {
+      return 'transport';
+    }
+    return 'upstream_error';
+  }
+
+  private toClassificationText(value: unknown): string {
+    if (isString(value)) {
+      return value;
+    }
+    if (Buffer.isBuffer(value)) {
+      return value.toString('utf-8');
+    }
+    if (!isObjectLike(value)) {
+      return '';
+    }
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return '';
+    }
+  }
+
+  private logUpstreamFailure(operation: string, error: UpstreamRequestError): void {
+    this.logger.error(
+      `[${operation}] upstream_request_failed status=${error.status ?? 'none'} reason=${error.reason}`,
+    );
   }
 
   private resolveUpstreamAxiosProxy(
@@ -640,7 +559,7 @@ export class GeminiClient {
 
       return proxyConfig;
     } catch {
-      this.logger.warn(`Upstream proxy URL is invalid: ${configuredProxyUrl}`);
+      this.logger.warn('Upstream proxy configuration is invalid: category=invalid_url');
       return undefined;
     }
   }
@@ -650,42 +569,22 @@ export class GeminiClient {
       return undefined;
     }
 
-    const retryAfter = (headers as Record<string, unknown>)['retry-after'];
-    if (isString(retryAfter) && !isEmpty(retryAfter.trim())) {
+    const retryAfter = Object.entries(headers as Record<string, unknown>).find(
+      ([name]) => name.toLowerCase() === 'retry-after',
+    )?.[1];
+    if (isString(retryAfter)) {
       return retryAfter.trim();
     }
     if (Array.isArray(retryAfter) && retryAfter.length > 0) {
       const first = retryAfter[0];
-      if (isString(first) && !isEmpty(first.trim())) {
+      if (isString(first)) {
         return first.trim();
       }
     }
     return undefined;
   }
 
-  private throwAsCleanError(error: unknown): never {
-    // Re-throw as clean Error to avoid circular reference issues.
-    throw error instanceof Error ? new Error(error.message) : new Error(String(error));
-  }
-
-  /**
-   * Safely stringify an object, handling circular references
-   */
-  private safeStringify(obj: unknown): string {
-    if (isNil(obj)) {
-      return String(obj);
-    }
-    try {
-      const seen = new WeakSet();
-      return JSON.stringify(obj, (key, value) => {
-        if (isObjectLike(value)) {
-          if (seen.has(value)) return '[Circular]';
-          seen.add(value);
-        }
-        return value;
-      });
-    } catch {
-      return '[Unserializable]';
-    }
+  private throwAsCleanError(_error: unknown): never {
+    throw new UpstreamRequestError({ reason: 'transport' });
   }
 }

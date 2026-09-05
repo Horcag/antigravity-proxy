@@ -55,6 +55,9 @@ const MODEL_POLICY_TEST_ACCOUNT_IDS = [
   'catalog-cooldown-account',
   'catalog-display-account',
   'sibling-account',
+  'temporary-cooldown-account',
+  'rejected-account',
+  'healthy-account',
 ];
 
 function modelToken(accountId: string, modelQuotas: Record<string, number>): AccountLeaseTokenData {
@@ -402,13 +405,41 @@ describe('Request compatibility for legacy aliases', () => {
       logger: { log: vi.fn(), warn: vi.fn() } as any,
     });
 
-    policy.markModelUnrequestable('gemini-3.8-flash-high');
+    policy.markModelUnrequestable('acc-1', 'gemini-3.8-flash-high');
 
     expect(policy.getAllCollectedModels()).not.toContain('gemini-3.8-flash-high');
     expect(policy.getAllCollectedModels()).toContain('gemini-3.8-flash-low');
     expect(policy.resolveDynamicModelForAccount('acc-1', 'gemini-3.8-flash-high')).toBe(
       'gemini-3.8-flash-low',
     );
+  });
+
+  it('keeps learned text-model rejection scoped to its account while preserving healthy catalogs', () => {
+    const policy = createModelPolicy(
+      new Map([
+        [
+          'rejected-account',
+          modelToken('rejected-account', {
+            'gemini-3.8-flash-high': 99,
+            'gemini-3.8-flash-low': 99,
+          }),
+        ],
+        [
+          'healthy-account',
+          modelToken('healthy-account', { 'gemini-3.8-flash-high': 99 }),
+        ],
+      ]),
+    );
+
+    policy.markModelUnrequestable('rejected-account', 'gemini-3.8-flash-high');
+
+    expect(
+      policy.resolveDynamicModelForAccount('rejected-account', 'gemini-3.8-flash-high'),
+    ).toBe('gemini-3.8-flash-low');
+    expect(
+      policy.resolveDynamicModelForAccount('healthy-account', 'gemini-3.8-flash-high'),
+    ).toBe('gemini-3.8-flash-high');
+    expect(policy.getAllCollectedModels()).toContain('gemini-3.8-flash-high');
   });
 
   it('never rewrites an unrequestable sibling to an account model in cooldown', () => {
@@ -424,7 +455,7 @@ describe('Request compatibility for legacy aliases', () => {
       ]),
     );
 
-    policy.markModelUnrequestable('gemini-3.8-flash-high');
+    policy.markModelUnrequestable('sibling-account', 'gemini-3.8-flash-high');
     proxyModelAvailabilityStore.mark(
       'sibling-account',
       'gemini-3.8-flash-low',
@@ -435,6 +466,50 @@ describe('Request compatibility for legacy aliases', () => {
       'gemini-3.8-flash-high',
     );
   });
+
+  it.each(['rate_limited', 'quota_exhausted'] as const)(
+    'keeps %s cooldowns out of hard sibling priority and upgrades a later 404',
+    (reason) => {
+      const accountId = 'temporary-cooldown-account';
+      const policy = createModelPolicy(
+        new Map([
+          [
+            accountId,
+            modelToken(accountId, {
+              'gemini-3.8-flash-high': 99,
+              'gemini-3.8-flash-low': 99,
+              'gemini-3.8-flash-tiered': 99,
+            }),
+          ],
+        ]),
+      );
+      const temporaryDeadline = Date.now() + 1_000;
+
+      proxyModelAvailabilityStore.mark(
+        accountId,
+        'gemini-3.8-flash-high',
+        reason,
+        temporaryDeadline,
+      );
+
+      expect(policy.isModelUnrequestable(accountId, 'gemini-3.8-flash-high')).toBe(false);
+      expect(
+        policy.resolveUnrequestableSibling(accountId, 'gemini-3.8-flash-high'),
+      ).toBeUndefined();
+      expect(policy.isModelRequestableForAccount(accountId, 'gemini-3.8-flash-high')).toBe(true);
+
+      policy.markModelUnrequestable(accountId, 'gemini-3.8-flash-high');
+
+      const upgraded = proxyModelAvailabilityStore
+        .getSnapshot()
+        .find((entry) => entry.accountId === accountId && entry.modelId === 'gemini-3.8-flash-high');
+      expect(upgraded).toMatchObject({ reason: 'model_not_supported' });
+      expect(upgraded?.unavailableUntil).toBeGreaterThan(temporaryDeadline);
+      expect(
+        policy.resolveUnrequestableSibling(accountId, 'gemini-3.8-flash-high'),
+      ).toBe('gemini-3.8-flash-tiered');
+    },
+  );
 
   it('publishes the union of capability-eligible account models without cooldown erasure', () => {
     const policy = createModelPolicy(

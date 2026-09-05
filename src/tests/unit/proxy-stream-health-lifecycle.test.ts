@@ -1,10 +1,12 @@
 import { Logger } from '@nestjs/common';
 import axios from 'axios';
+import { createHash } from 'node:crypto';
 import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import type { Observable } from 'rxjs';
 import type { CloudAccount } from '@/modules/cloud-account/types';
 import { GeminiClient } from '@/modules/proxy-gateway/server/clients/gemini.client';
+import { UpstreamRequestError } from '@/modules/proxy-gateway/server/clients/upstream-error';
 import { ProxyService } from '@/modules/proxy-gateway/server/proxy.service';
 
 type StreamFamily = 'anthropic' | 'gemini' | 'openai' | 'responses';
@@ -40,6 +42,8 @@ function createAccountLeaseService() {
     markAsRateLimited: vi.fn(),
     markFromUpstreamError: vi.fn().mockResolvedValue(undefined),
     markModelSuccess: vi.fn(),
+    recordPerformanceSuccess: vi.fn(),
+    recordPerformanceFailure: vi.fn(),
     markModelUnrequestable: vi.fn(),
   };
 }
@@ -102,6 +106,18 @@ async function settlePenalty(): Promise<void> {
   await Promise.resolve();
 }
 
+function canaries(prefix: string): string[] {
+  return [
+    `${prefix}-raw-canary`,
+    `${prefix}-account-project-model-canary`,
+    `https://${prefix}-user:${prefix}-password@proxy.example.test/path`,
+  ].flatMap((value) => [
+    value,
+    Buffer.from(value).toString('base64'),
+    createHash('sha256').update(value).digest('hex'),
+  ]);
+}
+
 const usableEvent =
   'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":"STOP"}]}}\n\n';
 
@@ -139,6 +155,156 @@ describe('ProxyService stream health lifecycle', () => {
     expect((await consumed).values.join('')).toBe(upstreamFrames);
   });
 
+  it('classifies native server tool-combination parts as usable Gemini stream output', async () => {
+    const { accountLeaseService, result, upstream } = await createStreamRequest('gemini');
+    const serverToolEvent =
+      'data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"toolCall":{"functionCalls":[{"name":"weather"}]},"thoughtSignature":"server-call-signature"},{"toolResponse":{"functionResponses":[{"name":"weather","response":{"result":"sunny"}}]},"thought_signature":"server-response-signature"}]}}]}}\n\n';
+    const consumed = consume(result);
+
+    upstream.end(serverToolEvent);
+
+    expect((await consumed).error).toBeUndefined();
+    expect(accountLeaseService.markModelSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  it('buffers native Gemini frames across chunks and preserves valid data, metadata, comments, and DONE bytes', async () => {
+    const { result, upstream } = await createStreamRequest('gemini');
+    const frames = [
+      ': keepalive\r\n\r\n',
+      'id: upstream-event-1\r\nevent: message\r\ndata: {"response":\r\ndata: {"usageMetadata":{"totalTokenCount":1}}}\r\n\r\n',
+      usableEvent,
+      'data: [DONE]\n\n',
+    ];
+    const consumed = consume(result);
+
+    upstream.write(frames[0].slice(0, 7));
+    upstream.write(frames[0].slice(7) + frames[1].slice(0, 31));
+    upstream.write(frames[1].slice(31) + frames[2] + frames[3]);
+    upstream.end();
+
+    expect((await consumed).values.join('')).toBe(frames.join(''));
+  });
+
+  it('delivers multiple CR-only native Gemini frames incrementally', async () => {
+    const { result, upstream } = await createStreamRequest('gemini');
+    const frames = [
+      usableEvent.replaceAll('\n', '\r'),
+      'data: [DONE]\r\r',
+      usableEvent.replaceAll('\n', '\r'),
+    ];
+    const values: string[] = [];
+    const completion = new Promise<Error | undefined>((resolve) => {
+      result.subscribe({
+        next: (value) => values.push(value),
+        error: (error: unknown) => resolve(error instanceof Error ? error : new Error(String(error))),
+        complete: () => resolve(undefined),
+      });
+    });
+
+    upstream.write(frames[0] + frames[1].slice(0, 1));
+    expect(values).toEqual([frames[0]]);
+    upstream.end(frames[1].slice(1) + frames[2]);
+
+    expect(await completion).toBeUndefined();
+    expect(values.join('')).toBe(frames.join(''));
+  });
+
+  it('waits for a CRLF frame terminator split across chunks', async () => {
+    const { result, upstream } = await createStreamRequest('gemini');
+    const frame = usableEvent.replaceAll('\n', '\r\n');
+    const values: string[] = [];
+    const completion = new Promise<Error | undefined>((resolve) => {
+      result.subscribe({
+        next: (value) => values.push(value),
+        error: (error: unknown) => resolve(error instanceof Error ? error : new Error(String(error))),
+        complete: () => resolve(undefined),
+      });
+    });
+
+    upstream.write(frame.slice(0, -1));
+    expect(values).toEqual([]);
+    upstream.end(frame.slice(-1));
+
+    expect(await completion).toBeUndefined();
+    expect(values).toEqual([frame]);
+  });
+
+  it('recognizes CRLF frames when every CRLF is split across chunks', async () => {
+    const { result, upstream } = await createStreamRequest('gemini');
+    const frame = `: keepalive\r\nid: event-1\r\ndata: ${usableEvent.slice('data: '.length, -2)}\r\n\r\n`;
+    const chunks = frame.split(/(?<=\r)(?=\n)/u);
+    const consumed = consume(result);
+
+    for (const chunk of chunks) {
+      upstream.write(chunk);
+    }
+    upstream.end();
+
+    expect((await consumed).error).toBeUndefined();
+    expect((await consumed).values).toEqual([frame]);
+  });
+
+  it('preserves a structurally valid mixed-ending comment and multiline-data frame', async () => {
+    const { result, upstream } = await createStreamRequest('gemini');
+    const payload = JSON.stringify({
+      response: { candidates: [{ content: { parts: [{ text: 'hello' }] }, finishReason: 'STOP' }] },
+    });
+    const splitAt = payload.indexOf('{', payload.indexOf(':') + 1);
+    const frame = [
+      ': keepalive\r',
+      'event: message\n',
+      `data: ${payload.slice(0, splitAt)}\r\n`,
+      `data: ${payload.slice(splitAt)}\r`,
+      '\n',
+    ].join('');
+    const consumed = consume(result);
+
+    upstream.end(frame);
+
+    expect((await consumed).error).toBeUndefined();
+    expect((await consumed).values).toEqual([frame]);
+  });
+
+  it.each([
+    ['before valid output', false],
+    ['after valid output', true],
+  ])('does not emit invalid native Gemini SSE frames %s', async (_position, emitValidFirst) => {
+    const { result, service, upstream } = await createStreamRequest('gemini');
+    const rawCanaries = canaries('native-gemini-sse');
+    const destroyUpstreamStream = vi.spyOn(service as any, 'destroyUpstreamStream');
+    const consumed = consume(result);
+    if (emitValidFirst) {
+      upstream.write(usableEvent);
+    }
+    upstream.write(`data: {${rawCanaries.join('|')}}\n\n`);
+    upstream.end();
+
+    const { error, values } = await consumed;
+    expect(error?.message).toBe('Upstream stream failed');
+    expect(values.join('')).toBe(emitValidFirst ? usableEvent : '');
+    expect(destroyUpstreamStream).toHaveBeenCalledTimes(1);
+    const serialized = JSON.stringify(values);
+    for (const canary of rawCanaries) {
+      expect(serialized).not.toContain(canary);
+    }
+  });
+
+  it('does not emit a CR-only invalid frame after valid native Gemini output', async () => {
+    const { result, upstream } = await createStreamRequest('gemini');
+    const rawCanaries = canaries('native-gemini-cr-sse');
+    const consumed = consume(result);
+    const validFrame = usableEvent.replaceAll('\n', '\r');
+
+    upstream.end(`${validFrame}data: {${rawCanaries.join('|')}}\r\r`);
+
+    const { error, values } = await consumed;
+    expect(error?.message).toBe('Upstream stream failed');
+    expect(values).toEqual([validFrame]);
+    for (const canary of rawCanaries) {
+      expect(JSON.stringify(values)).not.toContain(canary);
+    }
+  });
+
   it.each<StreamFamily>(['anthropic', 'gemini', 'openai', 'responses'])(
     '%s records a scoped penalty instead of success when the stream is empty',
     async (family) => {
@@ -152,6 +318,8 @@ describe('ProxyService stream health lifecycle', () => {
       expect(accountLeaseService.markFromUpstreamError).toHaveBeenCalledWith(
         expect.objectContaining({ accountIdOrEmail: 'account-secret', model: expect.any(String) }),
       );
+      expect(accountLeaseService.recordPerformanceFailure).toHaveBeenCalledTimes(1);
+      expect(accountLeaseService.recordPerformanceSuccess).not.toHaveBeenCalled();
     },
   );
 
@@ -220,6 +388,77 @@ describe('ProxyService stream health lifecycle', () => {
       expect(accountLeaseService.markFromUpstreamError).not.toHaveBeenCalled();
     },
   );
+
+  it.each<StreamFamily>(['anthropic', 'gemini', 'openai', 'responses'])(
+    '%s includes stream acquisition time in TTFT',
+    async (family) => {
+      const now = vi.spyOn(performance, 'now').mockReturnValueOnce(10).mockReturnValueOnce(42);
+      try {
+        const { accountLeaseService, result, upstream } = await createStreamRequest(family);
+        const consumed = consume(result);
+        upstream.end(usableEvent);
+
+        await consumed;
+        expect(accountLeaseService.recordPerformanceSuccess).toHaveBeenCalledWith(
+          'account-secret',
+          expect.any(String),
+          32,
+        );
+      } finally {
+        now.mockRestore();
+      }
+    },
+  );
+
+  it('records non-stream success without supplying a TTFT sample', async () => {
+    const accountLeaseService = createAccountLeaseService();
+    const geminiClient = {
+      generateInternal: vi.fn().mockResolvedValue({
+        candidates: [{ content: { role: 'model', parts: [{ text: 'hello' }] } }],
+      }),
+    };
+    const service = new ProxyService(accountLeaseService as never, geminiClient as never);
+
+    await service.handleGeminiGenerateContent('gemini-3-flash', {
+      contents: [{ role: 'user', parts: [{ text: 'hello' }] }],
+    });
+
+    expect(accountLeaseService.recordPerformanceSuccess).toHaveBeenCalledWith(
+      'account-secret',
+      'gemini-3-flash',
+    );
+    expect(accountLeaseService.recordPerformanceSuccess).not.toHaveBeenCalledWith(
+      'account-secret',
+      'gemini-3-flash',
+      expect.any(Number),
+    );
+  });
+
+  it('records every failed initiated non-stream retry once', async () => {
+    const accountLeaseService = createAccountLeaseService();
+    accountLeaseService.getRefreshedModelCapableAccountCount.mockResolvedValue(2);
+    const geminiClient = {
+      generateInternal: vi
+        .fn()
+        .mockRejectedValue(new UpstreamRequestError({ status: 503, reason: 'upstream_error' })),
+    };
+    const service = new ProxyService(accountLeaseService as never, geminiClient as never);
+    vi.spyOn(service as any, 'waitBeforeRetry').mockResolvedValue(undefined);
+
+    await expect(
+      service.handleGeminiGenerateContent('gemini-3-flash', {
+        contents: [{ role: 'user', parts: [{ text: 'hello' }] }],
+      }),
+    ).rejects.toBeInstanceOf(UpstreamRequestError);
+
+    expect(geminiClient.generateInternal).toHaveBeenCalledTimes(2);
+    expect(accountLeaseService.recordPerformanceFailure).toHaveBeenCalledTimes(2);
+    expect(accountLeaseService.recordPerformanceFailure).toHaveBeenNthCalledWith(
+      1,
+      'account-secret',
+      'gemini-3-flash',
+    );
+  });
 
   it('Responses removes its listeners and disposes timers on normal completion', async () => {
     vi.useFakeTimers();
@@ -299,6 +538,44 @@ describe('ProxyService stream health lifecycle', () => {
     expect(upstream.listenerCount('error')).toBe(0);
   });
 
+  it.each([
+    [401, undefined],
+    [403, undefined],
+    [429, '30'],
+    [429, 'Wed, 21 Oct 2037 07:28:00 GMT'],
+    [500, undefined],
+  ] as const)(
+    'Responses preserves typed in-band HTTP %i failures through stream health',
+    async (status, retryAfter) => {
+      const { accountLeaseService, result, upstream } = await createStreamRequest('responses');
+      const consumed = consume(result);
+      upstream.end(
+        `data: ${JSON.stringify({
+          error: {
+            code: status,
+            ...(retryAfter ? { headers: { 'Retry-After': retryAfter } } : {}),
+          },
+        })}\n\n`,
+      );
+
+      expect((await consumed).error).toBeUndefined();
+      await settlePenalty();
+      expect(accountLeaseService.recordParityError).toHaveBeenCalledTimes(1);
+      if (status === 401 || status === 403) {
+        expect(accountLeaseService.markAsForbidden).toHaveBeenCalledWith('account-secret');
+        expect(accountLeaseService.markFromUpstreamError).not.toHaveBeenCalled();
+        return;
+      }
+      expect(accountLeaseService.markFromUpstreamError).toHaveBeenCalledWith(
+        expect.objectContaining({
+          accountIdOrEmail: 'account-secret',
+          status,
+          ...(retryAfter ? { retryAfter } : {}),
+        }),
+      );
+    },
+  );
+
   it('Responses records one bounded failure and cleans up on idle timeout', async () => {
     const { accountLeaseService, result, service, upstream } = await createStreamRequest('responses');
     const idleTimer = {
@@ -328,7 +605,35 @@ describe('ProxyService stream health lifecycle', () => {
     expect(upstream.listenerCount('error')).toBe(0);
   });
 
-  it('Responses retains one success and records one failure when transport fails after output', async () => {
+  it.each<Extract<StreamFamily, 'gemini' | 'responses'>>(['gemini', 'responses'])(
+    '%s idle timeout has one destruction and terminal owner during late error and unsubscribe races',
+    async (family) => {
+      vi.useFakeTimers();
+      try {
+        const { result, service, upstream } = await createStreamRequest(family);
+        (service as any).streamIdleTimeoutMs = 1;
+        const destroyUpstreamStream = vi.spyOn(service as any, 'destroyUpstreamStream');
+        const terminalSettlements = vi.fn();
+        const subscription = result.subscribe({
+          complete: () => terminalSettlements('complete'),
+          error: () => terminalSettlements('error'),
+        });
+        const lateErrorCallbacks = upstream.listeners('error') as Array<(error: Error) => void>;
+
+        await vi.advanceTimersByTimeAsync(2);
+        lateErrorCallbacks.forEach((callback) => callback(new Error('late upstream error')));
+        subscription.unsubscribe();
+
+        expect(destroyUpstreamStream).toHaveBeenCalledTimes(1);
+        expect(terminalSettlements).toHaveBeenCalledTimes(1);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('Responses preserves one health penalty while suppressing performance failure after output', async () => {
     const { accountLeaseService, result, service, upstream } = await createStreamRequest('responses');
     const idleTimer = {
       reset: vi.fn(),
@@ -347,11 +652,13 @@ describe('ProxyService stream health lifecycle', () => {
     await settlePenalty();
     expect(accountLeaseService.markModelSuccess).toHaveBeenCalledTimes(1);
     expect(accountLeaseService.markFromUpstreamError).toHaveBeenCalledTimes(1);
+    expect(accountLeaseService.recordPerformanceSuccess).toHaveBeenCalledTimes(1);
+    expect(accountLeaseService.recordPerformanceFailure).not.toHaveBeenCalled();
     expect(idleTimer.dispose).toHaveBeenCalledTimes(1);
   });
 
   it.each<Extract<StreamFamily, 'gemini' | 'openai'>>(['gemini', 'openai'])(
-    '%s records exactly one bounded penalty when transport fails after usable output',
+    '%s preserves one health penalty while suppressing performance failure after usable output',
     async (family) => {
       const { accountLeaseService, result, upstream } = await createStreamRequest(family);
       const consumed = consume(result);
@@ -363,6 +670,8 @@ describe('ProxyService stream health lifecycle', () => {
       await settlePenalty();
       expect(accountLeaseService.markModelSuccess).toHaveBeenCalledTimes(1);
       expect(accountLeaseService.markFromUpstreamError).toHaveBeenCalledTimes(1);
+      expect(accountLeaseService.recordPerformanceSuccess).toHaveBeenCalledTimes(1);
+      expect(accountLeaseService.recordPerformanceFailure).not.toHaveBeenCalled();
     },
   );
 
@@ -422,7 +731,7 @@ describe('GeminiClient project-header downgrade logging', () => {
 
     const downgradeWarning = warn.mock.calls
       .map(([message]) => String(message))
-      .find((message) => message.includes('retrying without project context'));
+      .find((message) => message.includes('project_context_rejected'));
     expect(downgradeWarning).toBeDefined();
     expect(downgradeWarning).not.toContain('account-secret');
     expect(downgradeWarning).not.toContain('project-secret');

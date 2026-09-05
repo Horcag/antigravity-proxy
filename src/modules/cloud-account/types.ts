@@ -30,6 +30,7 @@ export interface CloudQuotaModelInfo {
 
 export interface CloudQuotaData {
   models: Record<string, CloudQuotaModelInfo>;
+  last_successful_refresh_at?: number;
   model_forwarding_rules?: Record<string, string>;
   subscription_tier?: string;
   is_forbidden?: boolean;
@@ -115,6 +116,7 @@ export const CloudQuotaGroupSchema = z.object({
 
 export const CloudQuotaDataSchema = z.object({
   models: z.record(z.string(), CloudQuotaModelInfoSchema),
+  last_successful_refresh_at: z.number().finite().positive().optional(),
   model_forwarding_rules: z.record(z.string(), z.string()).optional(),
   subscription_tier: z.string().optional(),
   is_forbidden: z.boolean().optional(),
