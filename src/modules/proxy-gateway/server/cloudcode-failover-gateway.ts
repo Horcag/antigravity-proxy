@@ -99,8 +99,20 @@ export class CloudCodeFailoverGateway {
       let payloadToSend = rawBody;
       const projectId = account?.token?.project_id;
       if (parsedBody && projectId) {
-        const cloned = { ...parsedBody, project: projectId };
-        payloadToSend = Buffer.from(JSON.stringify(cloned), 'utf-8');
+        if ('project' in parsedBody && parsedBody.project !== undefined) {
+          const cloned = { ...parsedBody, project: projectId };
+          payloadToSend = Buffer.from(JSON.stringify(cloned), 'utf-8');
+        } else if (
+          parsedBody.request &&
+          typeof parsedBody.request === 'object' &&
+          'project' in (parsedBody.request as Record<string, unknown>)
+        ) {
+          const cloned = {
+            ...parsedBody,
+            request: { ...(parsedBody.request as Record<string, unknown>), project: projectId },
+          };
+          payloadToSend = Buffer.from(JSON.stringify(cloned), 'utf-8');
+        }
       }
 
       // Build upstream request headers
@@ -132,7 +144,7 @@ export class CloudCodeFailoverGateway {
         upstreamHeaders['authorization'] = String(req.headers['authorization']);
       }
 
-      if (projectId) {
+      if (projectId && (req.headers['x-goog-user-project'] || ('project' in (parsedBody || {})))) {
         upstreamHeaders['x-goog-user-project'] = projectId;
       }
 
