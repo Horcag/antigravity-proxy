@@ -4,11 +4,13 @@ import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify
 import { AppModule } from './app.module';
 import { logger } from '../shared/logging/logger';
 import { AccountLeaseService } from '../modules/proxy-gateway/server/account-lease.service';
+import { ConnectIngressService } from '../modules/proxy-gateway/server/connect-ingress.service';
 
 import { ProxyConfig } from '@/modules/config/types';
 import { setServerConfig } from './server-config';
 
 let app: NestFastifyApplication | null = null;
+let connectIngress: ConnectIngressService | null = null;
 let currentPort: number = 0;
 let currentHost = '127.0.0.1';
 
@@ -49,6 +51,15 @@ function isTailscaleHost(host: string): boolean {
 }
 
 async function cleanupFailedServerStart() {
+  if (connectIngress) {
+    try {
+      connectIngress.close();
+    } catch {
+      // ignore
+    }
+    connectIngress = null;
+  }
+
   if (!app) {
     return;
   }
@@ -125,6 +136,18 @@ export async function bootstrapNestServer(config: ProxyConfig): Promise<NestServ
     await app.listen(port, host);
     currentPort = port;
     currentHost = host;
+
+    try {
+      const accountLeaseService = app.get(AccountLeaseService, { strict: false });
+      const rawHttpServer = (app.getHttpAdapter().getInstance() as any)?.server;
+      if (rawHttpServer) {
+        connectIngress = new ConnectIngressService(accountLeaseService);
+        connectIngress.attach(rawHttpServer);
+      }
+    } catch (ingressError) {
+      logger.warn('Failed to attach ConnectIngressService', ingressError);
+    }
+
     logger.info(`NestJS Proxy Server running on http://${host}:${port}`);
     return {
       success: true,
@@ -156,6 +179,15 @@ export async function bootstrapNestServer(config: ProxyConfig): Promise<NestServ
 }
 
 export async function stopNestServer(): Promise<boolean> {
+  if (connectIngress) {
+    try {
+      connectIngress.close();
+    } catch {
+      // ignore
+    }
+    connectIngress = null;
+  }
+
   if (app) {
     try {
       await app.close();

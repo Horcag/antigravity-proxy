@@ -22,3 +22,17 @@ export function getConfigPath(): string {
 export function getMasterKeyPath(): string {
   return path.join(getDataDir(), '.master-key');
 }
+
+export function getCertsDir(): string {
+  const dir = path.join(getDataDir(), 'certs');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
+export function getCaCertPath(): string {
+  return path.join(getCertsDir(), 'ca.crt');
+}
+
+export function getCaKeyPath(): string {
+  return path.join(getCertsDir(), 'ca.key');
+}
