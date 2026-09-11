@@ -3,6 +3,10 @@ import { CaManager } from '../../modules/proxy-gateway/server/cert/ca-manager';
 import { CloudCodeFailoverGateway } from '../../modules/proxy-gateway/server/cloudcode-failover-gateway';
 import { ConnectIngressService } from '../../modules/proxy-gateway/server/connect-ingress.service';
 import http from 'node:http';
+import net from 'node:net';
+import fs from 'node:fs';
+import { PassThrough } from 'node:stream';
+import { CloudAccount } from '../../modules/cloud-account/types';
 
 describe('CaManager', () => {
   it('identifies target CloudCode hosts correctly', () => {
@@ -10,14 +14,22 @@ describe('CaManager', () => {
     expect(CaManager.isTargetHost('cloudcode-pa.googleapis.com:443')).toBe(true);
     expect(CaManager.isTargetHost('daily-cloudcode-pa.sandbox.googleapis.com:443')).toBe(true);
     expect(CaManager.isTargetHost('generativelanguage.googleapis.com:443')).toBe(true);
+    expect(CaManager.isTargetHost('custom-cloudcode-pa.googleapis.com:443')).toBe(true);
     expect(CaManager.isTargetHost('api.openai.com:443')).toBe(false);
     expect(CaManager.isTargetHost('github.com:443')).toBe(false);
+    expect(CaManager.isTargetHost('')).toBe(false);
   });
 
-  it('generates and provides a valid secureContext', () => {
+  it('generates and provides a valid secureContext and CA cert', () => {
     const ctx = CaManager.ensureCertificates();
     expect(ctx).toBeDefined();
-    expect(CaManager.getCaCertPath()).toContain('ca.crt');
+
+    const caPath = CaManager.getCaCertPath();
+    expect(caPath).toContain('ca.crt');
+    expect(fs.existsSync(caPath)).toBe(true);
+
+    const caContent = fs.readFileSync(caPath, 'utf-8');
+    expect(caContent).toContain('BEGIN CERTIFICATE');
   });
 });
 
@@ -33,6 +45,130 @@ describe('CloudCodeFailoverGateway', () => {
     expect(isQuotaError('normal valid response')).toBe(false);
     expect(isQuotaError(undefined)).toBe(false);
   });
+
+  it('filters out forbidden HTTP/2 connection headers', () => {
+    const gateway = new CloudCodeFailoverGateway();
+    const mockRes: any = {
+      writeHead: vi.fn(),
+      end: vi.fn(),
+    };
+
+    (gateway as any).writeHeaders(mockRes, 200, {
+      'content-type': 'application/json',
+      'transfer-encoding': 'chunked',
+      connection: 'keep-alive',
+      'proxy-connection': 'keep-alive',
+      upgrade: 'h2c',
+      'x-custom-header': 'safe',
+    });
+
+    expect(mockRes.writeHead).toHaveBeenCalledTimes(1);
+    const writtenHeaders = mockRes.writeHead.mock.calls[0][1];
+    expect(writtenHeaders['content-type']).toBe('application/json');
+    expect(writtenHeaders['x-custom-header']).toBe('safe');
+    expect(writtenHeaders['transfer-encoding']).toBeUndefined();
+    expect(writtenHeaders['connection']).toBeUndefined();
+    expect(writtenHeaders['proxy-connection']).toBeUndefined();
+    expect(writtenHeaders['upgrade']).toBeUndefined();
+  });
+
+  it('rotates account and retries when upstream returns 429 quota error', async () => {
+    const account1: CloudAccount = {
+      id: 'acc-1',
+      provider: 'google',
+      email: 'acc1@example.com',
+      is_active: true,
+      created_at: Date.now(),
+      last_used: Date.now(),
+      token: {
+        access_token: 'token-1',
+        refresh_token: 'ref-1',
+        expires_in: 3600,
+        expiry_timestamp: Date.now() + 3600000,
+        token_type: 'Bearer',
+        project_id: 'project-1',
+      },
+    };
+
+    const account2: CloudAccount = {
+      id: 'acc-2',
+      provider: 'google',
+      email: 'acc2@example.com',
+      is_active: true,
+      created_at: Date.now(),
+      last_used: Date.now(),
+      token: {
+        access_token: 'token-2',
+        refresh_token: 'ref-2',
+        expires_in: 3600,
+        expiry_timestamp: Date.now() + 3600000,
+        token_type: 'Bearer',
+        project_id: 'project-2',
+      },
+    };
+
+    let leaseCount = 0;
+    const mockAccountLeaseService: any = {
+      getNextToken: vi.fn(async () => {
+        leaseCount++;
+        return leaseCount === 1 ? account1 : account2;
+      }),
+      markFromUpstreamError: vi.fn(async () => {}),
+    };
+
+    const gateway = new CloudCodeFailoverGateway(mockAccountLeaseService);
+
+    // Mock executeUpstreamCall: attempt 1 returns 429, attempt 2 returns 200
+    let attemptCount = 0;
+    (gateway as any).executeUpstreamCall = vi.fn(async () => {
+      attemptCount++;
+      if (attemptCount === 1) {
+        return {
+          statusCode: 429,
+          headers: { 'content-type': 'application/json' },
+          bodyStream: new PassThrough(),
+          bufferedBody: Buffer.from(
+            JSON.stringify({ error: { code: 429, message: 'RESOURCE_EXHAUSTED' } }),
+          ),
+        };
+      } else {
+        const streamStub = new PassThrough();
+        process.nextTick(() => {
+          streamStub.write('{"result":"success"}');
+          streamStub.end();
+        });
+        return {
+          statusCode: 200,
+          headers: { 'content-type': 'application/json' },
+          bodyStream: streamStub,
+        };
+      }
+    });
+
+    const mockReq: any = {
+      url: '/v1internal:streamGenerateContent',
+      method: 'POST',
+      headers: { host: 'daily-cloudcode-pa.googleapis.com' },
+      [Symbol.asyncIterator]: async function* () {
+        yield Buffer.from(JSON.stringify({ model: 'gemini-2.5-pro', contents: [] }));
+      },
+    };
+
+    const mockRes: any = new PassThrough();
+    mockRes.writeHead = vi.fn();
+    mockRes.headersSent = false;
+
+    await gateway.handleRequest(mockReq, mockRes);
+
+    expect(mockAccountLeaseService.markFromUpstreamError).toHaveBeenCalledWith({
+      accountIdOrEmail: 'acc-1',
+      status: 429,
+      model: 'gemini-2.5-pro',
+      reason: expect.anything(),
+    });
+    expect(mockAccountLeaseService.getNextToken).toHaveBeenCalledTimes(2);
+    expect(mockRes.writeHead).toHaveBeenCalledWith(200, expect.anything());
+  });
 });
 
 describe('ConnectIngressService', () => {
@@ -42,5 +178,33 @@ describe('ConnectIngressService', () => {
 
     expect(() => ingress.attach(server)).not.toThrow();
     expect(() => ingress.close()).not.toThrow();
+  });
+
+  it('handles CONNECT request for target host and non-target tunnel', async () => {
+    const server = http.createServer();
+    const ingress = new ConnectIngressService();
+    ingress.attach(server);
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const port = (server.address() as net.AddressInfo).port;
+
+    const response = await new Promise<string>((resolve, reject) => {
+      const client = net.connect(port, '127.0.0.1', () => {
+        client.write(
+          'CONNECT daily-cloudcode-pa.googleapis.com:443 HTTP/1.1\r\nHost: daily-cloudcode-pa.googleapis.com:443\r\n\r\n',
+        );
+      });
+      client.on('data', (d) => {
+        client.destroy();
+        resolve(d.toString('utf-8'));
+      });
+      client.on('error', reject);
+    });
+
+    expect(response).toContain('HTTP/1.1 200 Connection Established');
+
+    ingress.close();
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 });

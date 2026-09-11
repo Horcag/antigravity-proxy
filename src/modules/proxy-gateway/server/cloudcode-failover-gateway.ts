@@ -12,21 +12,37 @@ export interface CloudCodeGatewayOptions {
 }
 
 export class CloudCodeFailoverGateway {
-  private upstreamHost: string;
+  private defaultUpstreamHost: string;
 
   constructor(
     private readonly accountLeaseService?: AccountLeaseService,
     options: CloudCodeGatewayOptions = {},
   ) {
-    this.upstreamHost = options.upstreamHost || 'daily-cloudcode-pa.googleapis.com';
+    this.defaultUpstreamHost = options.upstreamHost || 'daily-cloudcode-pa.googleapis.com';
   }
 
   async handleRequest(
     req: http.IncomingMessage | http2.Http2ServerRequest,
     res: http.ServerResponse | http2.Http2ServerResponse,
   ): Promise<void> {
-    const url = req.url || '/';
+    const rawUrl = req.url || '/';
+    let urlPath = rawUrl;
+    if (urlPath.startsWith('http://') || urlPath.startsWith('https://')) {
+      try {
+        const parsed = new URL(urlPath);
+        urlPath = parsed.pathname + parsed.search;
+      } catch {
+        // preserve urlPath
+      }
+    }
+
     const method = req.method || 'POST';
+
+    // Determine upstream target host from :authority or host header
+    const targetHost =
+      (req.headers[':authority'] as string) ||
+      (req.headers['host'] as string)?.split(':')[0]?.trim() ||
+      this.defaultUpstreamHost;
 
     // 1. Buffer the full client request body
     const bodyChunks: Buffer[] = [];
@@ -41,12 +57,25 @@ export class CloudCodeFailoverGateway {
     try {
       if (rawBody.length > 0) {
         parsedBody = JSON.parse(rawBody.toString('utf-8'));
-        if (parsedBody && typeof parsedBody.model === 'string') {
-          modelName = parsedBody.model;
+        if (parsedBody && typeof parsedBody === 'object') {
+          if (typeof parsedBody.model === 'string' && parsedBody.model) {
+            modelName = parsedBody.model;
+          } else if (
+            typeof (parsedBody.request as Record<string, unknown> | undefined)?.model === 'string'
+          ) {
+            modelName = (parsedBody.request as Record<string, unknown>).model as string;
+          }
         }
       }
     } catch {
       // not JSON or stream; proceed with raw bytes
+    }
+
+    if (!modelName) {
+      const urlMatch = urlPath.match(/\/models\/([^/:]+)/);
+      if (urlMatch && urlMatch[1]) {
+        modelName = urlMatch[1];
+      }
     }
 
     // 3. Failover retry loop (ResponseCommitGate)
@@ -86,12 +115,23 @@ export class CloudCodeFailoverGateway {
         }
       }
 
-      upstreamHeaders['host'] = this.upstreamHost;
-      upstreamHeaders['content-length'] = String(payloadToSend.length);
+      upstreamHeaders['host'] = targetHost;
+
+      if (
+        payloadToSend.length > 0 ||
+        method === 'POST' ||
+        method === 'PUT' ||
+        method === 'PATCH'
+      ) {
+        upstreamHeaders['content-length'] = String(payloadToSend.length);
+      }
 
       if (account?.token?.access_token) {
         upstreamHeaders['authorization'] = `Bearer ${account.token.access_token}`;
+      } else if (!account && attempt === 1 && req.headers['authorization']) {
+        upstreamHeaders['authorization'] = String(req.headers['authorization']);
       }
+
       if (projectId) {
         upstreamHeaders['x-goog-user-project'] = projectId;
       }
@@ -99,64 +139,67 @@ export class CloudCodeFailoverGateway {
       try {
         const upstreamResult = await this.executeUpstreamCall(
           method,
-          url,
+          urlPath,
           upstreamHeaders,
           payloadToSend,
+          targetHost,
         );
 
-        const { statusCode, headers, bodyStream, initialChunk } = upstreamResult;
+        const { statusCode, headers, bodyStream, bufferedBody } = upstreamResult;
 
         // Check for rate limit / quota exhaustion
-        const isRateLimited =
-          statusCode === 429 ||
-          (statusCode === 403 && this.isQuotaErrorText(initialChunk?.toString('utf-8')));
+        if (statusCode >= 400) {
+          const errorText = bufferedBody ? bufferedBody.toString('utf-8') : '';
+          const isRateLimited =
+            statusCode === 429 ||
+            (statusCode === 403 && this.isQuotaErrorText(errorText));
 
-        if (isRateLimited) {
-          logger.warn(
-            `[CloudCodeGateway] Upstream returned ${statusCode} for account ${
-              account?.email || 'unknown'
-            } (attempt ${attempt}/${maxAttempts}). Rotating to next account...`,
-          );
+          if (isRateLimited) {
+            logger.warn(
+              `[CloudCodeGateway] Upstream returned ${statusCode} for account ${
+                account?.email || 'unknown'
+              } (attempt ${attempt}/${maxAttempts}). Rotating to next account...`,
+            );
 
-          if (this.accountLeaseService && account) {
-            await this.accountLeaseService.markFromUpstreamError({
-              accountIdOrEmail: account.id,
-              status: 429,
-              model: modelName,
-              reason: RateLimitReason.RateLimitExceeded,
-            });
+            if (this.accountLeaseService && account) {
+              await this.accountLeaseService.markFromUpstreamError({
+                accountIdOrEmail: account.id,
+                status: 429,
+                model: modelName,
+                reason: RateLimitReason.RateLimitExceeded,
+              });
+            }
+
+            continue;
           }
 
-          // Destroy unused upstream stream and retry with next account
-          bodyStream.destroy();
-          continue;
+          // Non-retriable error: commit to client
+          this.writeHeaders(res, statusCode, headers);
+          if (bufferedBody && bufferedBody.length > 0) {
+            res.end(bufferedBody);
+          } else {
+            res.end();
+          }
+          return;
         }
 
         // --- COMMIT POINT ---
-        // Success or non-retriable response: commit to client!
-        const responseHeaders: Record<string, string | string[]> = {};
-        for (const [k, v] of Object.entries(headers)) {
-          if (
-            !k.startsWith(':') &&
-            k.toLowerCase() !== 'transfer-encoding' &&
-            k.toLowerCase() !== 'connection'
-          ) {
-            if (v !== undefined) {
-              responseHeaders[k] = v;
-            }
-          }
-        }
-
-        const anyRes = res as any;
-        if (typeof anyRes.writeHead === 'function') {
-          anyRes.writeHead(statusCode, responseHeaders);
-        }
-
-        if (initialChunk && initialChunk.length > 0) {
-          anyRes.write(initialChunk);
-        }
+        // Success (200 OK): commit headers to client and stream response
+        this.writeHeaders(res, statusCode, headers);
 
         bodyStream.pipe(res);
+
+        res.on('close', () => {
+          bodyStream.destroy();
+        });
+
+        bodyStream.on('error', (err) => {
+          logger.warn('[CloudCodeGateway] Upstream streaming error', err);
+          if (!res.writableEnded) {
+            res.destroy(err);
+          }
+        });
+
         return;
       } catch (err: unknown) {
         logger.warn(
@@ -167,8 +210,8 @@ export class CloudCodeFailoverGateway {
         if (attempt === maxAttempts) {
           const anyRes = res as any;
           if (!anyRes.headersSent) {
-            anyRes.writeHead(502, { 'content-type': 'application/json' });
-            anyRes.end(
+            this.writeHeaders(res, 502, { 'content-type': 'application/json' });
+            res.end(
               JSON.stringify({
                 error: {
                   code: 502,
@@ -187,8 +230,8 @@ export class CloudCodeFailoverGateway {
     // All accounts exhausted
     const anyRes = res as any;
     if (!anyRes.headersSent) {
-      anyRes.writeHead(429, { 'content-type': 'application/json' });
-      anyRes.end(
+      this.writeHeaders(res, 429, { 'content-type': 'application/json' });
+      res.end(
         JSON.stringify({
           error: {
             code: 429,
@@ -197,6 +240,32 @@ export class CloudCodeFailoverGateway {
           },
         }),
       );
+    }
+  }
+
+  private writeHeaders(
+    res: http.ServerResponse | http2.Http2ServerResponse,
+    statusCode: number,
+    headers: http.IncomingHttpHeaders,
+  ): void {
+    const responseHeaders: Record<string, string | string[]> = {};
+    const forbidden = new Set([
+      'connection',
+      'keep-alive',
+      'proxy-connection',
+      'transfer-encoding',
+      'upgrade',
+    ]);
+
+    for (const [k, v] of Object.entries(headers)) {
+      if (!k.startsWith(':') && !forbidden.has(k.toLowerCase()) && v !== undefined) {
+        responseHeaders[k] = v;
+      }
+    }
+
+    const anyRes = res as any;
+    if (typeof anyRes.writeHead === 'function') {
+      anyRes.writeHead(statusCode, responseHeaders);
     }
   }
 
@@ -216,15 +285,16 @@ export class CloudCodeFailoverGateway {
     url: string,
     headers: Record<string, string>,
     payload: Buffer,
+    upstreamHost: string,
   ): Promise<{
     statusCode: number;
     headers: http.IncomingHttpHeaders;
     bodyStream: http.IncomingMessage;
-    initialChunk?: Buffer;
+    bufferedBody?: Buffer;
   }> {
     return new Promise((resolve, reject) => {
       const options: https.RequestOptions = {
-        hostname: this.upstreamHost,
+        hostname: upstreamHost,
         port: 443,
         path: url,
         method,
@@ -234,26 +304,21 @@ export class CloudCodeFailoverGateway {
       const upstreamReq = https.request(options, (upstreamRes) => {
         const statusCode = upstreamRes.statusCode || 200;
 
-        // If error status, buffer the first chunk to inspect before committing
+        // If error status, buffer entire error body before deciding
         if (statusCode >= 400) {
-          upstreamRes.once('data', (firstChunk: Buffer) => {
+          const chunks: Buffer[] = [];
+          upstreamRes.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+          upstreamRes.on('end', () => {
             resolve({
               statusCode,
               headers: upstreamRes.headers,
               bodyStream: upstreamRes,
-              initialChunk: Buffer.isBuffer(firstChunk) ? firstChunk : Buffer.from(firstChunk),
+              bufferedBody: Buffer.concat(chunks),
             });
           });
-
-          upstreamRes.once('end', () => {
-            resolve({
-              statusCode,
-              headers: upstreamRes.headers,
-              bodyStream: upstreamRes,
-            });
-          });
+          upstreamRes.on('error', reject);
         } else {
-          // Success status: immediate resolve
+          // Success status: stream directly
           resolve({
             statusCode,
             headers: upstreamRes.headers,

@@ -9,6 +9,7 @@ export const TARGET_CLOUDCODE_HOSTS = [
   'daily-cloudcode-pa.googleapis.com',
   'cloudcode-pa.googleapis.com',
   'daily-cloudcode-pa.sandbox.googleapis.com',
+  'generativelanguage.googleapis.com',
 ] as const;
 
 export class CaManager {
@@ -19,8 +20,10 @@ export class CaManager {
     if (!hostOnly) {
       return false;
     }
-    return TARGET_CLOUDCODE_HOSTS.some(
-      (target) => hostOnly === target || hostOnly.endsWith('.googleapis.com'),
+    return (
+      TARGET_CLOUDCODE_HOSTS.some((target) => hostOnly === target) ||
+      hostOnly.includes('cloudcode-pa') ||
+      hostOnly.endsWith('generativelanguage.googleapis.com')
     );
   }
 
@@ -71,7 +74,7 @@ export class CaManager {
       const sanList = TARGET_CLOUDCODE_HOSTS.map((h) => `DNS:${h}`).join(',');
       fs.writeFileSync(
         extPath,
-        `subjectAltName=${sanList},DNS:*.googleapis.com\nextendedKeyUsage=serverAuth\n`,
+        `subjectAltName=${sanList},DNS:*.googleapis.com,DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n`,
         { encoding: 'utf-8' },
       );
 

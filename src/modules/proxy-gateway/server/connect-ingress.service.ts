@@ -9,6 +9,7 @@ import { AccountLeaseService } from './account-lease.service';
 export class ConnectIngressService {
   private h2Server: http2.Http2SecureServer | null = null;
   private failoverGateway: CloudCodeFailoverGateway;
+  private activeSockets = new Set<net.Socket>();
 
   constructor(accountLeaseService?: AccountLeaseService) {
     this.failoverGateway = new CloudCodeFailoverGateway(accountLeaseService);
@@ -35,6 +36,15 @@ export class ConnectIngressService {
       },
     );
 
+    this.h2Server.on('error', (err) => {
+      logger.warn('[ConnectIngress] Internal TLS server error', err);
+    });
+
+    this.h2Server.on('clientError', (err, socket) => {
+      logger.debug(`[ConnectIngress] Client TLS error: ${err.message}`);
+      socket.destroy();
+    });
+
     httpServer.on('connect', (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
       this.handleConnect(req, clientSocket, head);
     });
@@ -49,6 +59,11 @@ export class ConnectIngressService {
     clientSocket: net.Socket,
     head: Buffer,
   ): void {
+    this.activeSockets.add(clientSocket);
+    clientSocket.once('close', () => {
+      this.activeSockets.delete(clientSocket);
+    });
+
     const destination = req.url || '';
     const [host, portStr] = destination.split(':');
     const port = parseInt(portStr || '443', 10);
@@ -81,6 +96,11 @@ export class ConnectIngressService {
       upstreamSocket.pipe(clientSocket);
     });
 
+    this.activeSockets.add(upstreamSocket);
+    upstreamSocket.once('close', () => {
+      this.activeSockets.delete(upstreamSocket);
+    });
+
     upstreamSocket.on('error', (err) => {
       logger.debug(`[ConnectIngress] Upstream tunnel error for ${destination}: ${err.message}`);
       clientSocket.destroy();
@@ -88,6 +108,15 @@ export class ConnectIngressService {
   }
 
   close(): void {
+    for (const socket of this.activeSockets) {
+      try {
+        socket.destroy();
+      } catch {
+        // ignore error
+      }
+    }
+    this.activeSockets.clear();
+
     if (this.h2Server) {
       try {
         this.h2Server.close();
