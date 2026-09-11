@@ -138,13 +138,19 @@ export class CloudCodeFailoverGateway {
         upstreamHeaders['content-length'] = String(payloadToSend.length);
       }
 
+      logger.debug(
+        `[CloudCodeGateway] Attempt ${attempt} account=${account?.email} headers: ${JSON.stringify(
+          req.headers,
+        )}`,
+      );
+
       if (account?.token?.access_token) {
         upstreamHeaders['authorization'] = `Bearer ${account.token.access_token}`;
       } else if (!account && attempt === 1 && req.headers['authorization']) {
         upstreamHeaders['authorization'] = String(req.headers['authorization']);
       }
 
-      if (projectId && (req.headers['x-goog-user-project'] || ('project' in (parsedBody || {})))) {
+      if (projectId && req.headers['x-goog-user-project']) {
         upstreamHeaders['x-goog-user-project'] = projectId;
       }
 
