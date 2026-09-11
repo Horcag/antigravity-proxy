@@ -131,7 +131,38 @@ export class CaManager {
     });
 
     logger.info(`Transparent CA ready at: ${caCertPath}`);
+
+    // Generate merged trust bundle for agy containing system roots + local root CA
+    const trustBundlePath = path.join(certsDir, 'agy-trust.pem');
+    const systemCaPaths = [
+      '/etc/ssl/certs/ca-certificates.crt',
+      '/etc/pki/tls/certs/ca-bundle.crt',
+      '/etc/ssl/ca-bundle.pem',
+    ];
+    let systemCa = '';
+    for (const sysPath of systemCaPaths) {
+      if (fs.existsSync(sysPath)) {
+        systemCa = fs.readFileSync(sysPath, 'utf-8');
+        break;
+      }
+    }
+    fs.writeFileSync(
+      trustBundlePath,
+      `${systemCa.trim()}\n\n# Antigravity Proxy Local Root CA\n${ca.toString('utf-8').trim()}\n`,
+      { encoding: 'utf-8', mode: 0o644 },
+    );
+    logger.info(`Merged trust bundle ready at: ${trustBundlePath}`);
+
     return this.secureContext;
+  }
+
+  static getTrustBundlePath(): string {
+    const certsDir = getCertsDir();
+    const trustBundlePath = path.join(certsDir, 'agy-trust.pem');
+    if (!fs.existsSync(trustBundlePath)) {
+      this.ensureCertificates();
+    }
+    return trustBundlePath;
   }
 
   static getSecureContext(): tls.SecureContext {
