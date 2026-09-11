@@ -30,6 +30,12 @@ describe('CaManager', () => {
 
     const caContent = fs.readFileSync(caPath, 'utf-8');
     expect(caContent).toContain('BEGIN CERTIFICATE');
+
+    const bundlePath = CaManager.getTrustBundlePath();
+    expect(bundlePath).toContain('agy-trust.pem');
+    expect(fs.existsSync(bundlePath)).toBe(true);
+    const bundleContent = fs.readFileSync(bundlePath, 'utf-8');
+    expect(bundleContent).toContain('Antigravity Proxy Local Root CA');
   });
 });
 
