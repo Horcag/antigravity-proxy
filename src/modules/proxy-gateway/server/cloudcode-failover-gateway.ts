@@ -6,11 +6,22 @@ import { logger } from '../../../shared/logging/logger';
 import { AccountLeaseService } from './account-lease.service';
 import { CloudAccount } from '../../cloud-account/types';
 import { RateLimitReason } from './rate-limit-tracker';
-import { CaManager } from './cert/ca-manager';
+import { CaManager, parseTargetAuthority } from './cert/ca-manager';
+
+export interface ProtocolFrameDecision {
+  state: 'NEED_MORE_DATA' | 'VALIDATED_RESPONSE' | 'VALIDATED_ERROR';
+  isQuota?: boolean;
+  isTransient?: boolean;
+  errorText?: string;
+}
 
 export interface CloudCodeGatewayOptions {
   accountLeaseService?: AccountLeaseService;
   upstreamHost?: string;
+}
+
+export function isVerifiedSessionKey(key: string | undefined): boolean {
+  return typeof key === 'string' && key.startsWith('session:');
 }
 
 export function extractCanonicalUserTurnText(turn: unknown): string | null {
@@ -23,6 +34,10 @@ export function extractCanonicalUserTurnText(turn: unknown): string | null {
     const texts = anyTurn.content
       .map((c: any) => {
         if (typeof c?.text === 'string') return c.text.trim();
+        if (c?.type === 'image' && c?.source?.data) {
+          const hash = crypto.createHash('sha256').update(c.source.data).digest('hex').slice(0, 16);
+          return `image:${c.source.media_type || 'unknown'}:${hash}`;
+        }
         if (c?.image_url?.url) return `image:${crypto.createHash('sha256').update(c.image_url.url).digest('hex').slice(0, 16)}`;
         if (c?.type) return `type:${c.type}`;
         return '';
@@ -74,14 +89,15 @@ export class CloudCodeFailoverGateway {
 
     const method = req.method || 'POST';
 
-    // Determine upstream target host from :authority or host header
-    const targetHost =
+    // Determine upstream target host strictly from :authority or host header
+    const rawAuthority =
       (req.headers[':authority'] as string) ||
-      (req.headers['host'] as string)?.split(':')[0]?.trim() ||
+      (req.headers['host'] as string) ||
       this.defaultUpstreamHost;
 
-    if (!CaManager.isTargetHost(`${targetHost}:443`)) {
-      logger.warn(`[CloudCodeGateway] Destination host not allowed for interception: ${targetHost}`);
+    const parsedAuthority = parseTargetAuthority(rawAuthority);
+    if (!parsedAuthority) {
+      logger.warn(`[CloudCodeGateway] Destination authority not allowed for interception: ${rawAuthority}`);
       const anyRes = res as any;
       if (typeof anyRes.writeHead === 'function') {
         anyRes.writeHead(403, { 'content-type': 'application/json' });
@@ -90,12 +106,14 @@ export class CloudCodeFailoverGateway {
         JSON.stringify({
           error: {
             code: 403,
-            message: `Host ${targetHost} is not authorized for transparent interception`,
+            message: `Authority '${rawAuthority}' is not authorized for transparent interception`,
           },
         }),
       );
       return;
     }
+
+    const targetHost = parsedAuthority.hostname;
 
     // F6: Early disconnect cleanup handlers attached immediately before any async wait
     let clientAborted = false;
@@ -220,6 +238,26 @@ export class CloudCodeFailoverGateway {
         }
       }
 
+      if (this.accountLeaseService && !lease) {
+        logger.warn(
+          `[CloudCodeGateway] No account lease available in managed pool on attempt ${attempt}. Disallowing unreserved passthrough.`,
+        );
+        if (!responseCommitted && !res.writableEnded) {
+          responseCommitted = true;
+          this.writeHeaders(res, 503, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              error: {
+                code: 503,
+                message: 'No available upstream account capacity in managed pool',
+                status: 'UNAVAILABLE',
+              },
+            }),
+          );
+        }
+        return;
+      }
+
       if (clientAborted || res.destroyed) {
         lease?.releaseReservation?.();
         return;
@@ -241,12 +279,13 @@ export class CloudCodeFailoverGateway {
       if (
         attempt > 1 &&
         sessionKey &&
+        isVerifiedSessionKey(sessionKey) &&
         account &&
         typeof this.accountLeaseService?.startSessionMigration === 'function'
       ) {
         this.accountLeaseService.startSessionMigration(
           sessionKey,
-          initialBinding?.generation ?? 1,
+          attemptGeneration,
           account.id,
           requestId,
         );
@@ -286,6 +325,15 @@ export class CloudCodeFailoverGateway {
 
       upstreamHeaders['host'] = targetHost;
 
+      // Strip hop-by-hop and incoming transfer framing so outbound is valid HTTP
+      delete upstreamHeaders['transfer-encoding'];
+      delete upstreamHeaders['connection'];
+      delete upstreamHeaders['proxy-connection'];
+      delete upstreamHeaders['proxy-authorization'];
+      delete upstreamHeaders['te'];
+      delete upstreamHeaders['keep-alive'];
+      delete upstreamHeaders['upgrade'];
+
       if (
         payloadToSend.length > 0 ||
         method === 'POST' ||
@@ -295,9 +343,24 @@ export class CloudCodeFailoverGateway {
         upstreamHeaders['content-length'] = String(payloadToSend.length);
       }
 
+      // Redact sensitive headers before logging
+      const redactedHeaders: Record<string, unknown> = { ...req.headers };
+      for (const k of Object.keys(redactedHeaders)) {
+        const lk = k.toLowerCase();
+        if (
+          lk.includes('auth') ||
+          lk.includes('token') ||
+          lk.includes('key') ||
+          lk.includes('cookie') ||
+          lk.includes('secret')
+        ) {
+          redactedHeaders[k] = '[REDACTED]';
+        }
+      }
+
       logger.debug(
         `[CloudCodeGateway] Attempt ${attempt} account=${account?.email} headers: ${JSON.stringify(
-          req.headers,
+          redactedHeaders,
         )}`,
       );
 
@@ -404,62 +467,91 @@ export class CloudCodeFailoverGateway {
         }
 
         // F5 Pre-commit response validation: inspect first chunk of stream before writing headers
-        const firstChunk = await new Promise<Buffer | null>((resolve, reject) => {
-          let settled = false;
-          const chunks: Buffer[] = [];
-          let totalBytes = 0;
-          const cleanup = () => {
-            bodyStream.removeListener('data', onData);
-            bodyStream.removeListener('end', onEnd);
-            bodyStream.removeListener('close', onClose);
-            bodyStream.removeListener('error', onError);
-            req.removeListener?.('close', onClientClose);
-            res.removeListener?.('close', onClientClose);
-          };
-          const onData = (chunk: Buffer) => {
-            if (settled) return;
-            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-            chunks.push(buf);
-            totalBytes += buf.length;
-            const text = Buffer.concat(chunks).toString('utf-8');
-            if (text.includes('\n') || totalBytes >= 512) {
+        // F5 Pre-commit response validation: inspect complete protocol frame before writing headers
+        const firstChunkResult = await new Promise<{ buffer: Buffer | null; decision: ProtocolFrameDecision }>(
+          (resolve, reject) => {
+            let settled = false;
+            const chunks: Buffer[] = [];
+            let totalBytes = 0;
+            const cleanup = () => {
+              bodyStream.removeListener('data', onData);
+              bodyStream.removeListener('end', onEnd);
+              bodyStream.removeListener('close', onClose);
+              bodyStream.removeListener('error', onError);
+              req.removeListener?.('close', onClientClose);
+              res.removeListener?.('close', onClientClose);
+            };
+            const onData = (chunk: Buffer) => {
+              if (settled) return;
+              const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+              chunks.push(buf);
+              totalBytes += buf.length;
+              const combined = Buffer.concat(chunks);
+              const decision = this.classifyProtocolFrame(
+                contentType,
+                combined,
+                headers,
+                bodyStream.trailers,
+              );
+              if (decision.state !== 'NEED_MORE_DATA' || totalBytes >= 65536) {
+                settled = true;
+                cleanup();
+                bodyStream.pause();
+                resolve({ buffer: combined, decision });
+              }
+            };
+            const onEnd = () => {
+              if (settled) return;
               settled = true;
               cleanup();
-              bodyStream.pause();
-              resolve(Buffer.concat(chunks));
-            }
-          };
-          const onEnd = () => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            resolve(chunks.length > 0 ? Buffer.concat(chunks) : null);
-          };
-          const onClose = () => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            resolve(chunks.length > 0 ? Buffer.concat(chunks) : null);
-          };
-          const onError = (err: unknown) => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            reject(err);
-          };
-          const onClientClose = () => {
-            if (settled) return;
-            settled = true;
-            cleanup();
-            resolve(null);
-          };
-          bodyStream.on('data', onData);
-          bodyStream.once('end', onEnd);
-          bodyStream.once('close', onClose);
-          bodyStream.once('error', onError);
-          req.once?.('close', onClientClose);
-          res.once?.('close', onClientClose);
-        });
+              const combined = chunks.length > 0 ? Buffer.concat(chunks) : null;
+              const decision = this.classifyProtocolFrame(
+                contentType,
+                combined,
+                headers,
+                bodyStream.trailers,
+                true,
+              );
+              resolve({ buffer: combined, decision });
+            };
+            const onClose = () => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              if (!bodyStream.readableEnded) {
+                reject(new Error('Upstream stream closed prematurely before response completion'));
+              } else {
+                const combined = chunks.length > 0 ? Buffer.concat(chunks) : null;
+                const decision = this.classifyProtocolFrame(
+                  contentType,
+                  combined,
+                  headers,
+                  bodyStream.trailers,
+                  true,
+                );
+                resolve({ buffer: combined, decision });
+              }
+            };
+            const onError = (err: unknown) => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              reject(err);
+            };
+            const onClientClose = () => {
+              if (settled) return;
+              settled = true;
+              cleanup();
+              resolve({ buffer: null, decision: { state: 'VALIDATED_ERROR', isTransient: true } });
+            };
+            bodyStream.on('data', onData);
+            bodyStream.once('end', onEnd);
+            bodyStream.once('close', onClose);
+            bodyStream.once('error', onError);
+            req.once?.('close', onClientClose);
+            res.once?.('close', onClientClose);
+          },
+        );
 
         if (clientAborted || res.destroyed) {
           cleanupActiveAttempt();
@@ -467,96 +559,92 @@ export class CloudCodeFailoverGateway {
           return;
         }
 
-        // Check terminal gRPC error when stream ends without data (Probe C14)
-        const terminalGrpcStatus = bodyStream.trailers?.['grpc-status'] ?? headers['grpc-status'];
-        if (firstChunk === null && terminalGrpcStatus !== undefined && String(terminalGrpcStatus) !== '0') {
-          const statusStr = String(terminalGrpcStatus);
+        const firstChunk = firstChunkResult.buffer;
+        const frameDecision = firstChunkResult.decision;
+
+        // Terminal gRPC error or protocol error
+        if (frameDecision.state === 'VALIDATED_ERROR') {
           cleanupActiveAttempt();
           bodyStream.destroy();
-          if (statusStr === '8') {
+          if (
+            sessionKey &&
+            isVerifiedSessionKey(sessionKey) &&
+            account &&
+            typeof this.accountLeaseService?.failSessionMigrationCandidate === 'function'
+          ) {
+            this.accountLeaseService.failSessionMigrationCandidate(
+              sessionKey,
+              attemptGeneration,
+              account.id,
+              requestId,
+            );
+          }
+
+          if (frameDecision.isQuota) {
             logger.warn(
-              `[CloudCodeGateway] Terminal gRPC status 8 (RESOURCE_EXHAUSTED) in trailers for account ${
+              `[CloudCodeGateway] Quota error for account ${
                 account?.email || 'unknown'
-              }. Rotating to next account...`,
+              }: ${frameDecision.errorText}. Rotating to next account...`,
             );
             if (this.accountLeaseService && account) {
               await this.accountLeaseService.markFromUpstreamError({
                 accountIdOrEmail: account.id,
                 status: 429,
                 model: modelName,
+                body: frameDecision.errorText,
                 headers: { ...headers, ...bodyStream.trailers },
                 reason: RateLimitReason.QuotaExhausted,
               });
             }
             continue;
           }
-          if (statusStr === '14') {
+
+          if (frameDecision.isTransient) {
             logger.warn(
-              `[CloudCodeGateway] Terminal gRPC status 14 (UNAVAILABLE) in trailers for account ${
+              `[CloudCodeGateway] Transient upstream error for account ${
                 account?.email || 'unknown'
-              }. Retrying without penalty...`,
+              }: ${frameDecision.errorText}. Retrying without quota penalty...`,
             );
             continue;
           }
-          // Non-retriable terminal gRPC error
+
+          // Non-retriable protocol error
           responseCommitted = true;
           this.writeHeaders(res, statusCode, { ...headers, ...bodyStream.trailers });
-          res.end();
-          return;
-        }
-
-        // Validate first chunk using protocol-level error classifier (Probe C11, C12)
-        const protocolError = this.parseProtocolQuotaError(contentType, firstChunk, headers, bodyStream.trailers);
-        if (protocolError.isQuotaError) {
-          logger.warn(
-            `[CloudCodeGateway] Protocol quota error for account ${
-              account?.email || 'unknown'
-            }: ${protocolError.errorText}. Rotating to next account...`,
-          );
-          cleanupActiveAttempt();
-          bodyStream.destroy();
-          if (this.accountLeaseService && account) {
-            await this.accountLeaseService.markFromUpstreamError({
-              accountIdOrEmail: account.id,
-              status: 429,
-              model: modelName,
-              body: protocolError.errorText,
-              headers,
-              reason: RateLimitReason.QuotaExhausted,
-            });
+          if (firstChunk && firstChunk.length > 0) {
+            res.end(firstChunk);
+          } else {
+            res.end();
           }
-          continue;
+          return;
         }
 
         // --- COMMIT POINT ---
         // Verify session binding or migration confirmation BEFORE committing response (Probe C22)
-        if (sessionKey && account) {
-          const currentBinding = this.accountLeaseService?.getSessionBinding?.(sessionKey);
-          if (currentBinding && currentBinding.state === 'migrating') {
-            if (typeof this.accountLeaseService?.confirmSessionMigration === 'function') {
-              const confirmed = this.accountLeaseService.confirmSessionMigration(
-                sessionKey,
-                currentBinding.generation,
-                account.id,
-                requestId,
+        if (sessionKey && account && isVerifiedSessionKey(sessionKey)) {
+          if (typeof this.accountLeaseService?.confirmOrBindSession === 'function') {
+            const confirmed = this.accountLeaseService.confirmOrBindSession(
+              sessionKey,
+              account.id,
+              attemptGeneration,
+              requestId,
+            );
+            if (confirmed === false) {
+              logger.warn(
+                `[CloudCodeGateway] Session confirmation rejected for session ${sessionKey} (lost race or mismatched owner); suppressing output`,
               );
-              if (!confirmed) {
-                logger.warn(
-                  `[CloudCodeGateway] Migration confirmation rejected for session ${sessionKey} (lost race or mismatched owner); suppressing output`,
-                );
-                cleanupActiveAttempt();
-                bodyStream.destroy();
-                continue;
-              }
+              cleanupActiveAttempt();
+              bodyStream.destroy();
+              continue;
             }
           } else if (typeof this.accountLeaseService?.bindSession === 'function') {
             const bound = this.accountLeaseService.bindSession(
               sessionKey,
               account.id,
               undefined,
-              currentBinding?.generation ?? 1,
+              attemptGeneration,
             );
-            if (!bound && currentBinding && currentBinding.accountId !== account.id) {
+            if (bound === false) {
               logger.warn(
                 `[CloudCodeGateway] Session binding rejected for session ${sessionKey} (lost race); suppressing output`,
               );
@@ -613,13 +701,40 @@ export class CloudCodeFailoverGateway {
             if (!bodyStream.readableEnded && !res.writableEnded) {
               res.destroy(new Error('Upstream stream closed prematurely'));
             }
+            onDone();
           });
         });
 
         if (firstChunk && firstChunk.length > 0) {
           const drained = (res as any).write(firstChunk);
           if (!drained && !res.writableEnded) {
-            await new Promise<void>((r) => (res as any).once('drain', r));
+            await new Promise<void>((resolve) => {
+              let settled = false;
+              const onDone = () => {
+                if (!settled) {
+                  settled = true;
+                  cleanup();
+                  resolve();
+                }
+              };
+              const cleanup = () => {
+                (res as any).removeListener?.('drain', onDone);
+                (res as any).removeListener?.('close', onDone);
+                (res as any).removeListener?.('error', onDone);
+                req.removeListener?.('close', onDone);
+                req.removeListener?.('aborted', onDone);
+              };
+              (res as any).once('drain', onDone);
+              (res as any).once('close', onDone);
+              (res as any).once('error', onDone);
+              req.once?.('close', onDone);
+              req.once?.('aborted', onDone);
+            });
+            if (res.writableEnded || (res as any).destroyed || clientAborted) {
+              cleanupActiveAttempt();
+              bodyStream.destroy();
+              return;
+            }
           }
         }
 
@@ -718,75 +833,124 @@ export class CloudCodeFailoverGateway {
     );
   }
 
-  private parseProtocolQuotaError(
+  public classifyProtocolFrame(
     contentType: string | undefined,
-    firstChunk: Buffer | null,
-    headers: http.IncomingHttpHeaders,
-    trailers?: http.IncomingHttpHeaders,
-  ): { isQuotaError: boolean; isTransientError: boolean; errorText: string } {
-    const grpcStatus = trailers?.['grpc-status'] ?? headers['grpc-status'];
+    buffer: Buffer | null,
+    headers?: http.IncomingHttpHeaders,
+    trailers?: NodeJS.Dict<string | string[]>,
+    streamEnded?: boolean,
+  ): ProtocolFrameDecision {
+    const grpcStatus = trailers?.['grpc-status'] ?? headers?.['grpc-status'];
     if (grpcStatus !== undefined && String(grpcStatus) !== '0') {
-      const statusStr = String(grpcStatus);
-      if (statusStr === '8') {
-        return { isQuotaError: true, isTransientError: false, errorText: 'gRPC status 8: RESOURCE_EXHAUSTED' };
-      }
-      if (statusStr === '14') {
-        return { isQuotaError: false, isTransientError: true, errorText: 'gRPC status 14: UNAVAILABLE' };
-      }
-      return { isQuotaError: false, isTransientError: false, errorText: `gRPC status ${statusStr}` };
+      const code = String(grpcStatus);
+      const isQuota = code === '8';
+      const isTransient = code === '14';
+      return {
+        state: 'VALIDATED_ERROR',
+        isQuota,
+        isTransient,
+        errorText: `gRPC status ${code}: ${trailers?.['grpc-message'] ?? headers?.['grpc-message'] ?? ''}`,
+      };
     }
 
-    if (!firstChunk || firstChunk.length === 0) {
-      return { isQuotaError: false, isTransientError: false, errorText: '' };
+    if (!buffer || buffer.length === 0) {
+      return streamEnded ? { state: 'VALIDATED_RESPONSE' } : { state: 'NEED_MORE_DATA' };
     }
 
-    const chunkStr = firstChunk.toString('utf-8');
+    const text = buffer.toString('utf-8');
+    const isSse = Boolean(contentType?.includes('text/event-stream'));
 
-    // SSE event-stream: check data lines
-    if (contentType && contentType.includes('text/event-stream')) {
-      const lines = chunkStr.split('\n');
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith('data:')) {
-          const jsonPayload = trimmed.slice(5).trim();
-          if (jsonPayload && jsonPayload !== '[DONE]') {
-            try {
-              const parsed = JSON.parse(jsonPayload);
-              if (parsed && typeof parsed === 'object') {
-                if (parsed.candidates || parsed.choices || parsed.functionCall || (parsed as any).parts) {
-                  return { isQuotaError: false, isTransientError: false, errorText: '' };
-                }
-                if (parsed.error && typeof parsed.error === 'object') {
-                  const err = parsed.error;
-                  const code = err.code ?? err.status;
-                  const msg = String(err.message || '').toLowerCase();
-                  const isQuota =
-                    code === 429 ||
-                    code === 'RESOURCE_EXHAUSTED' ||
-                    msg.includes('quota') ||
-                    msg.includes('resource_exhausted') ||
-                    msg.includes('rate limit');
-                  if (isQuota) {
-                    return { isQuotaError: true, isTransientError: false, errorText: JSON.stringify(err) };
-                  }
-                }
-              }
-            } catch {
-              // Fragmented chunk; ignore non-error frames
-            }
+    if (isSse) {
+      // SSE Framing: An event must end with a blank line (\n\n or \r\n\r\n)
+      if (!text.includes('\n\n') && !text.includes('\r\n\r\n')) {
+        return { state: 'NEED_MORE_DATA' };
+      }
+
+      // Parse complete events
+      const rawEvents = text.split(/\r?\n\r?\n/);
+      const completeEvents =
+        text.endsWith('\n\n') || text.endsWith('\r\n\r\n')
+          ? rawEvents.filter(Boolean)
+          : rawEvents.slice(0, -1).filter(Boolean);
+
+      if (completeEvents.length === 0) {
+        return { state: 'NEED_MORE_DATA' };
+      }
+
+      for (const eventStr of completeEvents) {
+        const lines = eventStr.split(/\r?\n/);
+        const dataLines: string[] = [];
+
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (trimmedLine.startsWith(':')) {
+            // Ignore SSE keep-alive/comment lines (Probe C10)
+            continue;
+          }
+          if (trimmedLine.startsWith('data:')) {
+            dataLines.push(trimmedLine.slice(5).trim());
           }
         }
+
+        if (dataLines.length === 0) {
+          // Event consisted entirely of comments or empty lines
+          continue;
+        }
+
+        const dataContent = dataLines.join('\n');
+        if (dataContent === '[DONE]') {
+          return { state: 'VALIDATED_RESPONSE' };
+        }
+
+        try {
+          const parsed = JSON.parse(dataContent);
+          if (parsed && typeof parsed === 'object') {
+            if (parsed.error && typeof parsed.error === 'object') {
+              const err = parsed.error;
+              const code = err.code ?? err.status;
+              const msg = String(err.message || '').toLowerCase();
+              const isQuota =
+                code === 429 ||
+                code === 'RESOURCE_EXHAUSTED' ||
+                msg.includes('quota') ||
+                msg.includes('resource_exhausted') ||
+                msg.includes('rate limit');
+              return {
+                state: 'VALIDATED_ERROR',
+                isQuota,
+                isTransient: code === 503 || msg.includes('unavailable'),
+                errorText: JSON.stringify(err),
+              };
+            }
+            if (
+              parsed.candidates ||
+              parsed.choices ||
+              parsed.functionCall ||
+              (parsed as any).parts ||
+              (parsed as any).content
+            ) {
+              return { state: 'VALIDATED_RESPONSE' };
+            }
+            return { state: 'VALIDATED_RESPONSE' };
+          }
+        } catch {
+          // Incomplete JSON inside data event
+          return { state: 'NEED_MORE_DATA' };
+        }
       }
-      return { isQuotaError: false, isTransientError: false, errorText: '' };
+
+      return { state: 'NEED_MORE_DATA' };
     }
 
-    // JSON response
+    // JSON response (application/json or unspecified)
+    const trimmed = text.trim();
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+      return { state: buffer.length > 0 ? 'VALIDATED_RESPONSE' : 'NEED_MORE_DATA' };
+    }
+
     try {
-      const parsed = JSON.parse(chunkStr);
+      const parsed = JSON.parse(trimmed);
       if (parsed && typeof parsed === 'object') {
-        if (parsed.candidates || parsed.choices || parsed.functionCall || (parsed as any).parts) {
-          return { isQuotaError: false, isTransientError: false, errorText: '' };
-        }
         if (parsed.error && typeof parsed.error === 'object') {
           const err = parsed.error;
           const code = err.code ?? err.status;
@@ -797,26 +961,30 @@ export class CloudCodeFailoverGateway {
             msg.includes('quota') ||
             msg.includes('resource_exhausted') ||
             msg.includes('rate limit');
-          if (isQuota) {
-            return { isQuotaError: true, isTransientError: false, errorText: JSON.stringify(err) };
-          }
+          return {
+            state: 'VALIDATED_ERROR',
+            isQuota,
+            isTransient: code === 503 || msg.includes('unavailable'),
+            errorText: JSON.stringify(err),
+          };
         }
+        if (
+          parsed.candidates ||
+          parsed.choices ||
+          parsed.functionCall ||
+          (parsed as any).parts ||
+          (parsed as any).content
+        ) {
+          return { state: 'VALIDATED_RESPONSE' };
+        }
+        return { state: 'VALIDATED_RESPONSE' };
       }
     } catch {
-      // Non-JSON or fragmented; inspect only if starts with error envelope and does not have candidates
-      const trimmed = chunkStr.trim();
-      if (
-        trimmed.startsWith('{"error"') &&
-        !trimmed.includes('"candidates"') &&
-        !trimmed.includes('"choices"') &&
-        !trimmed.includes('"functionCall"') &&
-        (trimmed.includes('RESOURCE_EXHAUSTED') || trimmed.includes('429'))
-      ) {
-        return { isQuotaError: true, isTransientError: false, errorText: trimmed.slice(0, 512) };
-      }
+      // Incomplete JSON (e.g. {\n or partial error envelope across chunks, Probe C11, C12)
+      return { state: 'NEED_MORE_DATA' };
     }
 
-    return { isQuotaError: false, isTransientError: false, errorText: '' };
+    return { state: 'NEED_MORE_DATA' };
   }
 
   private executeUpstreamCall(

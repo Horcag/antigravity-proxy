@@ -44,6 +44,13 @@ export interface ProxyRetryAccountLeaseService {
   getBreakerGeneration?(accountId: string): number;
   markModelSuccess?(accountIdOrEmail: string, model: string, expectedBreakerGeneration?: number): void;
   bindSession?(sessionKey: string | undefined, accountId: string, ttlMs?: number, expectedGeneration?: number): boolean | void;
+  confirmOrBindSession?(
+    sessionKey: string | undefined,
+    accountId: string,
+    expectedGeneration?: number,
+    ownerRequestId?: string,
+    ttlMs?: number,
+  ): boolean;
   getSessionBinding?(sessionKey: string | undefined): { generation: number } | null;
 }
 
@@ -147,11 +154,19 @@ export class ProxyRetryPolicy {
     expectedGeneration?: number,
     expectedBreakerGeneration?: number,
   ): void {
-    if (sessionKey && this.accountLeaseService.bindSession) {
-      if (expectedGeneration !== undefined) {
-        this.accountLeaseService.bindSession(sessionKey, accountId, undefined, expectedGeneration);
-      } else {
-        this.accountLeaseService.bindSession(sessionKey, accountId);
+    if (sessionKey) {
+      if (typeof this.accountLeaseService.confirmOrBindSession === 'function') {
+        this.accountLeaseService.confirmOrBindSession(
+          sessionKey,
+          accountId,
+          expectedGeneration,
+        );
+      } else if (this.accountLeaseService.bindSession) {
+        if (expectedGeneration !== undefined) {
+          this.accountLeaseService.bindSession(sessionKey, accountId, undefined, expectedGeneration);
+        } else {
+          this.accountLeaseService.bindSession(sessionKey, accountId);
+        }
       }
     }
     if (!model) {

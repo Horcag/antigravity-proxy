@@ -2074,6 +2074,7 @@ describe('AccountLeaseService parity scheduling replay', () => {
       [1, 'acc-1'],
     ] as const) {
       service.clearAllRateLimits();
+      service.clearAllWorkReservationsForTesting?.();
       service.resetSelectionState();
       (service as any).selectionPolicy.bindSession(
         'openai:user-1',

@@ -21,7 +21,12 @@ export class ConnectIngressService {
     this.h2Server = http2.createSecureServer(
       {
         allowHTTP1: true,
-        SNICallback: (_servername, cb) => {
+        SNICallback: (servername, cb) => {
+          if (servername && !CaManager.isTargetHost(servername)) {
+            logger.warn(`[ConnectIngress] SNI servername not allowed: ${servername}`);
+            cb(new Error(`SNI servername not allowed: ${servername}`));
+            return;
+          }
           cb(null, secureContext);
         },
       },

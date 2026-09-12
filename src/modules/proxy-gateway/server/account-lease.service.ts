@@ -143,7 +143,8 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   private readonly fulfillmentPolicy: AccountLeaseFulfillmentPolicy;
   private readonly modelPolicy: AccountLeaseModelPolicy;
   private readonly limitPolicy: AccountLeaseLimitPolicy;
-  private readonly inFlightWork: Map<string, number> = new Map();
+  private readonly activeReservations = new Map<string, string>();
+  private readonly accountReservations = new Map<string, Set<string>>();
   private readonly accountBreakerGenerations = new Map<string, number>();
   private readonly performancePolicy = new AccountPerformancePolicy();
 
@@ -428,8 +429,12 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   }
 
   clearAllRateLimits(): void {
-    this.inFlightWork.clear();
     this.limitPolicy.clearAllRateLimits();
+  }
+
+  clearAllWorkReservationsForTesting(): void {
+    this.activeReservations.clear();
+    this.accountReservations.clear();
   }
 
   recordParityError(): void {
@@ -548,6 +553,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
           allTokens: candidateAccountPool,
           getCurrentCandidates: () => this.buildCurrentCandidatePool(model, excludedAccountIds),
           sessionKey,
+          skipWait: true,
           model,
           getEffectiveModelForAccount: (id) =>
             model ? this.modelPolicy.resolveDynamicModelForAccount(id, model, false) : undefined,
@@ -768,24 +774,97 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
+  public failSessionMigrationCandidate(
+    sessionKey: string | undefined,
+    expectedGeneration: number,
+    failedAccountId: string,
+    ownerRequestId?: string,
+  ): boolean {
+    return this.selectionPolicy.failSessionMigrationCandidate(
+      sessionKey,
+      expectedGeneration,
+      failedAccountId,
+      ownerRequestId,
+    );
+  }
+
+  public confirmOrBindSession(
+    sessionKey: string | undefined,
+    accountId: string,
+    expectedGeneration?: number,
+    ownerRequestId?: string,
+    ttlMs?: number,
+  ): boolean {
+    if (!sessionKey || !accountId) return false;
+    const current = this.getSessionBinding(sessionKey);
+    const expiresAt = Date.now() + (ttlMs ?? this.stickySessionTtlMs);
+
+    if (current && current.state === 'migrating') {
+      return this.selectionPolicy.confirmSessionMigration(
+        sessionKey,
+        expectedGeneration ?? current.generation,
+        accountId,
+        ownerRequestId ?? current.migrationOwnerRequestId,
+        expiresAt,
+      );
+    }
+
+    if (current && current.accountId !== accountId) {
+      if (ownerRequestId) {
+        const started = this.selectionPolicy.startSessionMigration(
+          sessionKey,
+          current.generation,
+          accountId,
+          ownerRequestId,
+        );
+        if (started) {
+          return this.selectionPolicy.confirmSessionMigration(
+            sessionKey,
+            current.generation + 1,
+            accountId,
+            ownerRequestId,
+            expiresAt,
+          );
+        }
+      }
+      return false;
+    }
+
+    return this.selectionPolicy.bindSession(
+      sessionKey,
+      accountId,
+      expiresAt,
+      expectedGeneration ?? current?.generation,
+    );
+  }
+
   public acquireWorkReservation(accountId: string): () => void {
-    const current = this.inFlightWork.get(accountId) ?? 0;
-    this.inFlightWork.set(accountId, current + 1);
+    const reservationId = crypto.randomUUID();
+    this.activeReservations.set(reservationId, accountId);
+    let set = this.accountReservations.get(accountId);
+    if (!set) {
+      set = new Set();
+      this.accountReservations.set(accountId, set);
+    }
+    set.add(reservationId);
+
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      const count = this.inFlightWork.get(accountId) ?? 1;
-      if (count <= 1) {
-        this.inFlightWork.delete(accountId);
-      } else {
-        this.inFlightWork.set(accountId, count - 1);
+      this.activeReservations.delete(reservationId);
+      const accSet = this.accountReservations.get(accountId);
+      if (accSet) {
+        accSet.delete(reservationId);
+        if (accSet.size === 0) {
+          this.accountReservations.delete(accountId);
+        }
       }
     };
   }
 
   public getInFlightWork(accountId: string): number {
-    return this.inFlightWork.get(accountId) ?? 0;
+    return this.accountReservations.get(accountId)?.size ?? 0;
   }
 
   private async finalizeSelectedToken(

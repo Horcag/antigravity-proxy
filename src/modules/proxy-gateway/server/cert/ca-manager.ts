@@ -17,20 +17,36 @@ export const TARGET_CLOUDCODE_HOSTS = [
 
 export const ALLOWED_TARGET_HOSTS = new Set<string>(TARGET_CLOUDCODE_HOSTS);
 
+export interface TargetAuthority {
+  hostname: string;
+  port: 443;
+}
+
+export function parseTargetAuthority(destination: string | undefined): TargetAuthority | null {
+  if (!destination || typeof destination !== 'string') {
+    return null;
+  }
+  const trimmed = destination.trim().toLowerCase();
+  // Strictly validate authority: hostname must consist only of lowercase alphanumeric, dot, hyphen
+  // port if specified must consist only of digits and evaluate strictly to 443
+  const match = /^([a-z0-9.-]+)(?::([0-9]+))?$/.exec(trimmed);
+  if (!match) {
+    return null;
+  }
+  const hostname = match[1];
+  const portStr = match[2];
+  const port = portStr !== undefined ? Number(portStr) : 443;
+  if (port !== 443 || !ALLOWED_TARGET_HOSTS.has(hostname)) {
+    return null;
+  }
+  return { hostname, port: 443 };
+}
+
 export class CaManager {
   private static secureContext: tls.SecureContext | null = null;
 
   static isTargetHost(destination: string): boolean {
-    const [hostPart, portPart] = destination.split(':');
-    const hostOnly = hostPart?.trim().toLowerCase();
-    if (!hostOnly) {
-      return false;
-    }
-    const port = portPart ? parseInt(portPart.trim(), 10) : 443;
-    if (port !== 443) {
-      return false;
-    }
-    return ALLOWED_TARGET_HOSTS.has(hostOnly);
+    return parseTargetAuthority(destination) !== null;
   }
 
   static getCaCertPath(): string {

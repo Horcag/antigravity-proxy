@@ -14,6 +14,7 @@ export interface SessionBindingEntry {
   state: SessionState;
   migratingToAccountId?: string;
   migrationOwnerRequestId?: string;
+  migrationExpiresAt?: number;
   expiresAt: number;
   lastActivityAt: number;
 }
@@ -38,6 +39,7 @@ export interface AccountLeaseSelectionRequest<T> {
   allTokens: Array<AccountLeaseSelectionEntry<T>>;
   getCurrentCandidates?: () => Promise<Array<AccountLeaseSelectionEntry<T>>>;
   sessionKey?: string;
+  skipWait?: boolean;
   model?: string;
   getEffectiveModelForAccount?: (accountId: string) => string | undefined;
   getPerformanceScore?: (accountId: string, effectiveModel: string | undefined) => number;
@@ -207,22 +209,77 @@ export class AccountLeaseSelectionPolicy {
   ): boolean {
     if (!sessionKey || !ownerRequestId || !targetAccountId) return false;
     const current = this.sessionBindings.get(sessionKey);
-    if (!current || current.generation !== currentGeneration) {
+    if (!current) {
       return false;
     }
-    // Prohibit starting a new migration if one is already actively migrating (Probe C05, C09)
+    const now = Date.now();
+
+    // If currently migrating:
     if (current.state === 'migrating') {
+      const isMigrationExpired = current.migrationExpiresAt ? now > current.migrationExpiresAt : false;
+      // Allow the same owner to update candidate if previous candidate failed during failover (A -> B -> C)
+      if (current.migrationOwnerRequestId === ownerRequestId && current.generation === currentGeneration) {
+        this.sessionBindings.set(sessionKey, {
+          ...current,
+          migratingToAccountId: targetAccountId,
+          migrationExpiresAt: now + 30000,
+          lastActivityAt: now,
+        });
+        return true;
+      }
+      // If previous migration expired/abandoned, allow new owner to take over
+      if (isMigrationExpired) {
+        this.sessionBindings.set(sessionKey, {
+          ...current,
+          state: 'migrating',
+          generation: current.generation + 1,
+          migratingToAccountId: targetAccountId,
+          migrationOwnerRequestId: ownerRequestId,
+          migrationExpiresAt: now + 30000,
+          lastActivityAt: now,
+        });
+        return true;
+      }
+      // Active migration owned by another request; reject concurrent migration (Probe C05, C09)
       return false;
     }
+
+    if (current.generation !== currentGeneration) {
+      return false;
+    }
+
     this.sessionBindings.set(sessionKey, {
       ...current,
       state: 'migrating',
       generation: currentGeneration + 1,
       migratingToAccountId: targetAccountId,
       migrationOwnerRequestId: ownerRequestId,
-      lastActivityAt: Date.now(),
+      migrationExpiresAt: now + 30000,
+      lastActivityAt: now,
     });
     return true;
+  }
+
+  failSessionMigrationCandidate(
+    sessionKey: string | undefined,
+    expectedGeneration: number,
+    failedAccountId: string,
+    ownerRequestId?: string,
+  ): boolean {
+    if (!sessionKey || !failedAccountId || !ownerRequestId) return false;
+    const current = this.sessionBindings.get(sessionKey);
+    if (!current || current.state !== 'migrating') return false;
+    if (current.generation !== expectedGeneration) return false;
+    if (current.migrationOwnerRequestId !== ownerRequestId) return false;
+    if (current.migratingToAccountId === failedAccountId) {
+      this.sessionBindings.set(sessionKey, {
+        ...current,
+        migratingToAccountId: undefined,
+        lastActivityAt: Date.now(),
+      });
+      return true;
+    }
+    return false;
   }
 
   confirmSessionMigration(
@@ -237,8 +294,13 @@ export class AccountLeaseSelectionPolicy {
     if (!current) {
       return false;
     }
+    const now = Date.now();
     // Must be in migrating state (Probe C20)
     if (current.state !== 'migrating') {
+      return false;
+    }
+    // Migration must not be expired
+    if (current.migrationExpiresAt && now > current.migrationExpiresAt) {
       return false;
     }
     // Exact generation match
@@ -259,8 +321,9 @@ export class AccountLeaseSelectionPolicy {
       state: 'active',
       migratingToAccountId: undefined,
       migrationOwnerRequestId: undefined,
+      migrationExpiresAt: undefined,
       expiresAt: expiresAt ?? current.expiresAt,
-      lastActivityAt: Date.now(),
+      lastActivityAt: now,
     });
     return true;
   }
@@ -329,10 +392,8 @@ export class AccountLeaseSelectionPolicy {
       return null;
     }
 
-    const targetAccountId =
-      stickyBinding.state === 'migrating' && stickyBinding.migratingToAccountId
-        ? stickyBinding.migratingToAccountId
-        : stickyBinding.accountId;
+    // In migrating state, do not speculatively route followers to unconfirmed migratingToAccountId
+    const targetAccountId = stickyBinding.accountId;
 
     return candidates.find(([accountId]) => accountId === targetAccountId) ?? null;
   }
@@ -560,7 +621,7 @@ export class AccountLeaseSelectionPolicy {
     const hasBoundCandidate = request.allTokens.some(
       ([accountId]) => accountId === stickyBinding?.accountId,
     );
-    if (stickyBinding && hasBoundCandidate && request.config.schedulingMode === 'cache-first') {
+    if (stickyBinding && hasBoundCandidate && request.config.schedulingMode === 'cache-first' && !request.skipWait) {
       const waitSec = request.rateLimitTracker.getRemainingWaitSeconds(
         stickyBinding.accountId,
         this.getEffectiveModelForAccount(request, stickyBinding.accountId),
