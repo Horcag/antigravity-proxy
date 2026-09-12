@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -161,56 +162,160 @@ export class CaManager {
 
   static ensureAgyLauncher(): void {
     const homeDir = os.homedir();
-    const agyPath = path.join(homeDir, '.local', 'bin', 'agy');
+    const libexecDir = path.join(homeDir, '.local', 'libexec', 'antigravity-proxy');
+    const launcherPath = path.join(libexecDir, 'agy');
+    const agyNativePath = path.join(homeDir, '.local', 'bin', 'agy');
     const agyBinPath = path.join(homeDir, '.local', 'bin', 'agy.bin');
+    const trustBundlePath = path.join(getCertsDir(), 'agy-trust.pem');
 
     try {
-      if (!fs.existsSync(agyPath) && !fs.existsSync(agyBinPath)) {
-        return;
+      // Legacy cleanup: if agy.bin exists and agy is not an ELF binary, restore agy.bin to agy
+      if (fs.existsSync(agyBinPath) && (!fs.existsSync(agyNativePath) || !this.isElfFile(agyNativePath))) {
+        logger.info('[Launcher] Restoring native binary from agy.bin to agy');
+        fs.renameSync(agyBinPath, agyNativePath);
       }
 
-      let shouldRewrap = false;
-      if (fs.existsSync(agyPath)) {
-        const buffer = Buffer.alloc(4);
-        const fd = fs.openSync(agyPath, 'r');
-        fs.readSync(fd, buffer, 0, 4, 0);
-        fs.closeSync(fd);
+      fs.mkdirSync(libexecDir, { recursive: true });
 
-        // Check if agy is an ELF binary (magic: 0x7f, 'E', 'L', 'F')
-        if (buffer[0] === 0x7f && buffer[1] === 0x45 && buffer[2] === 0x4c && buffer[3] === 0x46) {
-          logger.info('[CaManager] Detected ELF binary at agy path; moving to agy.bin and restoring failover wrapper');
-          fs.renameSync(agyPath, agyBinPath);
-          shouldRewrap = true;
-        }
-      } else if (fs.existsSync(agyBinPath)) {
-        shouldRewrap = true;
-      }
-
-      if (shouldRewrap) {
-        const wrapperScript = `#!/usr/bin/env bash
+      const wrapperContent = `#!/bin/sh
 # Managed Antigravity CLI Launcher with Transparent HTTPS Proxy Failover
+# Installed at: ${launcherPath}
 
-PROXY_PORT="\${AG_PROXY_PORT:-8046}"
-PROXY_URL="\${HTTPS_PROXY:-http://127.0.0.1:\${PROXY_PORT}}"
-TRUST_BUNDLE="\${SSL_CERT_FILE:-${homeDir}/.antigravity-proxy/certs/agy-trust.pem}"
+AGY_REAL="${agyNativePath}"
+TRUST_BUNDLE="${trustBundlePath}"
+PROXY_URL="http://127.0.0.1:8046"
 
-if [[ ! -f "$TRUST_BUNDLE" ]]; then
-  TRUST_BUNDLE="${homeDir}/.antigravity-proxy/certs/ca.crt"
+if [ ! -x "$AGY_REAL" ]; then
+    printf '%s\\n' 'agy launcher: native executable is unavailable' >&2
+    exit 126
 fi
+
+if [ ! -r "$TRUST_BUNDLE" ]; then
+    printf '%s\\n' 'agy launcher: managed trust bundle is unavailable' >&2
+    exit 78
+fi
+
+unset AGY_CLI_DISABLE_AUTO_UPDATE
 
 export HTTPS_PROXY="$PROXY_URL"
 export https_proxy="$PROXY_URL"
-export NO_PROXY="localhost,127.0.0.1,::1"
-export no_proxy="localhost,127.0.0.1,::1"
+export NO_PROXY='localhost,127.0.0.1,::1'
+export no_proxy='localhost,127.0.0.1,::1'
 export SSL_CERT_FILE="$TRUST_BUNDLE"
 
-exec "${agyBinPath}" "$@"
+exec "$AGY_REAL" "$@"
 `;
-        fs.writeFileSync(agyPath, wrapperScript, { encoding: 'utf-8', mode: 0o755 });
-        logger.info(`[CaManager] Restored failover launcher at ${agyPath}`);
+
+      let needsWrite = true;
+      if (fs.existsSync(launcherPath)) {
+        const existing = fs.readFileSync(launcherPath, 'utf-8');
+        if (existing === wrapperContent) {
+          needsWrite = false;
+        }
+      }
+
+      if (needsWrite) {
+        const tempPath = path.join(libexecDir, `agy.tmp.${crypto.randomUUID()}`);
+        fs.writeFileSync(tempPath, wrapperContent, { encoding: 'utf-8', mode: 0o755 });
+        fs.renameSync(tempPath, launcherPath);
+        logger.info(`[Launcher] Atomically published managed launcher at: ${launcherPath}`);
+      }
+
+      this.observeAgyBinary(agyNativePath);
+    } catch (err) {
+      logger.warn('[Launcher] Failed to ensure managed launcher', err);
+    }
+  }
+
+  private static isElfFile(filePath: string): boolean {
+    try {
+      const buffer = Buffer.alloc(4);
+      const fd = fs.openSync(filePath, 'r');
+      try {
+        fs.readSync(fd, buffer, 0, 4, 0);
+      } finally {
+        fs.closeSync(fd);
+      }
+      return buffer[0] === 0x7f && buffer[1] === 0x45 && buffer[2] === 0x4c && buffer[3] === 0x46;
+    } catch {
+      return false;
+    }
+  }
+
+  private static observeAgyBinary(nativePath: string): void {
+    if (!fs.existsSync(nativePath)) {
+      return;
+    }
+
+    try {
+      const updatesDir = path.join(os.homedir(), '.antigravity-proxy', 'updates');
+      fs.mkdirSync(updatesDir, { recursive: true });
+
+      const statePath = path.join(updatesDir, 'state.json');
+      const historyPath = path.join(updatesDir, 'history.jsonl');
+      const noticePath = path.join(updatesDir, 'notice.txt');
+
+      const fileBuffer = fs.readFileSync(nativePath);
+      const currentHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+
+      let prevState: { sha256?: string; version?: string } = {};
+      if (fs.existsSync(statePath)) {
+        try {
+          prevState = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
+        } catch {
+          prevState = {};
+        }
+      }
+
+      if (prevState.sha256 !== currentHash) {
+        let reportedVersion = 'unknown';
+        try {
+          const out = execFileSync(nativePath, ['--version'], { timeout: 3000, encoding: 'utf-8' });
+          const match = out.match(/([0-9]+\.[0-9]+\.[0-9]+)/);
+          if (match) {
+            reportedVersion = match[1];
+          }
+        } catch {
+          // ignore probe error
+        }
+
+        const isInitial = !prevState.sha256;
+        const eventId = `event-${Date.now()}`;
+        const newState = {
+          sha256: currentHash,
+          version: reportedVersion,
+          observedAt: new Date().toISOString(),
+        };
+
+        fs.writeFileSync(statePath, JSON.stringify(newState, null, 2), 'utf-8');
+
+        if (!isInitial) {
+          const oldVersion = prevState.version || 'unknown';
+          logger.info(`[UpdateObserver] Detected native agy binary update: ${oldVersion} -> ${reportedVersion} (${currentHash.slice(0, 8)})`);
+
+          const historyEntry = JSON.stringify({
+            eventId,
+            timestamp: new Date().toISOString(),
+            previousHash: prevState.sha256,
+            currentHash,
+            previousVersion: oldVersion,
+            currentVersion: reportedVersion,
+          }) + '\n';
+          fs.appendFileSync(historyPath, historyEntry, 'utf-8');
+
+          const tempNotice = path.join(updatesDir, `notice.tmp.${crypto.randomUUID()}`);
+          fs.writeFileSync(
+            tempNotice,
+            `${eventId}\nGoogle Antigravity CLI updated: version ${oldVersion} -> ${reportedVersion}; proxy failover active.\n`,
+            { encoding: 'utf-8', mode: 0o644 },
+          );
+          fs.renameSync(tempNotice, noticePath);
+        } else {
+          logger.info(`[UpdateObserver] Baseline established for agy binary: version ${reportedVersion} (${currentHash.slice(0, 8)})`);
+        }
       }
     } catch (err) {
-      logger.warn('[CaManager] Failed to ensure agy launcher wrapper', err);
+      logger.debug('[UpdateObserver] Failed to observe agy binary', err);
     }
   }
 

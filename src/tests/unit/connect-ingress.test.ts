@@ -40,33 +40,40 @@ describe('CaManager', () => {
     expect(bundleContent).toContain('Antigravity Proxy Local Root CA');
   });
 
-  it('detects ELF binary at agy path and self-heals by restoring wrapper script', () => {
+  it('publishes managed launcher in libexec and establishes baseline update observer', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-launcher-test-'));
     const binDir = path.join(tmpDir, '.local', 'bin');
+    const libexecDir = path.join(tmpDir, '.local', 'libexec', 'antigravity-proxy');
     fs.mkdirSync(binDir, { recursive: true });
 
-    const agyPath = path.join(binDir, 'agy');
-    const agyBinPath = path.join(binDir, 'agy.bin');
+    const agyNativePath = path.join(binDir, 'agy');
+    const launcherPath = path.join(libexecDir, 'agy');
 
-    // Simulate an external installer or package overwriting agy with an ELF executable
-    const elfHeader = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]);
-    fs.writeFileSync(agyPath, elfHeader);
+    // Create a mock native executable
+    const elfContent = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x90, 0x90]);
+    fs.writeFileSync(agyNativePath, elfContent);
 
     const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(tmpDir);
 
     try {
       CaManager.ensureAgyLauncher();
 
-      // Original ELF should have been moved to agy.bin
-      expect(fs.existsSync(agyBinPath)).toBe(true);
-      expect(fs.readFileSync(agyBinPath)).toEqual(elfHeader);
+      // Native binary must remain untouched at ~/.local/bin/agy
+      expect(fs.existsSync(agyNativePath)).toBe(true);
+      expect(fs.readFileSync(agyNativePath)).toEqual(elfContent);
 
-      // Wrapper script should have been restored at agy
-      expect(fs.existsSync(agyPath)).toBe(true);
-      const restoredWrapper = fs.readFileSync(agyPath, 'utf-8');
-      expect(restoredWrapper).toContain('#!/usr/bin/env bash');
-      expect(restoredWrapper).toContain('export HTTPS_PROXY');
-      expect(restoredWrapper).toContain(agyBinPath);
+      // Managed launcher must be published at ~/.local/libexec/antigravity-proxy/agy
+      expect(fs.existsSync(launcherPath)).toBe(true);
+      const wrapperScript = fs.readFileSync(launcherPath, 'utf-8');
+      expect(wrapperScript).toContain('#!/bin/sh');
+      expect(wrapperScript).toContain('PROXY_URL="http://127.0.0.1:8046"');
+      expect(wrapperScript).toContain(agyNativePath);
+
+      // Update observer state must be initialized
+      const statePath = path.join(tmpDir, '.antigravity-proxy', 'updates', 'state.json');
+      expect(fs.existsSync(statePath)).toBe(true);
+      const state = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
+      expect(state.sha256).toBeDefined();
     } finally {
       homedirSpy.mockRestore();
       fs.rmSync(tmpDir, { recursive: true, force: true });
