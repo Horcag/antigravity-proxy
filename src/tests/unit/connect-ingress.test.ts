@@ -5,6 +5,8 @@ import { ConnectIngressService } from '../../modules/proxy-gateway/server/connec
 import http from 'node:http';
 import net from 'node:net';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { CloudAccount } from '../../modules/cloud-account/types';
 
@@ -36,6 +38,39 @@ describe('CaManager', () => {
     expect(fs.existsSync(bundlePath)).toBe(true);
     const bundleContent = fs.readFileSync(bundlePath, 'utf-8');
     expect(bundleContent).toContain('Antigravity Proxy Local Root CA');
+  });
+
+  it('detects ELF binary at agy path and self-heals by restoring wrapper script', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-launcher-test-'));
+    const binDir = path.join(tmpDir, '.local', 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+
+    const agyPath = path.join(binDir, 'agy');
+    const agyBinPath = path.join(binDir, 'agy.bin');
+
+    // Simulate an external installer or package overwriting agy with an ELF executable
+    const elfHeader = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]);
+    fs.writeFileSync(agyPath, elfHeader);
+
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(tmpDir);
+
+    try {
+      CaManager.ensureAgyLauncher();
+
+      // Original ELF should have been moved to agy.bin
+      expect(fs.existsSync(agyBinPath)).toBe(true);
+      expect(fs.readFileSync(agyBinPath)).toEqual(elfHeader);
+
+      // Wrapper script should have been restored at agy
+      expect(fs.existsSync(agyPath)).toBe(true);
+      const restoredWrapper = fs.readFileSync(agyPath, 'utf-8');
+      expect(restoredWrapper).toContain('#!/usr/bin/env bash');
+      expect(restoredWrapper).toContain('AGY_CLI_DISABLE_AUTO_UPDATE="true"');
+      expect(restoredWrapper).toContain(agyBinPath);
+    } finally {
+      homedirSpy.mockRestore();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 
