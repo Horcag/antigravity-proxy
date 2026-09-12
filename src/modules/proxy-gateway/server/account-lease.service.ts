@@ -28,6 +28,7 @@ import {
 import { AccountLeaseConfigPolicy } from './account-lease-config-policy';
 import { proxyModelAvailabilityStore } from './proxy-model-availability-store';
 import { AccountPerformancePolicy } from './account-performance-policy';
+import { CaManager } from './cert/ca-manager';
 
 interface GetNextTokenOptions {
   sessionKey?: string;
@@ -694,6 +695,11 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   private startQuotaCatalogRefreshTimer(): void {
     this.stopQuotaCatalogRefreshTimer();
     this.quotaCatalogRefreshTimer = setInterval(() => {
+      try {
+        CaManager.ensureAgyLauncher();
+      } catch {
+        // ignore
+      }
       void this.refreshQuotaCatalog({ force: true }).catch((error: unknown) => {
         this.logger.warn('Scheduled quota catalog refresh failed', error);
       });
