@@ -58,6 +58,7 @@ import {
   normalizeFunctionCallArgs,
 } from '../antigravity/function-call-args';
 import { preflightNativeGeminiRequest } from './native-gemini-request';
+import { extractCanonicalUserTurnText } from './cloudcode-failover-gateway';
 
 interface StreamIdleTimer {
   reset: () => void;
@@ -68,6 +69,7 @@ interface StreamIdleTimer {
 interface StreamHealthLifecycle {
   markUsableOutput: () => void;
   recordFailure: (error: unknown) => void;
+  cleanup?: () => void;
 }
 
 interface UpstreamAttempt<T> {
@@ -185,9 +187,22 @@ export class ProxyService {
     accountId: string,
     model: string,
     startedAt: number,
+    releaseReservation?: () => void,
+    sessionKey?: string,
+    sessionGeneration?: number,
+    expectedBreakerGeneration?: number,
   ): StreamHealthLifecycle {
     let hasMarkedSuccess = false;
     let hasRecordedFailure = false;
+    let hasCleanedUp = false;
+
+    const cleanup = (): void => {
+      if (hasCleanedUp) {
+        return;
+      }
+      hasCleanedUp = true;
+      releaseReservation?.();
+    };
 
     return {
       markUsableOutput: () => {
@@ -195,7 +210,13 @@ export class ProxyService {
           return;
         }
         hasMarkedSuccess = true;
-        this.retryPolicy.markUpstreamSuccess(accountId, model);
+        this.retryPolicy.markUpstreamSuccess(
+          accountId,
+          model,
+          sessionKey,
+          sessionGeneration,
+          expectedBreakerGeneration,
+        );
         this.accountLeaseService.recordPerformanceSuccess?.(
           accountId,
           model,
@@ -203,6 +224,7 @@ export class ProxyService {
         );
       },
       recordFailure: (error: unknown) => {
+        cleanup();
         if (hasRecordedFailure) {
           return;
         }
@@ -212,11 +234,27 @@ export class ProxyService {
         }
         this.recordBoundedStreamPenalty(accountId, model, error);
       },
+      cleanup,
     };
   }
 
-  private markUpstreamSuccess(accountId: string, model: string, sessionKey?: string): void {
-    this.retryPolicy.markUpstreamSuccess(accountId, model, sessionKey);
+  private markUpstreamSuccess(
+    accountId: string,
+    model: string,
+    sessionKey?: string,
+    retryState?: ProxyTokenRetryState,
+  ): void {
+    retryState?.activeReservation?.();
+    if (retryState) {
+      retryState.activeReservation = undefined;
+    }
+    this.retryPolicy.markUpstreamSuccess(
+      accountId,
+      model,
+      sessionKey,
+      retryState?.sessionGeneration,
+      retryState?.breakerGeneration,
+    );
     this.accountLeaseService.recordPerformanceSuccess?.(accountId, model);
   }
 
@@ -381,10 +419,20 @@ export class ProxyService {
               token.id,
             ),
           );
+          const streamHealth = this.createStreamHealthLifecycle(
+            token.id,
+            effectiveTargetModel,
+            startedAt,
+            token.releaseReservation,
+            sessionKey,
+            retryState.sessionGeneration,
+            retryState.breakerGeneration,
+          );
+          retryState.activeReservation = undefined;
           return this.processAnthropicInternalStream(
             stream,
             geminiBody.model,
-            this.createStreamHealthLifecycle(token.id, effectiveTargetModel, startedAt),
+            streamHealth,
             signatureContext,
             request.model,
           );
@@ -397,7 +445,7 @@ export class ProxyService {
             token.id,
             effectiveTargetModel,
           );
-          this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey);
+          this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
           return this.toAnthropicChatResponse(
             transformResponse(response, signatureContext, request.model),
           );
@@ -437,10 +485,20 @@ export class ProxyService {
                   token.id,
                 ),
               );
+              const streamHealth = this.createStreamHealthLifecycle(
+                token.id,
+                'gemini-3-flash',
+                startedAt,
+                token.releaseReservation,
+                sessionKey,
+                retryState.sessionGeneration,
+                retryState.breakerGeneration,
+              );
+              retryState.activeReservation = undefined;
               return this.processAnthropicInternalStream(
                 stream,
                 downgradedBody.model,
-                this.createStreamHealthLifecycle(token.id, 'gemini-3-flash', startedAt),
+                streamHealth,
                 downgradedSignatureContext,
                 request.model,
               );
@@ -453,7 +511,7 @@ export class ProxyService {
                 token.id,
                 'gemini-3-flash',
               );
-              this.markUpstreamSuccess(token.id, 'gemini-3-flash');
+              this.markUpstreamSuccess(token.id, 'gemini-3-flash', undefined, retryState);
               const transformed = this.toAnthropicChatResponse(
                 transformResponse(response, downgradedSignatureContext, request.model),
               );
@@ -472,6 +530,7 @@ export class ProxyService {
           token.id,
           effectiveTargetModel,
           lastError,
+          retryState,
         );
         if (!shouldRetry) {
           throw lastError;
@@ -506,6 +565,7 @@ export class ProxyService {
         upstreamStream.removeListener('data', onData);
         upstreamStream.removeListener('end', onEnd);
         upstreamStream.removeListener('error', onError);
+        streamHealth.cleanup?.();
       };
 
       const failStream = (error: Error, destroyUpstream = false): void => {
@@ -720,7 +780,7 @@ export class ProxyService {
           effectiveTargetModel,
         );
 
-        this.markUpstreamSuccess(token.id, effectiveTargetModel);
+        this.markUpstreamSuccess(token.id, effectiveTargetModel, undefined, retryState);
         return this.normalizeGeminiGenerateResponse(response);
       } catch (err) {
         if (err instanceof BadRequestException) {
@@ -732,6 +792,7 @@ export class ProxyService {
           token.id,
           effectiveTargetModel,
           lastError,
+          retryState,
         );
         if (!shouldRetry) {
           throw lastError;
@@ -808,9 +869,19 @@ export class ProxyService {
             token.id,
           ),
         );
+        const streamHealth = this.createStreamHealthLifecycle(
+          token.id,
+          effectiveTargetModel,
+          startedAt,
+          token.releaseReservation,
+          undefined,
+          retryState.sessionGeneration,
+          retryState.breakerGeneration,
+        );
+        retryState.activeReservation = undefined;
         return this.passthroughSseStream(
           stream,
-          this.createStreamHealthLifecycle(token.id, effectiveTargetModel, startedAt),
+          streamHealth,
         );
       } catch (err) {
         if (err instanceof BadRequestException) {
@@ -822,6 +893,7 @@ export class ProxyService {
           token.id,
           effectiveTargetModel,
           lastError,
+          retryState,
         );
         if (!shouldRetry) {
           throw lastError;
@@ -847,6 +919,7 @@ export class ProxyService {
         upstreamStream.removeListener('end', onEnd);
         upstreamStream.removeListener('error', onError);
         idleTimer.dispose();
+        streamHealth.cleanup?.();
       };
 
       const terminate = (): boolean => {
@@ -1196,6 +1269,16 @@ export class ProxyService {
                 token.id,
               ),
             );
+            const streamHealth = this.createStreamHealthLifecycle(
+              token.id,
+              effectiveTargetModel,
+              startedAt,
+              token.releaseReservation,
+              sessionKey,
+              retryState.sessionGeneration,
+              retryState.breakerGeneration,
+            );
+            retryState.activeReservation = undefined;
             return this.createOpenAIProtocolStream(
               stream,
               request.model,
@@ -1203,7 +1286,7 @@ export class ProxyService {
               streamOptions,
               signatureContext,
               responsesConfiguration,
-              this.createStreamHealthLifecycle(token.id, effectiveTargetModel, startedAt),
+              streamHealth,
             );
           } catch (streamError) {
             if (this.retryPolicy.shouldFailoverImmediately(streamError)) {
@@ -1221,7 +1304,7 @@ export class ProxyService {
               token.id,
               effectiveTargetModel,
             );
-            this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey);
+            this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
             const claudeResponse = transformResponse(response, signatureContext);
             const openaiResponse = this.convertClaudeToOpenAIResponse(
               claudeResponse,
@@ -1242,7 +1325,7 @@ export class ProxyService {
             token.id,
             effectiveTargetModel,
           );
-          this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey);
+          this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
           // Transform Gemini response to OpenAI format
           const claudeResponse = transformResponse(response, signatureContext);
           return this.convertClaudeToOpenAIResponse(
@@ -1259,6 +1342,7 @@ export class ProxyService {
           token.id,
           effectiveTargetModel,
           lastError,
+          retryState,
         );
         if (!shouldRetry) {
           throw lastError;
@@ -1867,6 +1951,7 @@ export class ProxyService {
         upstreamStream.removeListener('end', onEnd);
         upstreamStream.removeListener('error', onError);
         idleTimer.dispose();
+        streamHealth?.cleanup?.();
       };
 
       const terminate = (): boolean => {
@@ -2306,6 +2391,7 @@ export class ProxyService {
         upstreamStream.removeListener('end', onEnd);
         upstreamStream.removeListener('error', onError);
         idleTimer.dispose();
+        streamHealth?.cleanup?.();
       };
 
       const terminate = (): boolean => {
@@ -3339,6 +3425,7 @@ export class ProxyService {
     accountId: string,
     model: string,
     error: unknown,
+    retryState?: ProxyTokenRetryState,
   ): Promise<boolean> {
     const modelWasNotFound = this.isModelNotFoundError(error);
     if (modelWasNotFound && !model.toLowerCase().includes('-image')) {
@@ -3346,7 +3433,12 @@ export class ProxyService {
       // id so the in-flight retry loop and later requests reroute to a sibling.
       this.accountLeaseService.markModelUnrequestable(accountId, model);
     }
-    const shouldRetry = await this.retryPolicy.applyUpstreamPenalty(accountId, model, error);
+    const shouldRetry = await this.retryPolicy.applyUpstreamPenalty(
+      accountId,
+      model,
+      error,
+      retryState,
+    );
     return modelWasNotFound || shouldRetry;
   }
 
@@ -3372,19 +3464,21 @@ export class ProxyService {
   private extractAnthropicSessionKey(request: AnthropicChatRequest): string | undefined {
     const metadata = request.metadata;
     const sessionCandidate =
-      metadata?.session_id ?? metadata?.sessionId ?? metadata?.user_id ?? metadata?.userId;
+      metadata?.session_id ??
+      metadata?.sessionId ??
+      metadata?.conversation_id ??
+      metadata?.conversationId;
     if (isString(sessionCandidate) && !isEmpty(sessionCandidate.trim())) {
-      return `anthropic:${sessionCandidate.trim()}`;
+      return `session:${sessionCandidate.trim()}`;
     }
 
     if (Array.isArray(request.messages) && request.messages.length > 0) {
-      const firstMsg = request.messages[0];
-      const payload =
-        typeof firstMsg === 'object' && firstMsg !== null
-          ? JSON.stringify(firstMsg)
-          : String(firstMsg);
-      const hash = createHash('sha256').update(payload).digest('hex').slice(0, 16);
-      return `anthropic:prefix:${hash}`;
+      const userMsg = request.messages.find((m: any) => m?.role === 'user');
+      const text = extractCanonicalUserTurnText(userMsg);
+      if (text) {
+        const hash = createHash('sha256').update(text).digest('hex').slice(0, 16);
+        return `hint:prefix:${hash}`;
+      }
     }
 
     return undefined;
@@ -3393,19 +3487,21 @@ export class ProxyService {
   private extractOpenAISessionKey(request: OpenAIChatRequest): string | undefined {
     const extra = request.extra;
     const sessionCandidate =
-      extra?.session_id ?? extra?.sessionId ?? extra?.user_id ?? extra?.userId;
+      extra?.session_id ??
+      extra?.sessionId ??
+      extra?.conversation_id ??
+      extra?.conversationId;
     if (isString(sessionCandidate) && !isEmpty(sessionCandidate.trim())) {
-      return `openai:${sessionCandidate.trim()}`;
+      return `session:${sessionCandidate.trim()}`;
     }
 
     if (Array.isArray(request.messages) && request.messages.length > 0) {
-      const firstMsg = request.messages[0];
-      const payload =
-        typeof firstMsg === 'object' && firstMsg !== null
-          ? JSON.stringify(firstMsg)
-          : String(firstMsg);
-      const hash = createHash('sha256').update(payload).digest('hex').slice(0, 16);
-      return `openai:prefix:${hash}`;
+      const userMsg = request.messages.find((m: any) => m?.role === 'user');
+      const text = extractCanonicalUserTurnText(userMsg);
+      if (text) {
+        const hash = createHash('sha256').update(text).digest('hex').slice(0, 16);
+        return `hint:prefix:${hash}`;
+      }
     }
 
     return undefined;

@@ -17,6 +17,7 @@ export class AccountLeaseConfigPolicy {
       schedulingMode: this.getSchedulingMode(),
       preferredAccountId: this.getPreferredAccountId(),
       maxWaitMs: this.getMaxWaitDurationMs(),
+      maxConcurrencyPerAccount: config?.max_concurrency_per_account ?? 8,
       noGoMismatchRateThreshold: this.getNoGoMismatchRateThreshold(),
       noGoErrorRateThreshold: this.getNoGoErrorRateThreshold(),
     };

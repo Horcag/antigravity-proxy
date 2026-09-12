@@ -15,8 +15,20 @@ describe('CaManager', () => {
     expect(CaManager.isTargetHost('daily-cloudcode-pa.googleapis.com:443')).toBe(true);
     expect(CaManager.isTargetHost('cloudcode-pa.googleapis.com:443')).toBe(true);
     expect(CaManager.isTargetHost('daily-cloudcode-pa.sandbox.googleapis.com:443')).toBe(true);
-    expect(CaManager.isTargetHost('generativelanguage.googleapis.com:443')).toBe(true);
-    expect(CaManager.isTargetHost('custom-cloudcode-pa.googleapis.com:443')).toBe(true);
+    expect(CaManager.isTargetHost('autopush-cloudcode-pa.sandbox.googleapis.com:443')).toBe(true);
+    expect(CaManager.isTargetHost('preprod-daily-cloudcode-pa.sandbox.googleapis.com:443')).toBe(true);
+    // Non-cloudcode-pa endpoints and unverified services are left outside interception (T10-F06)
+    expect(CaManager.isTargetHost('generativelanguage.googleapis.com:443')).toBe(false);
+    expect(CaManager.isTargetHost('businessaicode.googleapis.com:443')).toBe(false);
+    expect(CaManager.isTargetHost('aicode.googleapis.com:443')).toBe(false);
+    expect(CaManager.isTargetHost('aiplatform.googleapis.com:443')).toBe(false);
+    // Rejects attacker and unauthorized domains (Probe C25)
+    expect(CaManager.isTargetHost('aicode.attacker.invalid:443')).toBe(false);
+    expect(CaManager.isTargetHost('businessaicode.attacker.invalid:443')).toBe(false);
+    expect(CaManager.isTargetHost('not-google-cloudcode-pa.attacker.invalid:443')).toBe(false);
+    expect(CaManager.isTargetHost('notgenerativelanguage.googleapis.com:443')).toBe(false);
+    expect(CaManager.isTargetHost('notaiplatform.googleapis.com:443')).toBe(false);
+    expect(CaManager.isTargetHost('daily-cloudcode-pa.googleapis.com:8080')).toBe(false);
     expect(CaManager.isTargetHost('api.openai.com:443')).toBe(false);
     expect(CaManager.isTargetHost('github.com:443')).toBe(false);
     expect(CaManager.isTargetHost('')).toBe(false);
@@ -208,12 +220,14 @@ describe('CloudCodeFailoverGateway', () => {
 
     await gateway.handleRequest(mockReq, mockRes);
 
-    expect(mockAccountLeaseService.markFromUpstreamError).toHaveBeenCalledWith({
-      accountIdOrEmail: 'acc-1',
-      status: 429,
-      model: 'gemini-2.5-pro',
-      reason: expect.anything(),
-    });
+    expect(mockAccountLeaseService.markFromUpstreamError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountIdOrEmail: 'acc-1',
+        status: 429,
+        model: 'gemini-2.5-pro',
+        reason: expect.anything(),
+      }),
+    );
     expect(mockAccountLeaseService.getNextToken).toHaveBeenCalledTimes(2);
     expect(mockRes.writeHead).toHaveBeenCalledWith(200, expect.anything());
   });

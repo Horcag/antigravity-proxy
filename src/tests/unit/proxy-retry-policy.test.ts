@@ -251,11 +251,13 @@ describe('ProxyRetryPolicy', () => {
       sessionKey: 'session-1',
       excludeAccountIds: [],
       model: 'gemini-3-flash',
+      deferSessionBinding: true,
     });
     expect(accountLeaseService.getNextToken).toHaveBeenNthCalledWith(2, {
       sessionKey: 'session-1',
       excludeAccountIds: ['acc-1'],
       model: 'gemini-3-flash',
+      deferSessionBinding: true,
     });
   });
 

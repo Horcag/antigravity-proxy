@@ -73,7 +73,10 @@ export class ConnectIngressService {
     });
 
     // 1. If destination is Google CloudCode, terminate TLS and failover
-    if (CaManager.isTargetHost(destination)) {
+    const isTarget = CaManager.isTargetHost(destination);
+    logger.info(`[ConnectIngress] CONNECT destination: ${destination} (intercepted=${isTarget})`);
+
+    if (isTarget) {
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
 
       if (head && head.length > 0) {

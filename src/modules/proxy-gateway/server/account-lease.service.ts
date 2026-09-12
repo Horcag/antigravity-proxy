@@ -18,7 +18,7 @@ import type { AccountLeaseQuotaCatalogRefreshResult } from './account-lease-quot
 import { AccountLeaseTokenCache } from './account-lease-token-cache';
 import { AccountLeaseHydrationPolicy } from './account-lease-hydration-policy';
 import { AccountLeaseFulfillmentPolicy } from './account-lease-fulfillment-policy';
-import { AccountLeaseSelectionPolicy } from './account-lease-selection-policy';
+import { AccountLeaseSelectionPolicy, type SessionBindingEntry } from './account-lease-selection-policy';
 import { AccountLeaseModelPolicy } from './account-lease-model-policy';
 import { normalizeModelId, type AccountLeaseTokenData } from './account-lease-token-types';
 import {
@@ -30,10 +30,33 @@ import { proxyModelAvailabilityStore } from './proxy-model-availability-store';
 import { AccountPerformancePolicy } from './account-performance-policy';
 import { CaManager } from './cert/ca-manager';
 
-interface GetNextTokenOptions {
+export interface AttemptLease {
+  account: CloudAccount;
+  sessionKey?: string;
+  generation: number;
+  breakerGeneration: number;
+  releaseReservation: () => void;
+  readonly isReleased: boolean;
+}
+
+export class Mutex {
+  private queue = Promise.resolve();
+  acquire(): Promise<() => void> {
+    let release: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const current = this.queue;
+    this.queue = current.then(() => next);
+    return current.then(() => release);
+  }
+}
+
+export interface GetNextTokenOptions {
   sessionKey?: string;
   excludeAccountIds?: string[];
   model?: string;
+  deferSessionBinding?: boolean;
 }
 
 type TokenData = AccountLeaseTokenData;
@@ -115,10 +138,13 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   private readonly quotaRefreshPolicy: AccountLeaseQuotaRefreshPolicy;
   private readonly tokenCache: AccountLeaseTokenCache;
   private readonly selectionPolicy = new AccountLeaseSelectionPolicy();
+  private readonly selectionMutex = new Mutex();
   private readonly hydrationPolicy: AccountLeaseHydrationPolicy;
   private readonly fulfillmentPolicy: AccountLeaseFulfillmentPolicy;
   private readonly modelPolicy: AccountLeaseModelPolicy;
   private readonly limitPolicy: AccountLeaseLimitPolicy;
+  private readonly inFlightWork: Map<string, number> = new Map();
+  private readonly accountBreakerGenerations = new Map<string, number>();
   private readonly performancePolicy = new AccountPerformancePolicy();
 
   constructor(
@@ -402,6 +428,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   }
 
   clearAllRateLimits(): void {
+    this.inFlightWork.clear();
     this.limitPolicy.clearAllRateLimits();
   }
 
@@ -425,7 +452,25 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     this.limitPolicy.markAsForbidden(accountIdOrEmail);
   }
 
-  markModelSuccess(accountIdOrEmail: string, model: string): void {
+  public getBreakerGeneration(accountId: string): number {
+    return this.accountBreakerGenerations.get(accountId) ?? 0;
+  }
+
+  public incrementBreakerGeneration(accountId: string): number {
+    const next = (this.accountBreakerGenerations.get(accountId) ?? 0) + 1;
+    this.accountBreakerGenerations.set(accountId, next);
+    return next;
+  }
+
+  markModelSuccess(accountIdOrEmail: string, model: string, expectedBreakerGeneration?: number): void {
+    const resolvedId = this.resolveAccountId(accountIdOrEmail);
+    if (resolvedId && expectedBreakerGeneration !== undefined) {
+      const currentGen = this.getBreakerGeneration(resolvedId);
+      if (expectedBreakerGeneration < currentGen) {
+        // Stale success from before breaker tripped; do not clear newer lockout
+        return;
+      }
+    }
     this.limitPolicy.markModelSuccess(accountIdOrEmail, model);
   }
 
@@ -438,10 +483,14 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   }
 
   async markFromUpstreamError(params: AccountLeaseUpstreamErrorParams): Promise<void> {
+    const resolvedId = this.resolveAccountId(params.accountIdOrEmail);
+    if (resolvedId) {
+      this.incrementBreakerGeneration(resolvedId);
+    }
     await this.limitPolicy.markFromUpstreamError(params);
   }
 
-  async getNextToken(options?: GetNextTokenOptions): Promise<CloudAccount | null> {
+  async acquireAttemptLease(options?: GetNextTokenOptions): Promise<AttemptLease | null> {
     try {
       if (this.tokens.size === 0) {
         await this.loadAccounts();
@@ -458,45 +507,155 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
 
       this.rateLimitTracker.cleanupExpired();
 
+      // 1. Await admission opportunity outside the critical section (e.g. cache-first sticky wait)
+      if (sessionKey && this.configPolicy.getSelectionConfig().schedulingMode === 'cache-first') {
+        const stickyBinding = this.getSessionBinding(sessionKey);
+        if (stickyBinding && !excludedAccountIds.has(stickyBinding.accountId)) {
+          const effectiveModel = model
+            ? this.modelPolicy.resolveDynamicModelForAccount(stickyBinding.accountId, model, false)
+            : undefined;
+          const waitSec = this.rateLimitTracker.getRemainingWaitSeconds(
+            stickyBinding.accountId,
+            effectiveModel,
+          );
+          const waitMs = waitSec * 1000;
+          const maxWaitMs = this.configPolicy.getSelectionConfig().maxWaitMs ?? 2000;
+          if (waitMs > 0 && waitMs <= maxWaitMs) {
+            await new Promise((resolve) => setTimeout(resolve, waitMs));
+          }
+        }
+      }
+
+      // 2. Pre-calculate candidate pool outside critical section
       const candidateAccountPool = await this.buildCurrentCandidatePool(model, excludedAccountIds);
       if (candidateAccountPool.length === 0) {
         return null;
       }
 
-      const selectedTokenEntry = await this.selectionPolicy.selectCandidate({
-        allTokens: candidateAccountPool,
-        getCurrentCandidates: () => this.buildCurrentCandidatePool(model, excludedAccountIds),
-        sessionKey,
-        model,
-        getEffectiveModelForAccount: (accountId) =>
-          model
-            ? this.modelPolicy.resolveDynamicModelForAccount(accountId, model, false)
-            : undefined,
-        getPerformanceScore: (accountId, effectiveModel) =>
-          this.performancePolicy.score({
-            accountId,
-            effectiveModel: effectiveModel ?? model ?? '',
-            remainingQuotaPercent:
-              this.tokens.get(accountId)?.model_quotas?.[effectiveModel ?? model ?? ''],
-            remainingCooldownMs: Math.max(0, (this.accountCooldowns.get(accountId) ?? now) - now),
-          }),
-        now,
-        accountCooldowns: this.accountCooldowns,
-        rateLimitTracker: this.rateLimitTracker,
-        config: this.configPolicy.getSelectionConfig(),
-        logger: this.logger,
-      });
+      let accountId: string;
+      let tokenData: TokenData;
+      let releaseReservation: () => void;
+      let breakerGeneration = 0;
+      let generation = 1;
 
-      if (!selectedTokenEntry) {
-        return null;
+      let selectedTokenEntry: TokenEntry | null = null;
+
+      // Enter short scheduler critical section to evaluate eligibility and reserve capacity atomically
+      const releaseMutex = await this.selectionMutex.acquire();
+      try {
+        const currentNow = Date.now();
+        selectedTokenEntry = await this.selectionPolicy.selectCandidate({
+          allTokens: candidateAccountPool,
+          getCurrentCandidates: () => this.buildCurrentCandidatePool(model, excludedAccountIds),
+          sessionKey,
+          model,
+          getEffectiveModelForAccount: (id) =>
+            model ? this.modelPolicy.resolveDynamicModelForAccount(id, model, false) : undefined,
+          getPerformanceScore: (id, effectiveModel) =>
+            this.performancePolicy.score({
+              accountId: id,
+              effectiveModel: effectiveModel ?? model ?? '',
+              remainingQuotaPercent:
+                this.tokens.get(id)?.model_quotas?.[effectiveModel ?? model ?? ''],
+              remainingCooldownMs: Math.max(0, (this.accountCooldowns.get(id) ?? currentNow) - currentNow),
+            }),
+          getInFlightCount: (id) => this.getInFlightWork(id),
+          now: currentNow,
+          accountCooldowns: this.accountCooldowns,
+          rateLimitTracker: this.rateLimitTracker,
+          config: this.configPolicy.getSelectionConfig(),
+          logger: this.logger,
+        });
+
+        if (!selectedTokenEntry) {
+          return null;
+        }
+
+        [accountId, tokenData] = selectedTokenEntry;
+        releaseReservation = this.acquireWorkReservation(accountId);
+        breakerGeneration = this.getBreakerGeneration(accountId);
+        generation = sessionKey
+          ? (this.getSessionBinding(sessionKey)?.generation ?? 1)
+          : 1;
+      } finally {
+        releaseMutex();
       }
 
-      const [accountId, tokenData] = selectedTokenEntry;
-      return this.finalizeSelectedToken(accountId, tokenData, nowSeconds, sessionKey);
+      // Hydration and post-hydration revalidation occur outside the critical section
+      let finalized: CloudAccount | null = null;
+      try {
+        finalized = await this.finalizeSelectedToken(
+          accountId,
+          tokenData,
+          nowSeconds,
+          sessionKey,
+          options?.deferSessionBinding,
+        );
+
+        if (!finalized) {
+          releaseReservation();
+          return null;
+        }
+
+        // Post-hydration revalidation: if candidate became cooled down or locked out, release and fail over
+        const cooldownUntil = this.accountCooldowns.get(accountId);
+        const effectiveModel = model
+          ? this.modelPolicy.resolveDynamicModelForAccount(accountId, model, false)
+          : undefined;
+        const isCooldowned = cooldownUntil && cooldownUntil > Date.now();
+        const isRateLimited = this.rateLimitTracker.isRateLimited(accountId, effectiveModel);
+
+        if (isCooldowned || isRateLimited) {
+          releaseReservation();
+          this.logger.warn(
+            `Account ${accountId} became unavailable during hydration; failing over to next candidate`,
+          );
+          return this.acquireAttemptLease({
+            ...options,
+            excludeAccountIds: [...(options?.excludeAccountIds ?? []), accountId],
+          });
+        }
+      } catch (err) {
+        releaseReservation();
+        throw err;
+      }
+
+      let isReleased = false;
+      const idempotentRelease = () => {
+        if (!isReleased) {
+          isReleased = true;
+          releaseReservation();
+        }
+      };
+
+      finalized.releaseReservation = idempotentRelease;
+
+      return {
+        account: finalized,
+        sessionKey,
+        generation,
+        breakerGeneration,
+        releaseReservation: idempotentRelease,
+        get isReleased() {
+          return isReleased;
+        },
+      };
     } catch (error) {
-      this.logger.error('Failed to select the next account token', error);
+      this.logger.error('Failed to acquire attempt lease', error);
       return null;
     }
+  }
+
+  async getNextToken(options?: GetNextTokenOptions): Promise<CloudAccount | null> {
+    const defer = options?.deferSessionBinding ?? false;
+    const lease = await this.acquireAttemptLease({
+      ...options,
+      deferSessionBinding: defer,
+    });
+    if (lease && options?.sessionKey && !defer) {
+      this.bindSession(options.sessionKey, lease.account.id);
+    }
+    return lease ? lease.account : null;
   }
 
   private selectModelCapableAccounts(allTokens: TokenEntry[], model?: string): TokenEntry[] {
@@ -561,12 +720,72 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     this.selectionPolicy.resetSelectionState();
   }
 
-  public bindSession(sessionKey: string | undefined, accountId: string, ttlMs?: number): void {
+  public bindSession(
+    sessionKey: string | undefined,
+    accountId: string,
+    ttlMs?: number,
+    expectedGeneration?: number,
+  ): boolean {
     if (!sessionKey) {
-      return;
+      return false;
     }
     const expiresAt = Date.now() + (ttlMs ?? this.stickySessionTtlMs);
-    this.selectionPolicy.bindSession(sessionKey, accountId, expiresAt);
+    return this.selectionPolicy.bindSession(sessionKey, accountId, expiresAt, expectedGeneration);
+  }
+
+  public getSessionBinding(sessionKey: string | undefined): SessionBindingEntry | null {
+    return this.selectionPolicy.getSessionBinding(sessionKey);
+  }
+
+  public startSessionMigration(
+    sessionKey: string | undefined,
+    currentGeneration: number,
+    targetAccountId: string,
+    ownerRequestId?: string,
+  ): boolean {
+    return this.selectionPolicy.startSessionMigration(
+      sessionKey,
+      currentGeneration,
+      targetAccountId,
+      ownerRequestId,
+    );
+  }
+
+  public confirmSessionMigration(
+    sessionKey: string | undefined,
+    expectedGeneration: number,
+    targetAccountId: string,
+    ownerRequestId?: string,
+    ttlMs?: number,
+  ): boolean {
+    const expiresAt = Date.now() + (ttlMs ?? this.stickySessionTtlMs);
+    return this.selectionPolicy.confirmSessionMigration(
+      sessionKey,
+      expectedGeneration,
+      targetAccountId,
+      ownerRequestId,
+      expiresAt,
+    );
+  }
+
+  public acquireWorkReservation(accountId: string): () => void {
+    const current = this.inFlightWork.get(accountId) ?? 0;
+    this.inFlightWork.set(accountId, current + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const count = this.inFlightWork.get(accountId) ?? 1;
+      if (count <= 1) {
+        this.inFlightWork.delete(accountId);
+      } else {
+        this.inFlightWork.set(accountId, count - 1);
+      }
+    };
+  }
+
+  public getInFlightWork(accountId: string): number {
+    return this.inFlightWork.get(accountId) ?? 0;
   }
 
   private async finalizeSelectedToken(
@@ -574,12 +793,14 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     tokenData: TokenData,
     nowSeconds: number,
     sessionKey?: string,
+    deferSessionBinding?: boolean,
   ): Promise<CloudAccount | null> {
     return this.fulfillmentPolicy.finalizeSelectedToken({
       accountId,
       tokenData,
       nowSeconds,
       sessionKey,
+      deferSessionBinding,
     });
   }
 

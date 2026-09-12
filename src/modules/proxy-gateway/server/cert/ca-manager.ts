@@ -11,22 +11,26 @@ export const TARGET_CLOUDCODE_HOSTS = [
   'daily-cloudcode-pa.googleapis.com',
   'cloudcode-pa.googleapis.com',
   'daily-cloudcode-pa.sandbox.googleapis.com',
-  'generativelanguage.googleapis.com',
+  'autopush-cloudcode-pa.sandbox.googleapis.com',
+  'preprod-daily-cloudcode-pa.sandbox.googleapis.com',
 ] as const;
+
+export const ALLOWED_TARGET_HOSTS = new Set<string>(TARGET_CLOUDCODE_HOSTS);
 
 export class CaManager {
   private static secureContext: tls.SecureContext | null = null;
 
   static isTargetHost(destination: string): boolean {
-    const hostOnly = destination.split(':')[0]?.trim().toLowerCase();
+    const [hostPart, portPart] = destination.split(':');
+    const hostOnly = hostPart?.trim().toLowerCase();
     if (!hostOnly) {
       return false;
     }
-    return (
-      TARGET_CLOUDCODE_HOSTS.some((target) => hostOnly === target) ||
-      hostOnly.includes('cloudcode-pa') ||
-      hostOnly.endsWith('generativelanguage.googleapis.com')
-    );
+    const port = portPart ? parseInt(portPart.trim(), 10) : 443;
+    if (port !== 443) {
+      return false;
+    }
+    return ALLOWED_TARGET_HOSTS.has(hostOnly);
   }
 
   static getCaCertPath(): string {

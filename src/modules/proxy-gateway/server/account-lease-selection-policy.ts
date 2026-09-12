@@ -6,6 +6,18 @@ export interface AccountLeaseRateLimitReader {
   getRemainingWaitSeconds(accountId: string, model?: string): number;
 }
 
+export type SessionState = 'active' | 'migrating';
+
+export interface SessionBindingEntry {
+  accountId: string;
+  generation: number;
+  state: SessionState;
+  migratingToAccountId?: string;
+  migrationOwnerRequestId?: string;
+  expiresAt: number;
+  lastActivityAt: number;
+}
+
 export interface AccountLeaseSelectionConfig {
   parityEnabled: boolean;
   parityShadowEnabled: boolean;
@@ -14,6 +26,7 @@ export interface AccountLeaseSelectionConfig {
   maxWaitMs: number;
   noGoMismatchRateThreshold: number;
   noGoErrorRateThreshold: number;
+  maxConcurrencyPerAccount?: number;
 }
 
 interface AccountLeaseSelectionLogger {
@@ -28,6 +41,7 @@ export interface AccountLeaseSelectionRequest<T> {
   model?: string;
   getEffectiveModelForAccount?: (accountId: string) => string | undefined;
   getPerformanceScore?: (accountId: string, effectiveModel: string | undefined) => number;
+  getInFlightCount?: (accountId: string) => number;
   now: number;
   accountCooldowns: Map<string, number>;
   rateLimitTracker: AccountLeaseRateLimitReader;
@@ -47,7 +61,7 @@ function compareCodeUnits(left: string, right: string): number {
 
 export class AccountLeaseSelectionPolicy {
   private currentIndex = 0;
-  private sessionBindings: Map<string, { accountId: string; expiresAt: number }> = new Map();
+  private sessionBindings: Map<string, SessionBindingEntry> = new Map();
   private parityRequestCount = 0;
   private parityErrorCount = 0;
   private noGoBlocked = false;
@@ -127,14 +141,128 @@ export class AccountLeaseSelectionPolicy {
     return selectedTokenEntry;
   }
 
-  bindSession(sessionKey: string | undefined, accountId: string, expiresAt: number): void {
-    if (!sessionKey) {
-      return;
+  bindSession(
+    sessionKey: string | undefined,
+    accountId: string,
+    expiresAt: number,
+    expectedGeneration?: number,
+  ): boolean {
+    if (!sessionKey || !accountId) {
+      return false;
     }
+    const current = this.sessionBindings.get(sessionKey);
+    const now = Date.now();
+    if (current && current.expiresAt > now) {
+      // If session is currently migrating, ordinary bindSession must NOT overwrite it (T10-F03)
+      if (current.state === 'migrating') {
+        return false;
+      }
+      // Strict version fencing: expected generation must match current generation
+      if (expectedGeneration !== undefined && expectedGeneration !== current.generation) {
+        return false;
+      }
+      // Cannot flip an active binding to another account without explicit migration (Probe C26)
+      if (expectedGeneration !== undefined && current.state === 'active' && current.accountId !== accountId) {
+        return false;
+      }
+      this.sessionBindings.set(sessionKey, {
+        ...current,
+        accountId,
+        state: 'active',
+        expiresAt,
+        lastActivityAt: now,
+      });
+      return true;
+    }
+
+    // New binding or expired session re-binding initialization
+    if (expectedGeneration !== undefined && expectedGeneration !== 1 && current && expectedGeneration !== current.generation) {
+      return false;
+    }
+
     this.sessionBindings.set(sessionKey, {
       accountId,
+      generation: current ? current.generation : 1,
+      state: 'active',
       expiresAt,
+      lastActivityAt: now,
     });
+    return true;
+  }
+
+  getSessionBinding(sessionKey: string | undefined): SessionBindingEntry | null {
+    if (!sessionKey) return null;
+    const binding = this.sessionBindings.get(sessionKey);
+    if (!binding || binding.expiresAt <= Date.now()) {
+      return null;
+    }
+    return binding;
+  }
+
+  startSessionMigration(
+    sessionKey: string | undefined,
+    currentGeneration: number,
+    targetAccountId: string,
+    ownerRequestId?: string,
+  ): boolean {
+    if (!sessionKey || !ownerRequestId || !targetAccountId) return false;
+    const current = this.sessionBindings.get(sessionKey);
+    if (!current || current.generation !== currentGeneration) {
+      return false;
+    }
+    // Prohibit starting a new migration if one is already actively migrating (Probe C05, C09)
+    if (current.state === 'migrating') {
+      return false;
+    }
+    this.sessionBindings.set(sessionKey, {
+      ...current,
+      state: 'migrating',
+      generation: currentGeneration + 1,
+      migratingToAccountId: targetAccountId,
+      migrationOwnerRequestId: ownerRequestId,
+      lastActivityAt: Date.now(),
+    });
+    return true;
+  }
+
+  confirmSessionMigration(
+    sessionKey: string | undefined,
+    expectedGeneration: number,
+    targetAccountId: string,
+    ownerRequestId?: string,
+    expiresAt?: number,
+  ): boolean {
+    if (!sessionKey || !targetAccountId || !ownerRequestId) return false;
+    const current = this.sessionBindings.get(sessionKey);
+    if (!current) {
+      return false;
+    }
+    // Must be in migrating state (Probe C20)
+    if (current.state !== 'migrating') {
+      return false;
+    }
+    // Exact generation match
+    if (current.generation !== expectedGeneration) {
+      return false;
+    }
+    // Candidate account must equal requested target (Probe C07, C21)
+    if (current.migratingToAccountId !== targetAccountId) {
+      return false;
+    }
+    // Owner request ID must be present and match exactly (Probe C08, C22)
+    if (current.migrationOwnerRequestId !== ownerRequestId) {
+      return false;
+    }
+    this.sessionBindings.set(sessionKey, {
+      accountId: targetAccountId,
+      generation: expectedGeneration,
+      state: 'active',
+      migratingToAccountId: undefined,
+      migrationOwnerRequestId: undefined,
+      expiresAt: expiresAt ?? current.expiresAt,
+      lastActivityAt: Date.now(),
+    });
+    return true;
   }
 
   private collectEligibleTokens<T>(
@@ -142,9 +270,19 @@ export class AccountLeaseSelectionPolicy {
     request: AccountLeaseSelectionRequest<T>,
     now: number,
   ): Array<AccountLeaseSelectionEntry<T>> {
+    const maxConcurrency = request.config.maxConcurrencyPerAccount ?? 8;
     return this.collectRateLimitEligibleTokens(allTokens, request).filter(([accountId]) => {
       const cooldownUntil = request.accountCooldowns.get(accountId);
-      return !cooldownUntil || cooldownUntil <= now;
+      if (cooldownUntil && cooldownUntil > now) {
+        return false;
+      }
+      if (request.getInFlightCount) {
+        const inFlight = request.getInFlightCount(accountId);
+        if (inFlight >= maxConcurrency) {
+          return false;
+        }
+      }
+      return true;
     });
   }
 
@@ -170,7 +308,7 @@ export class AccountLeaseSelectionPolicy {
   private getValidSessionBinding(
     sessionKey: string | undefined,
     now: number,
-  ): { accountId: string; expiresAt: number } | null {
+  ): SessionBindingEntry | null {
     if (!sessionKey) {
       return null;
     }
@@ -191,7 +329,12 @@ export class AccountLeaseSelectionPolicy {
       return null;
     }
 
-    return candidates.find(([accountId]) => accountId === stickyBinding.accountId) ?? null;
+    const targetAccountId =
+      stickyBinding.state === 'migrating' && stickyBinding.migratingToAccountId
+        ? stickyBinding.migratingToAccountId
+        : stickyBinding.accountId;
+
+    return candidates.find(([accountId]) => accountId === targetAccountId) ?? null;
   }
 
   private pickRoundRobinEntry<T>(
@@ -216,8 +359,13 @@ export class AccountLeaseSelectionPolicy {
 
   private getActiveSessionCount(accountId: string, now: number): number {
     let count = 0;
+    const recentDemandWindowMs = 5 * 60 * 1000;
     for (const binding of this.sessionBindings.values()) {
-      if (binding.accountId === accountId && binding.expiresAt > now) {
+      if (
+        binding.accountId === accountId &&
+        binding.expiresAt > now &&
+        now - binding.lastActivityAt <= recentDemandWindowMs
+      ) {
         count++;
       }
     }
@@ -235,18 +383,20 @@ export class AccountLeaseSelectionPolicy {
       return candidates[0];
     }
 
-    let minSessions = Infinity;
-    const sessionCounts = new Map<string, number>();
+    let minWorkload = Infinity;
+    const workloadCounts = new Map<string, number>();
     for (const [accountId] of candidates) {
-      const count = this.getActiveSessionCount(accountId, request.now);
-      sessionCounts.set(accountId, count);
-      if (count < minSessions) {
-        minSessions = count;
+      const activeSessions = this.getActiveSessionCount(accountId, request.now);
+      const inFlight = request.getInFlightCount?.(accountId) ?? 0;
+      const totalWorkload = activeSessions + inFlight;
+      workloadCounts.set(accountId, totalWorkload);
+      if (totalWorkload < minWorkload) {
+        minWorkload = totalWorkload;
       }
     }
 
     const leastLoaded = candidates.filter(
-      ([accountId]) => (sessionCounts.get(accountId) ?? 0) <= minSessions,
+      ([accountId]) => (workloadCounts.get(accountId) ?? 0) <= minWorkload,
     );
 
     if (leastLoaded.length === 1) {
@@ -254,29 +404,34 @@ export class AccountLeaseSelectionPolicy {
     }
 
     if (request.getPerformanceScore) {
-      const scored = [...leastLoaded].sort(([leftId], [rightId]) => {
-        const leftScore = request.getPerformanceScore?.(
-          leftId,
-          this.getEffectiveModelForAccount(request, leftId),
-        ) ?? 0;
-        const rightScore = request.getPerformanceScore?.(
-          rightId,
-          this.getEffectiveModelForAccount(request, rightId),
-        ) ?? 0;
-        return rightScore - leftScore;
+      const candidatesWithScores = leastLoaded.map((entry) => {
+        const id = entry[0];
+        const score =
+          request.getPerformanceScore!(
+            id,
+            this.getEffectiveModelForAccount(request, id),
+          ) ?? 0;
+        return { entry, id, score };
       });
-      const topScore = request.getPerformanceScore(
-        scored[0][0],
-        this.getEffectiveModelForAccount(request, scored[0][0]),
-      );
-      const secondScore = scored.length > 1
-        ? request.getPerformanceScore(
-            scored[1][0],
-            this.getEffectiveModelForAccount(request, scored[1][0]),
-          )
-        : topScore;
-      if (topScore > secondScore + 0.05) {
-        return scored[0];
+
+      let topScore = -Infinity;
+      for (const item of candidatesWithScores) {
+        if (item.score > topScore) {
+          topScore = item.score;
+        }
+      }
+
+      const nearTop = candidatesWithScores
+        .filter((item) => item.score >= topScore - 0.05)
+        .map((item) => item.entry);
+
+      if (nearTop.length === 1) {
+        return nearTop[0];
+      }
+      if (nearTop.length > 1) {
+        const picked = nearTop[this.currentIndex % nearTop.length];
+        this.currentIndex++;
+        return picked;
       }
     }
 
@@ -296,18 +451,20 @@ export class AccountLeaseSelectionPolicy {
       return candidates[0][0];
     }
 
-    let minSessions = Infinity;
-    const sessionCounts = new Map<string, number>();
+    let minWorkload = Infinity;
+    const workloadCounts = new Map<string, number>();
     for (const [accountId] of candidates) {
-      const count = this.getActiveSessionCount(accountId, request.now);
-      sessionCounts.set(accountId, count);
-      if (count < minSessions) {
-        minSessions = count;
+      const activeSessions = this.getActiveSessionCount(accountId, request.now);
+      const inFlight = request.getInFlightCount?.(accountId) ?? 0;
+      const totalWorkload = activeSessions + inFlight;
+      workloadCounts.set(accountId, totalWorkload);
+      if (totalWorkload < minWorkload) {
+        minWorkload = totalWorkload;
       }
     }
 
     const leastLoaded = candidates.filter(
-      ([accountId]) => (sessionCounts.get(accountId) ?? 0) <= minSessions,
+      ([accountId]) => (workloadCounts.get(accountId) ?? 0) <= minWorkload,
     );
 
     if (leastLoaded.length === 1) {
@@ -315,29 +472,32 @@ export class AccountLeaseSelectionPolicy {
     }
 
     if (request.getPerformanceScore) {
-      const scored = [...leastLoaded].sort(([leftId], [rightId]) => {
-        const leftScore = request.getPerformanceScore?.(
-          leftId,
-          this.getEffectiveModelForAccount(request, leftId),
-        ) ?? 0;
-        const rightScore = request.getPerformanceScore?.(
-          rightId,
-          this.getEffectiveModelForAccount(request, rightId),
-        ) ?? 0;
-        return rightScore - leftScore;
+      const candidatesWithScores = leastLoaded.map((entry) => {
+        const id = entry[0];
+        const score =
+          request.getPerformanceScore!(
+            id,
+            this.getEffectiveModelForAccount(request, id),
+          ) ?? 0;
+        return { entry, id, score };
       });
-      const topScore = request.getPerformanceScore(
-        scored[0][0],
-        this.getEffectiveModelForAccount(request, scored[0][0]),
-      );
-      const secondScore = scored.length > 1
-        ? request.getPerformanceScore(
-            scored[1][0],
-            this.getEffectiveModelForAccount(request, scored[1][0]),
-          )
-        : topScore;
-      if (topScore > secondScore + 0.05) {
-        return scored[0][0];
+
+      let topScore = -Infinity;
+      for (const item of candidatesWithScores) {
+        if (item.score > topScore) {
+          topScore = item.score;
+        }
+      }
+
+      const nearTop = candidatesWithScores
+        .filter((item) => item.score >= topScore - 0.05)
+        .map((item) => item.entry);
+
+      if (nearTop.length === 1) {
+        return nearTop[0][0];
+      }
+      if (nearTop.length > 1) {
+        return nearTop[this.currentIndex % nearTop.length][0];
       }
     }
 
@@ -348,22 +508,12 @@ export class AccountLeaseSelectionPolicy {
     request: AccountLeaseSelectionRequest<T>,
   ): AccountLeaseSelectionEntry<T> | null {
     const availableTokens = this.collectEligibleTokens(request.allTokens, request, request.now);
-    const candidateAccountPool =
-      availableTokens.length > 0
-        ? availableTokens
-        : this.collectRateLimitEligibleTokens(request.allTokens, request);
-    if (candidateAccountPool.length === 0) {
+    if (availableTokens.length === 0) {
       return null;
     }
 
-    if (availableTokens.length === 0) {
-      request.logger.warn(
-        'All accounts are cooling down; temporarily bypassing cooldown gate to preserve availability',
-      );
-    }
-
     const preferred = this.findPreferredToken(
-      candidateAccountPool,
+      availableTokens,
       request.config.preferredAccountId,
     );
     if (preferred) {
@@ -371,7 +521,7 @@ export class AccountLeaseSelectionPolicy {
     }
 
     const stickyToken = this.findStickySessionToken(
-      candidateAccountPool,
+      availableTokens,
       request.sessionKey,
       request.now,
     );
@@ -379,7 +529,7 @@ export class AccountLeaseSelectionPolicy {
       return stickyToken;
     }
 
-    return this.pickBalancedEntry(candidateAccountPool, request);
+    return this.pickRoundRobinEntry(availableTokens);
   }
 
   private async selectParityTokenCandidate<T>(
@@ -503,7 +653,7 @@ export class AccountLeaseSelectionPolicy {
       return stickyToken[0];
     }
 
-    return this.peekBalancedCandidateAccountId(candidateAccountPool, request);
+    return this.peekRoundRobinCandidateAccountId(candidateAccountPool);
   }
 
   private predictParityAccountCandidateId<T>(

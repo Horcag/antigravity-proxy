@@ -2361,17 +2361,7 @@ describe('AccountLeaseService parity scheduling replay', () => {
     (service as any).accountCooldowns.set('acc-1', cooldownUntil);
     (service as any).accountCooldowns.set('acc-2', cooldownUntil);
 
-    await expect(service.getNextToken({ model: 'gemini-2.5-flash' })).resolves.toMatchObject({
-      id: 'acc-1',
-    });
-
-    expect(warnSpy).toHaveBeenCalledWith(
-      'All accounts are cooling down; temporarily bypassing cooldown gate to preserve availability',
-    );
-    expect(warnSpy).toHaveBeenCalledWith(
-      'Parity shadow mismatch detected: legacy_candidate=true, parity_candidate=false',
-    );
-    expect((service as any).shadowComparisonCount).toBe(1);
+    await expect(service.getNextToken({ model: 'gemini-2.5-flash' })).resolves.toBeNull();
   });
 
   it('does not bypass a rate limit while recovering from cooldown-only exhaustion', async () => {
@@ -2391,12 +2381,10 @@ describe('AccountLeaseService parity scheduling replay', () => {
       model: 'gemini-2.5-flash',
     });
 
-    await expect(service.getNextToken({ model: 'gemini-2.5-flash' })).resolves.toMatchObject({
-      id: 'acc-2',
-    });
+    await expect(service.getNextToken({ model: 'gemini-2.5-flash' })).resolves.toBeNull();
   });
 
-  it('keeps cooldown-only fail-open behavior after the parity no-go blocks scheduling', async () => {
+  it('strictly honors cooldown after parity no-go blocks scheduling', async () => {
     setServerConfig(
       createProxyConfig({
         parity_enabled: true,
@@ -2413,21 +2401,88 @@ describe('AccountLeaseService parity scheduling replay', () => {
     expect((service as any).noGoBlocked).toBe(true);
     service.resetSelectionState();
 
-    const warnSpy = vi.spyOn((service as any).logger, 'warn').mockImplementation(() => undefined);
     const cooldownUntil = Date.now() + 30_000;
     (service as any).accountCooldowns.set('acc-1', cooldownUntil);
     (service as any).accountCooldowns.set('acc-2', cooldownUntil);
 
-    await expect(service.getNextToken({ model: 'gemini-2.5-flash' })).resolves.toMatchObject({
-      id: 'acc-1',
-    });
+    await expect(service.getNextToken({ model: 'gemini-2.5-flash' })).resolves.toBeNull();
+  });
 
-    expect(warnSpy).toHaveBeenCalledWith(
-      'All accounts are cooling down; temporarily bypassing cooldown gate to preserve availability',
+  it('admits exactly cap concurrent acquisitions under overlapping load and limits beyond (T10-F01, Probe C02)', async () => {
+    setServerConfig(
+      createProxyConfig({
+        parity_enabled: true,
+        scheduling_mode: 'balance',
+        max_concurrency_per_account: 8,
+      }),
     );
-    expect(warnSpy).toHaveBeenCalledWith(
-      'Parity shadow mismatch detected: legacy_candidate=true, parity_candidate=false',
+    // Remove acc-2 to isolate concurrency limit on a single account acc-1
+    (service as any).tokens.delete('acc-2');
+
+    // Launch 16 concurrent acquisition requests
+    const acquisitions = await Promise.all(
+      Array.from({ length: 16 }, () => service.getNextToken({ model: 'gemini-2.5-flash' })),
     );
-    expect((service as any).shadowComparisonCount).toBe(1);
+
+    const admitted = acquisitions.filter((acc) => acc !== null);
+    const rejected = acquisitions.filter((acc) => acc === null);
+
+    expect(admitted).toHaveLength(8);
+    expect(rejected).toHaveLength(8);
+    expect(service.getInFlightWork('acc-1')).toBe(8);
+
+    // Releasing one admitted reservation frees up capacity for exactly one new request
+    admitted[0]!.releaseReservation?.();
+    expect(service.getInFlightWork('acc-1')).toBe(7);
+
+    const followUp = await service.getNextToken({ model: 'gemini-2.5-flash' });
+    expect(followUp).not.toBeNull();
+    expect(service.getInFlightWork('acc-1')).toBe(8);
+
+    // Clean up remaining reservations
+    for (const acc of admitted.slice(1)) {
+      acc!.releaseReservation?.();
+    }
+    followUp!.releaseReservation?.();
+    expect(service.getInFlightWork('acc-1')).toBe(0);
+  });
+
+  it('preserves in-flight reservations across resetSelectionState (T10-F01, Probe C03)', async () => {
+    setServerConfig(
+      createProxyConfig({
+        parity_enabled: true,
+        scheduling_mode: 'balance',
+        max_concurrency_per_account: 8,
+      }),
+    );
+    (service as any).tokens.delete('acc-2');
+
+    // Acquire 4 reservations
+    const reservations = await Promise.all(
+      Array.from({ length: 4 }, () => service.getNextToken({ model: 'gemini-2.5-flash' })),
+    );
+    expect(reservations.every((r) => r !== null)).toBe(true);
+    expect(service.getInFlightWork('acc-1')).toBe(4);
+
+    // Call resetSelectionState() - must NOT clear inFlightWork
+    service.resetSelectionState();
+    expect(service.getInFlightWork('acc-1')).toBe(4);
+
+    // Only 4 more should be admitted before hitting the cap of 8
+    const moreAcquisitions = await Promise.all(
+      Array.from({ length: 8 }, () => service.getNextToken({ model: 'gemini-2.5-flash' })),
+    );
+    const admittedMore = moreAcquisitions.filter((r) => r !== null);
+    const rejectedMore = moreAcquisitions.filter((r) => r === null);
+
+    expect(admittedMore).toHaveLength(4);
+    expect(rejectedMore).toHaveLength(4);
+    expect(service.getInFlightWork('acc-1')).toBe(8);
+
+    // Clean up
+    for (const r of reservations) r?.releaseReservation?.();
+    for (const r of admittedMore) r?.releaseReservation?.();
+    expect(service.getInFlightWork('acc-1')).toBe(0);
   });
 });
+

@@ -19,13 +19,14 @@ interface FinalizeSelectedTokenRequest {
   tokenData: AccountLeaseTokenData;
   nowSeconds: number;
   sessionKey?: string;
+  deferSessionBinding?: boolean;
 }
 
 export class AccountLeaseFulfillmentPolicy {
   constructor(private readonly options: AccountLeaseFulfillmentPolicyOptions) {}
 
   async finalizeSelectedToken(request: FinalizeSelectedTokenRequest): Promise<CloudAccount | null> {
-    const { accountId, tokenData, nowSeconds, sessionKey } = request;
+    const { accountId, tokenData, nowSeconds, sessionKey, deferSessionBinding } = request;
 
     try {
       const hydrationResult = await this.options.hydrationPolicy.hydrateSelectedToken({
@@ -47,7 +48,8 @@ export class AccountLeaseFulfillmentPolicy {
         return null;
       }
 
-      this.options.bindSession(sessionKey, accountId, Date.now() + this.options.stickySessionTtlMs);
+      // Speculative binding is never performed during lease fulfillment.
+      // Session affinity is strictly confirmed upon successful upstream response/usable output.
 
       return {
         id: accountId,

@@ -13,6 +13,7 @@ export interface AccountLeaseUpstreamErrorParams {
   status?: number;
   retryAfter?: string;
   body?: string;
+  headers?: Record<string, string | string[] | undefined>;
   reason?: RateLimitReason;
   model?: string;
 }
@@ -122,9 +123,22 @@ export class AccountLeaseLimitPolicy {
   async markFromUpstreamError(params: AccountLeaseUpstreamErrorParams): Promise<void> {
     const accountId = this.resolveAccountId(params.accountIdOrEmail);
     const normalizedModel = normalizeModelId(params.model);
+    const retryAfterHeader = params.headers?.['retry-after'];
+    const retryAfterHeaderStr = Array.isArray(retryAfterHeader) ? retryAfterHeader[0] : retryAfterHeader;
+    const effectiveRetryAfter = params.retryAfter ?? retryAfterHeaderStr;
+
     const hasExplicitRetryWindow =
-      Boolean(isString(params.retryAfter) && !isEmpty(params.retryAfter.trim())) ||
+      Boolean(isString(effectiveRetryAfter) && !isEmpty(effectiveRetryAfter.trim())) ||
       parseRetryDelayMilliseconds(params.body) !== null;
+
+    // Immediately install provisional lockout so concurrent requests and immediate retry
+    // failover cannot re-select this account while upstream quota refresh is in flight.
+    this.trackParsedError(
+      { ...params, retryAfter: effectiveRetryAfter },
+      accountId,
+      normalizedModel,
+      true,
+    );
 
     if (!hasExplicitRetryWindow && (params.status ?? 0) === 429) {
       const reason = params.reason ?? this.detectRateLimitReasonFromBody(params.body);
@@ -132,9 +146,11 @@ export class AccountLeaseLimitPolicy {
         reason === RateLimitReason.QuotaExhausted || reason === RateLimitReason.Unknown;
 
       if (!shouldAttemptPreciseLockout) {
-        this.trackParsedError(params, accountId, normalizedModel, true);
         return;
       }
+
+      const provisionalUntil = this.accountCooldowns.get(accountId);
+      const provisionalReason = this.accountCooldownReasons.get(accountId);
 
       const isLockedByRealtimeQuota = await this.options.refreshRealtimeQuotaAndSetPreciseLockout(
         accountId,
@@ -142,6 +158,15 @@ export class AccountLeaseLimitPolicy {
         normalizedModel,
       );
       if (isLockedByRealtimeQuota) {
+        if (
+          normalizedModel &&
+          this.accountCooldowns.get(accountId) === provisionalUntil &&
+          this.accountCooldownReasons.get(accountId) === provisionalReason &&
+          provisionalReason === reason
+        ) {
+          this.accountCooldowns.delete(accountId);
+          this.accountCooldownReasons.delete(accountId);
+        }
         return;
       }
 
@@ -151,11 +176,18 @@ export class AccountLeaseLimitPolicy {
         normalizedModel,
       );
       if (isLockedByQuotaCache) {
+        if (
+          normalizedModel &&
+          this.accountCooldowns.get(accountId) === provisionalUntil &&
+          this.accountCooldownReasons.get(accountId) === provisionalReason &&
+          provisionalReason === reason
+        ) {
+          this.accountCooldowns.delete(accountId);
+          this.accountCooldownReasons.delete(accountId);
+        }
         return;
       }
     }
-
-    this.trackParsedError(params, accountId, normalizedModel, true);
   }
 
   private trackParsedError(

@@ -7,6 +7,9 @@ import { RateLimitReason } from './rate-limit-tracker';
 
 export interface ProxyTokenRetryState {
   attemptedAccountIds: Set<string>;
+  activeReservation?: () => void;
+  sessionGeneration?: number;
+  breakerGeneration?: number;
 }
 
 export interface ProxyRetryAccountLeaseService {
@@ -14,6 +17,7 @@ export interface ProxyRetryAccountLeaseService {
     sessionKey?: string;
     excludeAccountIds?: string[];
     model?: string;
+    deferSessionBinding?: boolean;
   }): Promise<CloudAccount | null>;
   recordParityError(): void;
   markAsForbidden(accountIdOrEmail: string): void;
@@ -25,8 +29,22 @@ export interface ProxyRetryAccountLeaseService {
     reason?: RateLimitReason;
     model?: string;
   }): Promise<void>;
-  markModelSuccess?(accountIdOrEmail: string, model: string): void;
-  bindSession?(sessionKey: string | undefined, accountId: string, ttlMs?: number): void;
+  acquireAttemptLease?(options?: {
+    sessionKey?: string;
+    excludeAccountIds?: string[];
+    model?: string;
+    deferSessionBinding?: boolean;
+  }): Promise<{
+    account: CloudAccount;
+    sessionKey?: string;
+    generation: number;
+    breakerGeneration: number;
+    releaseReservation: () => void;
+  } | null>;
+  getBreakerGeneration?(accountId: string): number;
+  markModelSuccess?(accountIdOrEmail: string, model: string, expectedBreakerGeneration?: number): void;
+  bindSession?(sessionKey: string | undefined, accountId: string, ttlMs?: number, expectedGeneration?: number): boolean | void;
+  getSessionBinding?(sessionKey: string | undefined): { generation: number } | null;
 }
 
 interface ProxyRetryLogger {
@@ -57,16 +75,45 @@ export class ProxyRetryPolicy {
     model: string,
     sessionKey?: string,
   ): Promise<CloudAccount | null> {
+    retryState.activeReservation?.();
+    retryState.activeReservation = undefined;
+
+    if (this.accountLeaseService.acquireAttemptLease) {
+      const lease = await this.accountLeaseService.acquireAttemptLease({
+        sessionKey,
+        excludeAccountIds: Array.from(retryState.attemptedAccountIds),
+        model,
+        deferSessionBinding: true,
+      });
+      if (!lease) {
+        return null;
+      }
+      retryState.attemptedAccountIds.add(lease.account.id);
+      retryState.activeReservation = lease.releaseReservation;
+      retryState.sessionGeneration = lease.generation;
+      retryState.breakerGeneration = lease.breakerGeneration;
+      return lease.account;
+    }
+
     const token = await this.accountLeaseService.getNextToken({
       sessionKey,
       excludeAccountIds: Array.from(retryState.attemptedAccountIds),
       model,
+      deferSessionBinding: true,
     });
     if (!token) {
       return null;
     }
 
     retryState.attemptedAccountIds.add(token.id);
+    retryState.activeReservation = token.releaseReservation;
+    if (sessionKey && this.accountLeaseService.getSessionBinding) {
+      retryState.sessionGeneration =
+        this.accountLeaseService.getSessionBinding(sessionKey)?.generation ?? 1;
+    }
+    if (this.accountLeaseService.getBreakerGeneration) {
+      retryState.breakerGeneration = this.accountLeaseService.getBreakerGeneration(token.id);
+    }
     return token;
   }
 
@@ -93,19 +140,47 @@ export class ProxyRetryPolicy {
     );
   }
 
-  markUpstreamSuccess(accountId: string, model?: string, sessionKey?: string): void {
+  markUpstreamSuccess(
+    accountId: string,
+    model?: string,
+    sessionKey?: string,
+    expectedGeneration?: number,
+    expectedBreakerGeneration?: number,
+  ): void {
     if (sessionKey && this.accountLeaseService.bindSession) {
-      this.accountLeaseService.bindSession(sessionKey, accountId);
+      if (expectedGeneration !== undefined) {
+        this.accountLeaseService.bindSession(sessionKey, accountId, undefined, expectedGeneration);
+      } else {
+        this.accountLeaseService.bindSession(sessionKey, accountId);
+      }
     }
     if (!model) {
       return;
     }
 
-    this.accountLeaseService.markModelSuccess?.(accountId, model);
-    proxyModelAvailabilityStore.clearModel(accountId, model);
+    if (expectedBreakerGeneration !== undefined) {
+      this.accountLeaseService.markModelSuccess?.(accountId, model, expectedBreakerGeneration);
+    } else {
+      this.accountLeaseService.markModelSuccess?.(accountId, model);
+    }
+    const currentBreaker = this.accountLeaseService.getBreakerGeneration
+      ? this.accountLeaseService.getBreakerGeneration(accountId)
+      : expectedBreakerGeneration;
+    if (expectedBreakerGeneration === undefined || currentBreaker === expectedBreakerGeneration) {
+      proxyModelAvailabilityStore.clearModel(accountId, model);
+    }
   }
 
-  async applyUpstreamPenalty(accountId: string, model: string, error: unknown): Promise<boolean> {
+  async applyUpstreamPenalty(
+    accountId: string,
+    model: string,
+    error: unknown,
+    retryState?: ProxyTokenRetryState,
+  ): Promise<boolean> {
+    retryState?.activeReservation?.();
+    if (retryState) {
+      retryState.activeReservation = undefined;
+    }
     this.accountLeaseService.recordParityError();
 
     if (error instanceof UpstreamRequestError) {

@@ -68,6 +68,7 @@ export interface CloudAccount {
   status_reason?: string;
   is_active?: boolean;
   proxy_url?: string;
+  releaseReservation?: () => void;
 }
 
 // Zod Schemas

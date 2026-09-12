@@ -444,6 +444,7 @@ describe('ProxyService account failover', () => {
       excludeAccountIds: [],
       model: 'gemini-new-flash-high',
       sessionKey: undefined,
+      deferSessionBinding: true,
     });
   });
 
