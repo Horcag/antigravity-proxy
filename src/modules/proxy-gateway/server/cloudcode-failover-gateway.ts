@@ -518,25 +518,8 @@ export class CloudCodeFailoverGateway {
         upstreamHeaders['content-length'] = String(payloadToSend.length);
       }
 
-      // Redact sensitive headers before logging
-      const redactedHeaders: Record<string, unknown> = { ...req.headers };
-      for (const k of Object.keys(redactedHeaders)) {
-        const lk = k.toLowerCase();
-        if (
-          lk.includes('auth') ||
-          lk.includes('token') ||
-          lk.includes('key') ||
-          lk.includes('cookie') ||
-          lk.includes('secret')
-        ) {
-          redactedHeaders[k] = '[REDACTED]';
-        }
-      }
-
       logger.debug(
-        `[CloudCodeGateway] Attempt ${attempt} account=${account?.email} headers: ${JSON.stringify(
-          redactedHeaders,
-        )}`,
+        `[CloudCodeGateway] Attempt ${attempt} model=${modelName || 'default'} operation=upstream_attempt`,
       );
 
       if (account?.token?.access_token) {
@@ -580,10 +563,9 @@ export class CloudCodeFailoverGateway {
             (statusCode === 403 && this.isQuotaErrorText(errorText));
 
           if (isRateLimited) {
+            const isQuota = this.isQuotaErrorText(errorText);
             logger.warn(
-              `[CloudCodeGateway] Upstream returned ${statusCode} for account ${
-                account?.email || 'unknown'
-              } (attempt ${attempt}/${maxAttempts}). Rotating to next account...`,
+              `[CloudCodeGateway] Upstream returned ${statusCode} (attempt ${attempt}/${maxAttempts}). Rotating to next account...`,
             );
 
             if (
@@ -607,7 +589,7 @@ export class CloudCodeFailoverGateway {
                 model: modelName,
                 body: errorText,
                 headers,
-                reason: RateLimitReason.RateLimitExceeded,
+                reason: isQuota ? RateLimitReason.QuotaExhausted : RateLimitReason.RateLimitExceeded,
               });
             }
 
@@ -650,9 +632,7 @@ export class CloudCodeFailoverGateway {
           const isTransient = code === '14';
           if (isQuotaExhausted) {
             logger.warn(
-              `[CloudCodeGateway] Upstream returned gRPC status 8 (RESOURCE_EXHAUSTED) for account ${
-                account?.email || 'unknown'
-              } (attempt ${attempt}/${maxAttempts}). Rotating to next account...`,
+              `[CloudCodeGateway] Upstream returned gRPC status 8 (RESOURCE_EXHAUSTED) (attempt ${attempt}/${maxAttempts}). Rotating to next account...`,
             );
             if (this.accountLeaseService && account) {
               await this.accountLeaseService.markFromUpstreamError({
@@ -668,9 +648,7 @@ export class CloudCodeFailoverGateway {
 
           if (isTransient) {
             logger.warn(
-              `[CloudCodeGateway] Upstream returned transient gRPC status 14 (UNAVAILABLE) for account ${
-                account?.email || 'unknown'
-              } (attempt ${attempt}/${maxAttempts}). Retrying without quota penalty...`,
+              `[CloudCodeGateway] Upstream returned transient gRPC status 14 (UNAVAILABLE) (attempt ${attempt}/${maxAttempts}). Retrying without quota penalty...`,
             );
             continue;
           }
@@ -949,9 +927,7 @@ export class CloudCodeFailoverGateway {
 
             if (frameDecision.isQuota) {
               logger.warn(
-                `[CloudCodeGateway] Quota error for account ${
-                  account?.email || 'unknown'
-                }: ${frameDecision.errorText}. Rotating to next account...`,
+                `[CloudCodeGateway] Quota exhausted (attempt ${attempt}/${maxAttempts}) model=${modelName || 'default'}. Rotating to next account...`,
               );
               if (this.accountLeaseService && account) {
                 await this.accountLeaseService.markFromUpstreamError({
@@ -968,9 +944,7 @@ export class CloudCodeFailoverGateway {
 
             if (frameDecision.isTransient) {
               logger.warn(
-                `[CloudCodeGateway] Transient upstream error for account ${
-                  account?.email || 'unknown'
-                }: ${frameDecision.errorText}. Retrying without quota penalty...`,
+                `[CloudCodeGateway] Transient upstream error (attempt ${attempt}/${maxAttempts}) model=${modelName || 'default'}. Retrying without quota penalty...`,
               );
               continue;
             }
@@ -1015,9 +989,7 @@ export class CloudCodeFailoverGateway {
             cleanupActiveAttempt();
             bodyStream.destroy();
             logger.warn(
-              `[CloudCodeGateway] Protocol frame inspection limit exceeded (NEED_MORE_DATA) for account ${
-                account?.email || 'unknown'
-              }`,
+              `[CloudCodeGateway] Protocol frame inspection limit exceeded (NEED_MORE_DATA) (attempt ${attempt}/${maxAttempts})`,
             );
             responseCommitted = true;
             const errorBody = Buffer.from(
@@ -1131,7 +1103,9 @@ export class CloudCodeFailoverGateway {
         });
 
         bodyStream.once('error', (err) => {
-          logger.warn('[CloudCodeGateway] Upstream streaming error', err);
+          logger.warn(
+            '[CloudCodeGateway] Upstream streaming error: operation=upstream_stream reason=stream_error',
+          );
           if (!res.writableEnded) {
             res.destroy(err);
           }
@@ -1200,15 +1174,13 @@ export class CloudCodeFailoverGateway {
         clearLogicalDeadline();
         cleanupActiveAttempt();
         return;
-      } catch (err: unknown) {
+      } catch {
         cleanupActiveAttempt();
         if (responseCommitted) {
           return;
         }
         logger.warn(
-          `[CloudCodeGateway] Attempt ${attempt} failed with network error: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
+          `[CloudCodeGateway] Upstream network error: operation=upstream_request reason=network_error attempt=${attempt}/${maxAttempts}`,
         );
         if (attempt === maxAttempts) {
           responseCommitted = true;
@@ -1219,9 +1191,7 @@ export class CloudCodeFailoverGateway {
               JSON.stringify({
                 error: {
                   code: 502,
-                  message: `Failover gateway failed all attempts: ${
-                    err instanceof Error ? err.message : String(err)
-                  }`,
+                  message: 'Failover gateway failed all attempts: network error',
                 },
               }),
             );
@@ -1282,6 +1252,66 @@ export class CloudCodeFailoverGateway {
       lower.includes('rate limit') ||
       lower.includes('credit')
     );
+  }
+
+  private classifyParsedEnvelope(
+    parsed: any,
+    statusCode?: number,
+  ): ProtocolFrameDecision | null {
+    if (!parsed || typeof parsed !== 'object') {
+      return null;
+    }
+
+    const hasUsableCandidates = Array.isArray(parsed.candidates) && parsed.candidates.length > 0;
+    const hasUsableChoices = Array.isArray(parsed.choices) && parsed.choices.length > 0;
+    const hasModelDeltas = parsed.type === 'content_block_delta' || parsed.delta !== undefined;
+
+    if (hasUsableCandidates || hasUsableChoices || hasModelDeltas) {
+      return { state: 'VALIDATED_RESPONSE' };
+    }
+
+    let errorText: string | undefined;
+    let code: string | number | undefined;
+    let msg = '';
+
+    if (parsed.error && typeof parsed.error === 'object') {
+      const err = parsed.error;
+      code = err.code ?? err.status ?? statusCode;
+      msg = String(err.message || '').toLowerCase();
+      errorText = JSON.stringify(err);
+    } else if (typeof parsed.error === 'string') {
+      code = statusCode;
+      msg = parsed.error.toLowerCase();
+      errorText = parsed.error;
+    } else if (typeof parsed.message === 'string') {
+      const lower = parsed.message.toLowerCase();
+      if (
+        lower.includes('quota') || lower.includes('resource_exhausted') ||
+        lower.includes('rate limit') || lower.includes('unavailable') ||
+        (statusCode !== undefined && statusCode >= 400)
+      ) {
+        code = statusCode;
+        msg = lower;
+        errorText = parsed.message;
+      }
+    }
+
+    if (errorText !== undefined) {
+      const isQuota =
+        code === 429 || code === 'RESOURCE_EXHAUSTED' ||
+        msg.includes('individual quota reached') || msg.includes('quota') ||
+        msg.includes('resource_exhausted') || msg.includes('rate limit');
+      const isTransient = code === 503 || msg.includes('unavailable');
+      return {
+        state: 'VALIDATED_ERROR',
+        isQuota,
+        isTransient,
+        category: isQuota ? 'account-quota' : isTransient ? 'upstream-transient' : undefined,
+        errorText,
+      };
+    }
+
+    return null;
   }
 
   public classifyProtocolFrame(
@@ -1525,24 +1555,9 @@ export class CloudCodeFailoverGateway {
         try {
           const parsed = JSON.parse(dataContent);
           if (parsed && typeof parsed === 'object') {
-            if (parsed.error && typeof parsed.error === 'object') {
-              const err = parsed.error;
-              const code = err.code ?? err.status;
-              const msg = String(err.message || '').toLowerCase();
-              const isQuota =
-                code === 429 ||
-                code === 'RESOURCE_EXHAUSTED' ||
-                msg.includes('quota') ||
-                msg.includes('resource_exhausted') ||
-                msg.includes('rate limit');
-              const isTransient = code === 503 || msg.includes('unavailable');
-              return {
-                state: 'VALIDATED_ERROR',
-                isQuota,
-                isTransient,
-                category: isQuota ? 'account-quota' : isTransient ? 'upstream-transient' : undefined,
-                errorText: JSON.stringify(err),
-              };
+            const envelopeDecision = this.classifyParsedEnvelope(parsed, statusCode);
+            if (envelopeDecision) {
+              return envelopeDecision;
             }
             return { state: 'VALIDATED_RESPONSE' };
           }
@@ -1588,24 +1603,9 @@ export class CloudCodeFailoverGateway {
       try {
         const parsed = JSON.parse(trimmed);
         if (parsed && typeof parsed === 'object') {
-          if (parsed.error && typeof parsed.error === 'object') {
-            const err = parsed.error;
-            const code = err.code ?? err.status;
-            const msg = String(err.message || '').toLowerCase();
-            const isQuota =
-              code === 429 ||
-              code === 'RESOURCE_EXHAUSTED' ||
-              msg.includes('quota') ||
-              msg.includes('resource_exhausted') ||
-              msg.includes('rate limit');
-            const isTransient = code === 503 || msg.includes('unavailable');
-            return {
-              state: 'VALIDATED_ERROR',
-              isQuota,
-              isTransient,
-              category: isQuota ? 'account-quota' : isTransient ? 'upstream-transient' : undefined,
-              errorText: JSON.stringify(err),
-            };
+          const envelopeDecision = this.classifyParsedEnvelope(parsed, statusCode);
+          if (envelopeDecision) {
+            return envelopeDecision;
           }
           return { state: 'VALIDATED_RESPONSE' };
         }

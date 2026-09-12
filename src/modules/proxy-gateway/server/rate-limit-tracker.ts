@@ -59,11 +59,11 @@ const DURATION_UNIT_TO_MS = {
 } as const;
 const RETRY_HINT_KEYS = new Set(['retryafter', 'retrydelay', 'quotaresetdelay', 'backofflimit']);
 const QUOTA_RETRY_PATTERNS = [
+  /resets in ([^.,;"'}\]\n]+)/i,
   /quota will reset after ([^.,;\]\n]+)/i,
   /retry after ([^.,;\]\n]+)/i,
   /quotaResetDelay["'=:\s]+([^\s,"}\]]+)/i,
 ];
-
 function toLowerText(value: string | undefined): string {
   return (value ?? '').toLowerCase();
 }
@@ -451,11 +451,11 @@ export class RateLimitTracker {
     backoffSteps: number[];
   }): RateLimitInfo | null {
     const status = params.status ?? 0;
-    if (![404, 429, 500, 503, 529].includes(status)) {
-      return null;
-    }
-
     const reason = params.reason ?? this.detectRateLimitReason(status, params.body);
+    const isAllowed =
+      [404, 429, 500, 503, 529].includes(status) || (status === 403 && reason === RateLimitReason.QuotaExhausted);
+    if (!isAllowed) return null;
+
     const retryAfterSec = this.computeRetryAfterSeconds({
       reason,
       status,
@@ -515,7 +515,7 @@ export class RateLimitTracker {
       }
     }
 
-    if (status !== 429) {
+    if (status !== 429 && status !== 403) {
       return RateLimitReason.ServerError;
     }
 
