@@ -96,7 +96,7 @@ export class CaManager {
       const sanList = TARGET_CLOUDCODE_HOSTS.map((h) => `DNS:${h}`).join(',');
       fs.writeFileSync(
         extPath,
-        `subjectAltName=${sanList},DNS:*.googleapis.com,DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n`,
+        `subjectAltName=${sanList}\nextendedKeyUsage=serverAuth\n`,
         { encoding: 'utf-8' },
       );
 
@@ -186,7 +186,15 @@ export class CaManager {
     const launcherPath = path.join(libexecDir, 'agy');
     const agyNativePath = path.join(homeDir, '.local', 'bin', 'agy');
     const agyBinPath = path.join(homeDir, '.local', 'bin', 'agy.bin');
-    const trustBundlePath = path.join(getCertsDir(), 'agy-trust.pem');
+    const publicTrustBundle = '/usr/local/share/antigravity-proxy/agy-trust.pem';
+    const trustBundlePath = fs.existsSync(publicTrustBundle)
+      ? publicTrustBundle
+      : path.join(getCertsDir(), 'agy-trust.pem');
+    const rawPort = Number(process.env.AG_PROXY_PORT?.trim());
+    const proxyPort = Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535 ? rawPort : 8045;
+    const rawHost = process.env.AG_PROXY_HOST?.trim() || '127.0.0.1';
+    const proxyHost = /^[a-zA-Z0-9.-]+$/.test(rawHost) ? rawHost : '127.0.0.1';
+    const proxyUrl = `http://${proxyHost}:${proxyPort}`;
 
     try {
       // Legacy cleanup: if agy.bin exists and agy is not an ELF binary, restore agy.bin to agy
@@ -203,7 +211,7 @@ export class CaManager {
 
 AGY_REAL="${agyNativePath}"
 TRUST_BUNDLE="${trustBundlePath}"
-PROXY_URL="http://127.0.0.1:8046"
+PROXY_URL="${proxyUrl}"
 
 if [ ! -x "$AGY_REAL" ]; then
     printf '%s\\n' 'agy launcher: native executable is unavailable' >&2

@@ -18,8 +18,11 @@
     "dev": "node --import tsx src/cli.ts serve",
     "type-check": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
-    "lint": "eslint .",
-    "check": "npm run type-check && npm test && npm run build"
+    "quality:file-size": "tsx scripts/quality/check-file-size.ts",
+    "quality:ratchet": "tsx scripts/quality/check-file-size.ts --update-baseline",
+    "lint:debt": "tsx scripts/quality/check-debt-baseline.ts",
+    "lint": "eslint . && npm run lint:debt && npm run quality:file-size",
+    "check": "npm run type-check && npm run lint && npm test && npm run build"
   },
   "dependencies": {
     "@fastify/multipart": "^9.4.0",

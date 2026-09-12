@@ -137,15 +137,11 @@ export async function bootstrapNestServer(config: ProxyConfig): Promise<NestServ
     currentPort = port;
     currentHost = host;
 
-    try {
-      const accountLeaseService = app.get(AccountLeaseService, { strict: false });
-      const rawHttpServer = (app.getHttpAdapter().getInstance() as any)?.server;
-      if (rawHttpServer) {
-        connectIngress = new ConnectIngressService(accountLeaseService);
-        connectIngress.attach(rawHttpServer);
-      }
-    } catch (ingressError) {
-      logger.warn('Failed to attach ConnectIngressService', ingressError);
+    const accountLeaseService = app.get(AccountLeaseService, { strict: false });
+    const rawHttpServer = (app.getHttpAdapter().getInstance() as any)?.server;
+    if (rawHttpServer) {
+      connectIngress = new ConnectIngressService(accountLeaseService);
+      connectIngress.attach(rawHttpServer);
     }
 
     logger.info(`NestJS Proxy Server running on http://${host}:${port}`);
@@ -232,4 +228,8 @@ export async function getNestServerStatus(): Promise<{
     base_url: running ? `http://${currentHost}:${currentPort}` : '',
     active_accounts: activeAccounts,
   };
+}
+
+export function isConnectIngressReady(): boolean {
+  return connectIngress !== null && connectIngress.isAttached();
 }

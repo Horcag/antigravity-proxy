@@ -469,10 +469,9 @@ describe('AccountLeaseSelectionPolicy session affinity and parallel session dist
     expect(pick2?.[0]).toBe('acc-2');
     inFlightMap.set('acc-2', 1);
 
-    // When Request 1 finishes, its reservation releases:
     inFlightMap.set('acc-1', 0);
-    // Request 3 arrives: acc-1 has inFlight=0, acc-2 has inFlight=1 -> picks acc-1!
     const pick3 = await policy.selectCandidate(makeRequest());
+    expect(pick3?.[0]).toBe('acc-1');
   });
 
   it('enforces strict migration ownership, state, and generation invariants (T10-F03, Probes C06, C08, C20)', () => {

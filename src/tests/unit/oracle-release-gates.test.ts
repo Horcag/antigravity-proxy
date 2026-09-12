@@ -114,9 +114,8 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     expect(leaseService.getSessionBinding(sessionKey)?.accountId).toBe('acc-1');
     expect(leaseService.getSessionBinding(sessionKey)?.generation).toBe(1);
 
-    // Mock executeUpstreamCall: acc-1 returns 429, acc-2 returns 200 OK with valid candidates
     let attemptCount = 0;
-    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(
+    (vi.spyOn(gateway as any, 'executeUpstreamCall') as any).mockImplementation(
       async (_method: string, _url: string, headers: Record<string, string>) => {
         attemptCount++;
         const auth = headers['authorization'] || '';
@@ -175,7 +174,7 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     leaseService.bindSession(sessionKey, 'acc-1', 60000);
     expect(leaseService.getSessionBinding(sessionKey)?.generation).toBe(1);
 
-    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(
+    (vi.spyOn(gateway as any, 'executeUpstreamCall') as any).mockImplementation(
       async (_method: string, _url: string, headers: Record<string, string>) => {
         const auth = headers['authorization'] || '';
         if (auth.includes('token-acc-1') || auth.includes('token-acc-2')) {
@@ -360,14 +359,10 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
   it('Gate 10: Malformed CONNECT authority daily-cloudcode-pa.googleapis.com:443junk returns 400 Bad Request', () => {
     const ingress = new ConnectIngressService();
     const socket = new EventEmitter() as any;
-    let writtenData = '';
-    socket.write = vi.fn((data: string) => {
-      writtenData += data;
-      return true;
-    });
+    socket.write = vi.fn().mockReturnValue(true);
     socket.destroy = vi.fn();
 
-    ingress.handleConnect(
+    (ingress as any).handleConnect(
       {
         url: 'daily-cloudcode-pa.googleapis.com:443junk',
         headers: { host: 'daily-cloudcode-pa.googleapis.com:443junk' },
@@ -408,7 +403,7 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
   // Gate 12: Initial grpc-status: 14 -> Handled as transient retry without committing 200 OK headers
   it('Gate 12: Initial grpc-status: 14 on 200 OK response triggers retry without committing headers', async () => {
     let attemptCount = 0;
-    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(
+    (vi.spyOn(gateway as any, 'executeUpstreamCall') as any).mockImplementation(
       async (_method: string, _url: string, headers: Record<string, string>) => {
         attemptCount++;
         const auth = headers['authorization'] || '';
@@ -771,7 +766,7 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     );
 
     expect(commitResult.kind).toBe('rejected');
-    expect(commitResult.reason).toContain('does not match current table incarnation');
+    expect((commitResult as any).reason).toContain('does not match current table incarnation');
   });
 
   // T14-F05: Migration lease renewal extends expiresAt with matching incarnation
@@ -880,7 +875,7 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     let reservationReleased = false;
 
     const originalAcquireWorkReservation = (leaseService as any).acquireWorkReservation.bind(leaseService);
-    vi.spyOn(leaseService as any, 'acquireWorkReservation').mockImplementation((accId: string) => {
+    (vi.spyOn(leaseService as any, 'acquireWorkReservation') as any).mockImplementation((accId: string) => {
       const rel = originalAcquireWorkReservation(accId);
       return () => {
         reservationReleased = true;
@@ -947,23 +942,24 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     const sessionKey = 'session:relay-budget-cross';
     leaseService.bindSession(sessionKey, 'acc-1');
 
-    // Create a valid JSON body > 64KB (e.g. 80KB)
-    const filler = 'X'.repeat(79900);
-    const fullBodyStr = JSON.stringify({ candidates: [{ content: { parts: [{ text: filler }] } }] });
-    const fullBodyBuf = Buffer.from(fullBodyStr, 'utf-8');
-    expect(fullBodyBuf.length).toBeGreaterThan(65536);
+    // Create a valid SSE payload > 64KB (75KB) with text/event-stream where inspection budget is 64 KiB (65536 bytes)
+    const event1 = `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: 'A'.repeat(39000) }] } }] })}\n\n`;
+    const event2 = `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: 'B'.repeat(36000) }] } }] })}\n\n`;
+    const fullSseStr = event1 + event2;
+    const fullSseBuf = Buffer.from(fullSseStr, 'utf-8');
+    expect(fullSseBuf.length).toBeGreaterThan(65536);
 
-    // Split into chunk1 (40KB) and chunk2 (rest, ~40KB).
+    // Split into chunk1 (45KB) and chunk2 (rest, ~30KB).
     // chunk1 + chunk2 crosses the 64KB inspection budget during chunk2!
-    const chunk1 = fullBodyBuf.subarray(0, 40000);
-    const chunk2 = fullBodyBuf.subarray(40000);
+    const chunk1 = fullSseBuf.subarray(0, 45000);
+    const chunk2 = fullSseBuf.subarray(45000);
 
     vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async () => {
       return {
         statusCode: 200,
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'text/event-stream' },
         bodyStream: createMockStream([chunk1, chunk2]),
-        bufferedBody: fullBodyBuf,
+        bufferedBody: fullSseBuf,
       };
     });
 
@@ -981,8 +977,8 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
 
     expect(res.writeHead).toHaveBeenCalledWith(200, expect.any(Object));
     const receivedBody = Buffer.concat(res.writtenChunks);
-    expect(receivedBody.length).toBe(fullBodyBuf.length);
-    expect(receivedBody.equals(fullBodyBuf)).toBe(true);
+    expect(receivedBody.length).toBe(fullSseBuf.length);
+    expect(receivedBody.equals(fullSseBuf)).toBe(true);
   });
 
   // T16-F01: Chunk partition invariance verifies byte-for-byte identical client forwarding
@@ -990,17 +986,19 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     const sessionKey = 'session:chunk-invariance';
     leaseService.bindSession(sessionKey, 'acc-1');
 
-    const filler = 'Y'.repeat(80000);
-    const fullBodyStr = JSON.stringify({ candidates: [{ content: { parts: [{ text: filler }] } }] });
-    const fullBodyBuf = Buffer.from(fullBodyStr, 'utf-8');
+    const event1 = `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: 'X'.repeat(38000) }] } }] })}\n\n`;
+    const event2 = `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Y'.repeat(38000) }] } }] })}\n\n`;
+    const fullSseStr = event1 + event2;
+    const fullSseBuf = Buffer.from(fullSseStr, 'utf-8');
+    expect(fullSseBuf.length).toBeGreaterThan(65536);
 
     async function runWithChunks(chunks: Buffer[]): Promise<Buffer> {
       vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async () => {
         return {
           statusCode: 200,
-          headers: { 'content-type': 'application/json' },
+          headers: { 'content-type': 'text/event-stream' },
           bodyStream: createMockStream(chunks),
-          bufferedBody: fullBodyBuf,
+          bufferedBody: fullSseBuf,
         };
       });
 
@@ -1019,25 +1017,25 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
 
     // Partition 1: 1KB chunks
     const chunks1KB: Buffer[] = [];
-    for (let i = 0; i < fullBodyBuf.length; i += 1024) {
-      chunks1KB.push(fullBodyBuf.subarray(i, i + 1024));
+    for (let i = 0; i < fullSseBuf.length; i += 1024) {
+      chunks1KB.push(fullSseBuf.subarray(i, i + 1024));
     }
     const result1KB = await runWithChunks(chunks1KB);
 
     // Partition 2: 16KB chunks
     const chunks16KB: Buffer[] = [];
-    for (let i = 0; i < fullBodyBuf.length; i += 16384) {
-      chunks16KB.push(fullBodyBuf.subarray(i, i + 16384));
+    for (let i = 0; i < fullSseBuf.length; i += 16384) {
+      chunks16KB.push(fullSseBuf.subarray(i, i + 16384));
     }
     const result16KB = await runWithChunks(chunks16KB);
 
     // Partition 3: Boundary-crossing (48KB + remainder)
-    const chunksBoundary = [fullBodyBuf.subarray(0, 48000), fullBodyBuf.subarray(48000)];
+    const chunksBoundary = [fullSseBuf.subarray(0, 48000), fullSseBuf.subarray(48000)];
     const resultBoundary = await runWithChunks(chunksBoundary);
 
-    expect(result1KB.equals(fullBodyBuf)).toBe(true);
-    expect(result16KB.equals(fullBodyBuf)).toBe(true);
-    expect(resultBoundary.equals(fullBodyBuf)).toBe(true);
+    expect(result1KB.equals(fullSseBuf)).toBe(true);
+    expect(result16KB.equals(fullSseBuf)).toBe(true);
+    expect(resultBoundary.equals(fullSseBuf)).toBe(true);
     expect(result1KB.equals(resultBoundary)).toBe(true);
   });
 
@@ -1046,7 +1044,7 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     const sessionKey = 'session:gzip-flush-test';
     leaseService.bindSession(sessionKey, 'acc-1');
 
-    const event = `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Hello from SSE' }] } }] })}\n\n`;
+    const event = `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Validated after raw cap' }] } }] })}\n\n`;
     const randomPadding = randomBytes(70000).toString('base64');
     const fullSse = event + `: keepalive ${randomPadding}\n\n`;
     const gzipped = zlib.gzipSync(Buffer.from(fullSse, 'utf-8'));
@@ -1085,9 +1083,9 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     expect(res.writeHead).toHaveBeenCalledWith(200, expect.any(Object));
     expect(res.statusCode).toBe(200);
     const receivedCompressed = Buffer.concat(res.writtenChunks);
-    expect(receivedCompressed.length).toBeGreaterThan(0);
+    expect(receivedCompressed.equals(gzipped)).toBe(true);
     const decompressed = zlib.gunzipSync(receivedCompressed);
-    expect(decompressed.toString('utf-8')).toContain('Hello from SSE');
+    expect(decompressed.equals(Buffer.from(fullSse, 'utf-8'))).toBe(true);
   });
 
   // T16-F02 Probe C03: Abort while hydration is pending behind barrier settles acquisition immediately to null before barrier release
@@ -1104,7 +1102,13 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
       };
     });
 
+    let hydrationEntered!: () => void;
+    const hydrationEnteredPromise = new Promise<void>((resolve) => {
+      hydrationEntered = resolve;
+    });
+
     vi.spyOn(leaseService as any, 'finalizeSelectedToken').mockImplementation(async () => {
+      hydrationEntered();
       await barrierPromise;
       return null;
     });
@@ -1116,7 +1120,10 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
       return res;
     });
 
-    // Before barrier releases, trigger abort
+    // Wait explicitly until finalizeSelectedToken has entered and is waiting on the barrier!
+    await hydrationEnteredPromise;
+
+    // Now trigger abort while actively blocked inside hydration barrier
     abortController.abort();
 
     const lease = await acquirePromise;
@@ -1177,6 +1184,160 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
       policy.disposeTokenRetryState(retryState);
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  // T17-F01 Probe C01: Abort while API acquisition is pending releases late lease and does not start renewal
+  it('T17-F01 Probe C01: Abort while API acquisition is pending releases late lease and does not start renewal', async () => {
+    const policy = new ProxyRetryPolicy(leaseService as any, { log: () => {}, warn: () => {} });
+    const sessionKey = 'session:t17-probe-c01';
+    leaseService.bindSession(sessionKey, 'acc-1');
+
+    const abortController = new AbortController();
+    const retryState = policy.createTokenRetryState(abortController.signal);
+    retryState.attemptedAccountIds.add('acc-1');
+
+    let releaseCalled = false;
+    let acquisitionDeferred!: () => void;
+    const acquisitionPromise = new Promise<{
+      account: any;
+      generation: number;
+      tableIncarnation: number;
+      releaseReservation: () => void;
+    }>((resolve) => {
+      acquisitionDeferred = () => {
+        resolve({
+          account: { id: 'acc-2', email: 'acc2@test.com', token: {} as any },
+          generation: 1,
+          tableIncarnation: 1,
+          releaseReservation: () => {
+            releaseCalled = true;
+          },
+        });
+      };
+    });
+
+    vi.spyOn(leaseService as any, 'acquireAttemptLease').mockReturnValue(acquisitionPromise);
+
+    const selectPromise = policy.selectRetryToken(retryState, 'gemini-2.5-pro', sessionKey);
+
+    // Abort while acquisition is pending
+    abortController.abort();
+    expect(policy.isTerminal(retryState)).toBe(true);
+
+    // Now acquisition finishes and returns late lease
+    acquisitionDeferred();
+    const selected = await selectPromise;
+
+    expect(selected).toBeNull();
+    expect(releaseCalled).toBe(true);
+    expect(retryState.migrationRenewalTimer).toBeUndefined();
+    expect(retryState.activeReservation).toBeUndefined();
+  });
+
+  // T17-F01 Probe C02: Abort after capability issuance disposes timer and reservation
+  it('T17-F01 Probe C02: Abort after capability issuance disposes timer and reservation', async () => {
+    const policy = new ProxyRetryPolicy(leaseService as any, { log: () => {}, warn: () => {} });
+    const sessionKey = 'session:t17-probe-c02';
+    leaseService.bindSession(sessionKey, 'acc-1');
+
+    const abortController = new AbortController();
+    const retryState = policy.createTokenRetryState(abortController.signal);
+    retryState.attemptedAccountIds.add('acc-1');
+
+    let reservationReleased = false;
+    vi.spyOn(leaseService as any, 'acquireAttemptLease').mockResolvedValue({
+      account: { id: 'acc-2', email: 'acc2@test.com', token: {} as any },
+      generation: 1,
+      tableIncarnation: 1,
+      releaseReservation: () => {
+        reservationReleased = true;
+      },
+    });
+
+    const selected = await policy.selectRetryToken(retryState, 'gemini-2.5-pro', sessionKey);
+    expect(selected?.id).toBe('acc-2');
+    expect(retryState.migrationRenewalTimer).toBeDefined();
+    expect(retryState.activeReservation).toBeDefined();
+
+    // Abort after capability issuance
+    abortController.abort();
+
+    expect(policy.isTerminal(retryState)).toBe(true);
+    expect(retryState.status).toBe('cancelled');
+    expect(retryState.migrationRenewalTimer).toBeUndefined();
+    expect(retryState.activeReservation).toBeUndefined();
+    expect(reservationReleased).toBe(true);
+  });
+
+  // T17-F01 Probe C03: Disposal during acquisition prevents disposed state from adopting late lease
+  it('T17-F01 Probe C03: Call disposal then let acquisition finish prevents adoption of late lease', async () => {
+    const policy = new ProxyRetryPolicy(leaseService as any, { log: () => {}, warn: () => {} });
+    const sessionKey = 'session:t17-probe-c03-disposal';
+    leaseService.bindSession(sessionKey, 'acc-1');
+
+    const retryState = policy.createTokenRetryState();
+    retryState.attemptedAccountIds.add('acc-1');
+
+    let releaseCalled = false;
+    let acquisitionDeferred!: () => void;
+    const acquisitionPromise = new Promise<any>((resolve) => {
+      acquisitionDeferred = () => {
+        resolve({
+          account: { id: 'acc-2', email: 'acc2@test.com', token: {} as any },
+          generation: 1,
+          tableIncarnation: 1,
+          releaseReservation: () => {
+            releaseCalled = true;
+          },
+        });
+      };
+    });
+
+    vi.spyOn(leaseService as any, 'acquireAttemptLease').mockReturnValue(acquisitionPromise);
+
+    const selectPromise = policy.selectRetryToken(retryState, 'gemini-2.5-pro', sessionKey);
+
+    // Call disposal before acquisition finishes
+    policy.disposeTokenRetryState(retryState);
+    expect(retryState.status).toBe('disposed');
+
+    acquisitionDeferred();
+    const selected = await selectPromise;
+
+    expect(selected).toBeNull();
+    expect(releaseCalled).toBe(true);
+    expect(retryState.activeReservation).toBeUndefined();
+    expect(retryState.migrationRenewalTimer).toBeUndefined();
+  });
+
+  // T17-F01 Probe C03: Exception between acquisition and try disposes renewal and lease via outer finalizer
+  it('T17-F01 Probe C03: Throw immediately after selection cleans up renewal and lease via outer finalizer', async () => {
+    let reservationReleased = false;
+    vi.spyOn(leaseService as any, 'acquireAttemptLease').mockResolvedValue({
+      account: { id: 'acc-1', email: 'acc1@test.com', token: {} as any },
+      generation: 1,
+      tableIncarnation: 1,
+      releaseReservation: () => {
+        reservationReleased = true;
+      },
+    });
+
+    // Injected resolver error before per-attempt try (Oracle Probe C03)
+    vi.spyOn(leaseService as any, 'resolveDynamicModelForAccount').mockImplementation(() => {
+      throw new Error('Resolver failure injected at pre-try boundary');
+    });
+
+    const service = (gateway as any).proxyService;
+    if (service) {
+      await expect(
+        service.handleAnthropicMessages({
+          model: 'claude-3-5-sonnet-20241022',
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      ).rejects.toThrow('Resolver failure injected at pre-try boundary');
+
+      expect(reservationReleased).toBe(true);
     }
   });
 

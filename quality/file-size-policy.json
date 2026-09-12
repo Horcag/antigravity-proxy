@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "baseline_path": "quality/file-size-baseline.json",
+  "thresholds": {
+    "warning_above": 350,
+    "error_above": 500,
+    "critical_above": 1000
+  },
+  "source_roots": [
+    "src",
+    "scripts"
+  ],
+  "extensions": [
+    ".ts",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".sh"
+  ],
+  "excluded_globs": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/coverage/**",
+    "**/.agent-work/**",
+    "**/.git/**"
+  ]
+}

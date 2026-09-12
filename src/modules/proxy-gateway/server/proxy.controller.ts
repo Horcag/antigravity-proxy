@@ -210,9 +210,13 @@ export class ProxyController {
   }
 
   @Post('chat/completions')
-  async chatCompletions(@Body() body: OpenAIChatRequest, @Res() res: FastifyReply) {
+  async chatCompletions(
+    @Body() body: OpenAIChatRequest,
+    @Res() res: FastifyReply,
+    @Req() req?: FastifyRequest,
+  ) {
     this.validateChatRequest(body);
-    await this.respondOpenAIChatCompletions(body, res);
+    await this.respondOpenAIChatCompletions(body, res, req);
   }
 
   @Post('completions')
@@ -220,6 +224,7 @@ export class ProxyController {
     @Body()
     body: OpenAILegacyCompletionRequest,
     @Res() res: FastifyReply,
+    @Req() req?: FastifyRequest,
   ) {
     this.requireJsonObject(body);
     this.requireNonEmptyString(body.model, 'model');
@@ -245,7 +250,12 @@ export class ProxyController {
       stream_options: body.stream_options,
     };
     try {
-      const result = await this.proxyService.handleChatCompletions(request, 'text-completions');
+      const result = await this.proxyService.handleChatCompletions(
+        request,
+        'text-completions',
+        undefined,
+        this.extractRequestAbortSignal(req),
+      );
       if (body.stream && this.isObservableLike(result)) {
         this.writeSseResponse(res, result);
         return;
@@ -263,6 +273,7 @@ export class ProxyController {
     @Body()
     body: OpenAIResponsesRequest,
     @Res() res: FastifyReply,
+    @Req() req?: FastifyRequest,
   ) {
     this.requireJsonObject(body);
     this.requireNonEmptyString(body.model, 'model');
@@ -278,6 +289,7 @@ export class ProxyController {
         request,
         'responses',
         configuration,
+        this.extractRequestAbortSignal(req),
       );
       if (body.stream && this.isObservableLike(result)) {
         this.writeSseResponse(res, result, 'responses');
@@ -591,9 +603,38 @@ export class ProxyController {
     }
   }
 
-  private async respondOpenAIChatCompletions(body: OpenAIChatRequest, res: FastifyReply) {
+  private extractRequestAbortSignal(request?: FastifyRequest): AbortSignal | undefined {
+    if (!request) return undefined;
+    if ((request as any).signal instanceof AbortSignal) {
+      return (request as any).signal;
+    }
+    const raw = request.raw;
+    if (!raw) return undefined;
+    if (raw.destroyed || raw.closed) {
+      return AbortSignal.abort();
+    }
+    const controller = new AbortController();
+    const onClose = () => {
+      if (!raw.complete) {
+        controller.abort();
+      }
+    };
+    raw.once('close', onClose);
+    return controller.signal;
+  }
+
+  private async respondOpenAIChatCompletions(
+    body: OpenAIChatRequest,
+    res: FastifyReply,
+    request?: FastifyRequest,
+  ) {
     try {
-      const result = await this.proxyService.handleChatCompletions(body);
+      const result = await this.proxyService.handleChatCompletions(
+        body,
+        'chat-completions',
+        undefined,
+        this.extractRequestAbortSignal(request),
+      );
 
       if (body.stream && this.isObservableLike(result)) {
         this.writeSseResponse(res, result);
@@ -617,7 +658,10 @@ export class ProxyController {
     this.validateAnthropicRequest(body, request.headers['anthropic-version']);
 
     try {
-      const result = await this.proxyService.handleAnthropicMessages(body);
+      const result = await this.proxyService.handleAnthropicMessages(
+        body,
+        this.extractRequestAbortSignal(request),
+      );
 
       if (body.stream && this.isObservableLike(result)) {
         this.writeSseResponse(res, result, 'anthropic', requestId);

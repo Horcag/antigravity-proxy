@@ -600,7 +600,7 @@ describe('Request compatibility for legacy aliases', () => {
 
     await controller.chatCompletions(request, reply);
 
-    expect(mockProxyService.handleChatCompletions).toHaveBeenCalledWith(request);
+    expect(mockProxyService.handleChatCompletions).toHaveBeenCalledWith(request, 'chat-completions', undefined, undefined);
     expect(reply.sentBody.model).toBe('gpt-4o');
   });
 });

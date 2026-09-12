@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 # Shared primitives for the systemd release scripts. This file is sourced, not executed.
 
 release_init() {
@@ -49,7 +48,6 @@ release_init() {
   migration_wants_published_identity=''
   migration_smoke_check_count=0
   migration_topology=''
-
   case "$root_prefix" in
     '') ;;
     /*) ;;
@@ -68,7 +66,6 @@ release_init() {
   require_absolute_path "$release_lock_file" RELEASE_LOCK_FILE
   validate_release_id "$release_id"
   case "$bundle_node" in 0|1) ;; *) die "BUNDLE_NODE must be 0 or 1" ;; esac
-
   node_binary="${NODE_BINARY:-$(command -v node || true)}"
   [ -n "$node_binary" ] || die "Node runtime not found; set NODE_BINARY to an executable absolute path"
   require_absolute_path "$node_binary" NODE_BINARY
@@ -866,7 +863,7 @@ restore_migration_unit_state() {
         return 0
       fi
       if ! mv -Tn -- "$backup_quarantine_path" "$unit_fs" || { [ -e "$backup_quarantine_path" ] || [ -L "$backup_quarantine_path" ]; }; then
-        rm -rf -- "$backup_quarantine_dir" 2>/dev/null || true
+        [ -n "$migration_unit_backup_fs" ] && mv -Tn -- "$backup_quarantine_path" "$migration_unit_backup_fs" 2>/dev/null && [ ! -e "$backup_quarantine_path" ] && [ ! -L "$backup_quarantine_path" ] && rmdir -- "$backup_quarantine_dir" 2>/dev/null || true
         printf '%s\n' "Refusing to restore migration system unit without overwriting a concurrent replacement: $unit_fs" >&2
         return 1
       fi
@@ -931,7 +928,7 @@ restore_migration_wants_state() {
         return 0
       fi
       if ! mv -Tn -- "$backup_quarantine_path" "$migration_wants_fs" || { [ -e "$backup_quarantine_path" ] || [ -L "$backup_quarantine_path" ]; }; then
-        rm -rf -- "$backup_quarantine_dir" 2>/dev/null || true
+        [ -n "$migration_wants_backup_fs" ] && mv -Tn -- "$backup_quarantine_path" "$migration_wants_backup_fs" 2>/dev/null && [ ! -e "$backup_quarantine_path" ] && [ ! -L "$backup_quarantine_path" ] && rmdir -- "$backup_quarantine_dir" 2>/dev/null || true
         printf '%s\n' "Refusing to restore migration system wants entry without overwriting a concurrent replacement: $migration_wants_fs" >&2
         return 1
       fi
@@ -1286,7 +1283,7 @@ smoke_check() {
     fi
 
     curl_exit=0
-    health_code="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time "$request_timeout" "$base_url/health" 2>/dev/null)" || curl_exit=$?
+    health_code="$(curl -q --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' --max-time "$request_timeout" "$base_url/health" 2>/dev/null)" || curl_exit=$?
 
     if [ "$curl_exit" -eq 0 ] && [ "$health_code" = 200 ]; then
       ready=1
@@ -1315,7 +1312,7 @@ smoke_check() {
     return 1
   fi
 
-  admin_status="$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time "$request_timeout" "$base_url/admin/status" 2>/dev/null || printf '000')"
+  admin_status="$(curl -q --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' --max-time "$request_timeout" "$base_url/admin/status" 2>/dev/null || printf '000')"
   case "$admin_status" in
     401|403) ;;
     *)

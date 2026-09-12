@@ -30,7 +30,18 @@ export function parseConnectAuthority(destination: string | undefined): ParsedCo
   return { hostname, port };
 }
 
+export function isSelfOrLoopback(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || /^127\.\d+\.\d+\.\d+$/.test(h);
+}
+
 export class ConnectIngressService {
+  private static instanceAttached = false;
+
+  static isReady(): boolean {
+    return this.instanceAttached;
+  }
+
   private h2Server: http2.Http2SecureServer | null = null;
   private failoverGateway: CloudCodeFailoverGateway;
   private activeSockets = new Set<net.Socket>();
@@ -81,6 +92,7 @@ export class ConnectIngressService {
     logger.info(
       `[ConnectIngress] Transparent HTTPS failover attached. CA cert path: ${CaManager.getCaCertPath()}`,
     );
+    ConnectIngressService.instanceAttached = true;
   }
 
   private handleConnect(
@@ -124,13 +136,45 @@ export class ConnectIngressService {
     }
 
     // 2. Standard TCP tunnel for non-target destinations
+    if (isSelfOrLoopback(parsed.hostname) || (parsed.port !== 443 && parsed.port !== 8443)) {
+      logger.warn(`[ConnectIngress] Non-target destination disallowed: ${destination}`);
+      clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
+
+    let isConnected = false;
+    let clientClosed = false;
+
     const upstreamSocket = net.connect(parsed.port, parsed.hostname, () => {
+      isConnected = true;
+      if (clientClosed) {
+        upstreamSocket.destroy();
+        return;
+      }
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head && head.length > 0) {
         upstreamSocket.write(head);
       }
       clientSocket.pipe(upstreamSocket);
       upstreamSocket.pipe(clientSocket);
+    });
+
+    clientSocket.once('close', () => {
+      clientClosed = true;
+      if (!isConnected) {
+        upstreamSocket.destroy();
+      }
+    });
+
+    clientSocket.setTimeout(60000, () => {
+      clientSocket.destroy();
+      upstreamSocket.destroy();
+    });
+
+    upstreamSocket.setTimeout(60000, () => {
+      upstreamSocket.destroy();
+      clientSocket.destroy();
     });
 
     this.activeSockets.add(upstreamSocket);
@@ -142,6 +186,10 @@ export class ConnectIngressService {
       logger.debug(`[ConnectIngress] Upstream tunnel error for ${destination}: ${err.message}`);
       clientSocket.destroy();
     });
+  }
+
+  isAttached(): boolean {
+    return this.h2Server !== null;
   }
 
   close(): void {
@@ -162,5 +210,6 @@ export class ConnectIngressService {
       }
       this.h2Server = null;
     }
+    ConnectIngressService.instanceAttached = false;
   }
 }

@@ -13,6 +13,8 @@ import { type AffinityCommitResult } from './account-lease.service';
 
 export { type AffinityCommitResult };
 
+export type ProxyRetryLifecycleState = 'active' | 'confirmed' | 'failed' | 'cancelled' | 'disposed';
+
 export interface ProxyTokenRetryState {
   attemptedAccountIds: Set<string>;
   requestId: string;
@@ -22,6 +24,9 @@ export interface ProxyTokenRetryState {
   breakerGeneration?: number;
   migrationCapability?: MigrationCapability;
   migrationRenewalTimer?: NodeJS.Timeout;
+  signal?: AbortSignal;
+  status: ProxyRetryLifecycleState;
+  removeAbortListener?: () => void;
 }
 
 export interface ProxyRetryAccountLeaseService {
@@ -30,6 +35,7 @@ export interface ProxyRetryAccountLeaseService {
     excludeAccountIds?: string[];
     model?: string;
     deferSessionBinding?: boolean;
+    signal?: AbortSignal;
   }): Promise<CloudAccount | null>;
   recordParityError(): void;
   markAsForbidden(accountIdOrEmail: string): void;
@@ -46,6 +52,7 @@ export interface ProxyRetryAccountLeaseService {
     excludeAccountIds?: string[];
     model?: string;
     deferSessionBinding?: boolean;
+    signal?: AbortSignal;
   }): Promise<{
     account: CloudAccount;
     sessionKey?: string;
@@ -114,32 +121,61 @@ export class ProxyRetryPolicy {
     private readonly logger: ProxyRetryLogger,
   ) {}
 
+  isTerminal(retryState?: ProxyTokenRetryState): boolean {
+    if (!retryState) return true;
+    return retryState.status !== 'active' || Boolean(retryState.signal?.aborted);
+  }
+
   createTokenRetryState(signal?: AbortSignal): ProxyTokenRetryState {
     const retryState: ProxyTokenRetryState = {
       attemptedAccountIds: new Set<string>(),
       requestId: crypto.randomUUID(),
+      signal,
+      status: 'active',
     };
     if (signal) {
       const onAbort = () => {
-        this.stopMigrationRenewal(retryState);
+        this.cancelTokenRetryState(retryState);
       };
       if (signal.aborted) {
         onAbort();
       } else {
         signal.addEventListener('abort', onAbort, { once: true });
+        retryState.removeAbortListener = () => {
+          signal.removeEventListener('abort', onAbort);
+        };
       }
     }
     return retryState;
   }
 
+  cancelTokenRetryState(retryState?: ProxyTokenRetryState): void {
+    if (!retryState) return;
+    if (retryState.status === 'cancelled' || retryState.status === 'disposed') {
+      this.stopMigrationRenewal(retryState);
+      this.releaseReservation(retryState);
+      return;
+    }
+    retryState.status = 'cancelled';
+    retryState.removeAbortListener?.();
+    retryState.removeAbortListener = undefined;
+    this.stopMigrationRenewal(retryState);
+    this.releaseReservation(retryState);
+  }
+
   startMigrationRenewal(retryState: ProxyTokenRetryState, sessionKey?: string): void {
     this.stopMigrationRenewal(retryState);
+    if (this.isTerminal(retryState)) return;
     if (!sessionKey || !retryState.migrationCapability) return;
 
     const migrationCap = retryState.migrationCapability;
     const renewalIntervalMs = 20000;
 
     retryState.migrationRenewalTimer = setInterval(() => {
+      if (this.isTerminal(retryState)) {
+        this.stopMigrationRenewal(retryState);
+        return;
+      }
       if (typeof this.accountLeaseService.renewSessionMigration === 'function') {
         const expectedGen = retryState.sessionGeneration ?? migrationCap.generation;
         const renewed = this.accountLeaseService.renewSessionMigration(
@@ -169,9 +205,24 @@ export class ProxyRetryPolicy {
 
   disposeTokenRetryState(retryState?: ProxyTokenRetryState): void {
     if (!retryState) return;
+    if (retryState.status === 'disposed') return;
+    retryState.status = 'disposed';
+    retryState.removeAbortListener?.();
+    retryState.removeAbortListener = undefined;
     this.stopMigrationRenewal(retryState);
-    retryState.activeReservation?.();
-    retryState.activeReservation = undefined;
+    this.releaseReservation(retryState);
+  }
+
+  private releaseReservation(retryState: ProxyTokenRetryState): void {
+    if (retryState.activeReservation) {
+      const release = retryState.activeReservation;
+      retryState.activeReservation = undefined;
+      try {
+        release();
+      } catch (err) {
+        this.logger.warn(`[ProxyRetryPolicy] Error releasing reservation: ${err}`);
+      }
+    }
   }
 
   async selectRetryToken(
@@ -179,8 +230,11 @@ export class ProxyRetryPolicy {
     model: string,
     sessionKey?: string,
   ): Promise<CloudAccount | null> {
-    retryState.activeReservation?.();
-    retryState.activeReservation = undefined;
+    if (this.isTerminal(retryState)) {
+      return null;
+    }
+
+    this.releaseReservation(retryState);
 
     const isRetryAttempt = retryState.attemptedAccountIds.size > 0;
 
@@ -197,7 +251,16 @@ export class ProxyRetryPolicy {
         excludeAccountIds: Array.from(retryState.attemptedAccountIds),
         model,
         deferSessionBinding: true,
+        signal: retryState.signal,
       });
+      if (this.isTerminal(retryState)) {
+        if (lease) {
+          try {
+            lease.releaseReservation();
+          } catch { /* empty */ }
+        }
+        return null;
+      }
       if (!lease) {
         return null;
       }
@@ -213,7 +276,16 @@ export class ProxyRetryPolicy {
         excludeAccountIds: Array.from(retryState.attemptedAccountIds),
         model,
         deferSessionBinding: true,
+        signal: retryState.signal,
       });
+      if (this.isTerminal(retryState)) {
+        if (token) {
+          try {
+            token.releaseReservation?.();
+          } catch { /* empty */ }
+        }
+        return null;
+      }
       if (!token) {
         return null;
       }
@@ -231,6 +303,11 @@ export class ProxyRetryPolicy {
         retryState.breakerGeneration = this.accountLeaseService.getBreakerGeneration(token.id);
       }
       selectedAccount = token;
+    }
+
+    if (this.isTerminal(retryState)) {
+      this.releaseReservation(retryState);
+      return null;
     }
 
     const needsMigration = Boolean(
@@ -305,7 +382,11 @@ export class ProxyRetryPolicy {
     retryState?: ProxyTokenRetryState,
   ): AffinityCommitResult {
     if (retryState) {
+      retryState.status = 'confirmed';
+      retryState.removeAbortListener?.();
+      retryState.removeAbortListener = undefined;
       this.stopMigrationRenewal(retryState);
+      this.releaseReservation(retryState);
     }
     let commitResult: AffinityCommitResult = { kind: 'not-applicable' };
     if (sessionKey) {
@@ -367,10 +448,7 @@ export class ProxyRetryPolicy {
   ): Promise<boolean> {
     if (retryState) {
       this.stopMigrationRenewal(retryState);
-    }
-    retryState?.activeReservation?.();
-    if (retryState) {
-      retryState.activeReservation = undefined;
+      this.releaseReservation(retryState);
     }
     if (
       retryState?.migrationCapability &&

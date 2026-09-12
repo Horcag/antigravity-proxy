@@ -1,5 +1,6 @@
 import { Body, Controller, Delete, Get, Param, Post, Put, Query, UseGuards } from '@nestjs/common';
 import { AdminGuard } from '@/modules/proxy-gateway/server/guards/admin.guard';
+import { ConnectIngressService } from '@/modules/proxy-gateway/server/connect-ingress.service';
 import { AdminService, OAuthExchangeRequest } from './admin.service';
 
 function isExplicitTrue(value: string | undefined): boolean {
@@ -22,6 +23,7 @@ export class AdminController {
   health() {
     return {
       ok: true,
+      connect_ready: ConnectIngressService.isReady(),
     };
   }
 

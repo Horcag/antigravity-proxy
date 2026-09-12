@@ -26,7 +26,7 @@ export class AccountLeaseFulfillmentPolicy {
   constructor(private readonly options: AccountLeaseFulfillmentPolicyOptions) {}
 
   async finalizeSelectedToken(request: FinalizeSelectedTokenRequest): Promise<CloudAccount | null> {
-    const { accountId, tokenData, nowSeconds, sessionKey, deferSessionBinding } = request;
+    const { accountId, tokenData, nowSeconds } = request;
 
     try {
       const hydrationResult = await this.options.hydrationPolicy.hydrateSelectedToken({

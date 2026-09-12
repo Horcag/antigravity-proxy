@@ -205,7 +205,7 @@ export class ProxyService {
       }
       hasCleanedUp = true;
       if (retryState) {
-        this.retryPolicy.stopMigrationRenewal(retryState);
+        this.retryPolicy.disposeTokenRetryState(retryState);
       }
       releaseReservation?.();
     };
@@ -371,6 +371,7 @@ export class ProxyService {
 
   async handleAnthropicMessages(
     request: AnthropicChatRequest,
+    clientSignal?: AbortSignal,
   ): Promise<AnthropicChatResponse | Observable<string>> {
     const sessionKey = this.extractAnthropicSessionKey(request);
 
@@ -390,193 +391,203 @@ export class ProxyService {
     // Retry loop
     let lastError: unknown = null;
     const maxRetries = await this.getModelRetryBudget(targetModel);
-    const retryState = this.createTokenRetryState();
+    const retryState = this.createTokenRetryState(clientSignal);
+    let streamTransferred = false;
 
-    for (let i = 0; i < maxRetries; i++) {
-      await this.waitBeforeRetry(i, maxRetries, 'Anthropic');
+    try {
+      for (let i = 0; i < maxRetries; i++) {
+        await this.waitBeforeRetry(i, maxRetries, 'Anthropic');
 
-      const token = await this.selectRetryToken(retryState, targetModel, sessionKey);
-      if (!token) {
-        if (lastError) {
-          throw lastError;
+        const token = await this.selectRetryToken(retryState, targetModel, sessionKey);
+        if (!token) {
+          if (lastError) {
+            throw lastError;
+          }
+          throw new AccountPoolUnavailableException(
+            'All model-capable accounts are exhausted or rate limited',
+            HttpStatus.TOO_MANY_REQUESTS,
+          );
         }
-        throw new AccountPoolUnavailableException(
-          'All model-capable accounts are exhausted or rate limited',
-          HttpStatus.TOO_MANY_REQUESTS,
+        const effectiveTargetModel = this.accountLeaseService.resolveDynamicModelForAccount(
+          token.id,
+          targetModel,
         );
-      }
-      const effectiveTargetModel = this.accountLeaseService.resolveDynamicModelForAccount(
-        token.id,
-        targetModel,
-      );
 
-      const signatureContext: SignatureContext = {
-        accountId: token.id,
-        model: effectiveTargetModel,
-      };
+        const signatureContext: SignatureContext = {
+          accountId: token.id,
+          model: effectiveTargetModel,
+        };
 
-      try {
-        const projectId = token.token.project_id ?? '';
-        const requestUserAgent = await resolveRequestUserAgent();
-        const geminiBody = transformClaudeRequestIn(
-          this.toClaudeRequest(request),
-          projectId,
-          requestUserAgent,
-          signatureContext,
-        );
-        geminiBody.model = effectiveTargetModel;
-        this.applyInternalGenerationConstraints(geminiBody, effectiveTargetModel, token.id);
+        try {
+          const projectId = token.token.project_id ?? '';
+          const requestUserAgent = await resolveRequestUserAgent();
+          const geminiBody = transformClaudeRequestIn(
+            this.toClaudeRequest(request),
+            projectId,
+            requestUserAgent,
+            signatureContext,
+          );
+          geminiBody.model = effectiveTargetModel;
+          this.applyInternalGenerationConstraints(geminiBody, effectiveTargetModel, token.id);
 
-        if (request.stream) {
-          const { result: stream, startedAt } = await this.executeUpstreamAttempt(
-            token.id,
-            effectiveTargetModel,
-            () => this.geminiClient.streamGenerateInternal(
+          if (request.stream) {
+            const { result: stream, startedAt } = await this.executeUpstreamAttempt(
+              token.id,
+              effectiveTargetModel,
+              () => this.geminiClient.streamGenerateInternal(
+                geminiBody,
+                token.token.access_token,
+                token.token.upstream_proxy_url,
+                extraHeaders,
+                token.id,
+              ),
+            );
+            const streamHealth = this.createStreamHealthLifecycle(
+              token.id,
+              effectiveTargetModel,
+              startedAt,
+              token.releaseReservation,
+              sessionKey,
+              retryState.sessionGeneration,
+              retryState.breakerGeneration,
+              retryState.requestId,
+              retryState.tableIncarnation,
+              retryState,
+            );
+            retryState.activeReservation = undefined;
+            streamTransferred = true;
+            return this.processAnthropicInternalStream(
+              stream,
+              geminiBody.model,
+              streamHealth,
+              signatureContext,
+              request.model,
+            );
+          } else {
+            const { result: response } = await this.generateInternalWithStreamFallback(
               geminiBody,
               token.token.access_token,
               token.token.upstream_proxy_url,
               extraHeaders,
               token.id,
-            ),
-          );
-          const streamHealth = this.createStreamHealthLifecycle(
-            token.id,
-            effectiveTargetModel,
-            startedAt,
-            token.releaseReservation,
-            sessionKey,
-            retryState.sessionGeneration,
-            retryState.breakerGeneration,
-            retryState.requestId,
-            retryState.tableIncarnation,
-            retryState,
-          );
-          retryState.activeReservation = undefined;
-          return this.processAnthropicInternalStream(
-            stream,
-            geminiBody.model,
-            streamHealth,
-            signatureContext,
-            request.model,
-          );
-        } else {
-          const { result: response } = await this.generateInternalWithStreamFallback(
-            geminiBody,
-            token.token.access_token,
-            token.token.upstream_proxy_url,
-            extraHeaders,
-            token.id,
-            effectiveTargetModel,
-          );
-          const commitResult = this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
-          if (commitResult.kind === 'rejected') {
-            throw new HttpException(
-              `Session affinity confirmation rejected: ${commitResult.reason}`,
-              HttpStatus.CONFLICT,
+              effectiveTargetModel,
+            );
+            const commitResult = this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
+            if (commitResult.kind === 'rejected') {
+              throw new HttpException(
+                `Session affinity confirmation rejected: ${commitResult.reason}`,
+                HttpStatus.CONFLICT,
+              );
+            }
+            return this.toAnthropicChatResponse(
+              transformResponse(response, signatureContext, request.model),
             );
           }
-          return this.toAnthropicChatResponse(
-            transformResponse(response, signatureContext, request.model),
-          );
-        }
-      } catch (error) {
-        let effectiveError: unknown = error;
-        if (this.isQuotaExhaustedError(error)) {
-          this.logger.warn(
-            'Anthropic request retrying with fallback: operation=anthropic_request reason=quota_exhausted',
-          );
-          try {
-            const downgradedRequest: ClaudeRequest = {
-              ...this.toClaudeRequest(request),
-              model: 'gemini-3-flash',
-            };
-            const requestUserAgent = await resolveRequestUserAgent();
-            const downgradedSignatureContext: SignatureContext = {
-              accountId: token.id,
-              model: 'gemini-3-flash',
-            };
-            const downgradedBody = transformClaudeRequestIn(
-              downgradedRequest,
-              token.token.project_id ?? '',
-              requestUserAgent,
-              downgradedSignatureContext,
+        } catch (error) {
+          let effectiveError: unknown = error;
+          if (this.isQuotaExhaustedError(error)) {
+            this.logger.warn(
+              'Anthropic request retrying with fallback: operation=anthropic_request reason=quota_exhausted',
             );
-            this.applyInternalGenerationConstraints(downgradedBody, 'gemini-3-flash', token.id);
+            try {
+              const downgradedRequest: ClaudeRequest = {
+                ...this.toClaudeRequest(request),
+                model: 'gemini-3-flash',
+              };
+              const requestUserAgent = await resolveRequestUserAgent();
+              const downgradedSignatureContext: SignatureContext = {
+                accountId: token.id,
+                model: 'gemini-3-flash',
+              };
+              const downgradedBody = transformClaudeRequestIn(
+                downgradedRequest,
+                token.token.project_id ?? '',
+                requestUserAgent,
+                downgradedSignatureContext,
+              );
+              downgradedBody.model = 'gemini-3-flash';
+              this.applyInternalGenerationConstraints(downgradedBody, 'gemini-3-flash', token.id);
 
-            if (request.stream) {
-              const { result: stream, startedAt } = await this.executeUpstreamAttempt(
-                token.id,
-                'gemini-3-flash',
-                () => this.geminiClient.streamGenerateInternal(
+              if (request.stream) {
+                const { result: stream, startedAt } = await this.executeUpstreamAttempt(
+                  token.id,
+                  'gemini-3-flash',
+                  () => this.geminiClient.streamGenerateInternal(
+                    downgradedBody,
+                    token.token.access_token,
+                    token.token.upstream_proxy_url,
+                    extraHeaders,
+                    token.id,
+                  ),
+                );
+                const streamHealth = this.createStreamHealthLifecycle(
+                  token.id,
+                  'gemini-3-flash',
+                  startedAt,
+                  token.releaseReservation,
+                  sessionKey,
+                  retryState.sessionGeneration,
+                  retryState.breakerGeneration,
+                  retryState.requestId,
+                  retryState.tableIncarnation,
+                  retryState,
+                );
+                retryState.activeReservation = undefined;
+                streamTransferred = true;
+                return this.processAnthropicInternalStream(
+                  stream,
+                  downgradedBody.model,
+                  streamHealth,
+                  downgradedSignatureContext,
+                  request.model,
+                );
+              } else {
+                const { result: response } = await this.generateInternalWithStreamFallback(
                   downgradedBody,
                   token.token.access_token,
                   token.token.upstream_proxy_url,
                   extraHeaders,
                   token.id,
-                ),
-              );
-              const streamHealth = this.createStreamHealthLifecycle(
-                token.id,
-                'gemini-3-flash',
-                startedAt,
-                token.releaseReservation,
-                sessionKey,
-                retryState.sessionGeneration,
-                retryState.breakerGeneration,
-                retryState.requestId,
-                retryState.tableIncarnation,
-                retryState,
-              );
-              retryState.activeReservation = undefined;
-              return this.processAnthropicInternalStream(
-                stream,
-                downgradedBody.model,
-                streamHealth,
-                downgradedSignatureContext,
-                request.model,
-              );
-            } else {
-              const { result: response } = await this.generateInternalWithStreamFallback(
-                downgradedBody,
-                token.token.access_token,
-                token.token.upstream_proxy_url,
-                extraHeaders,
-                token.id,
-                'gemini-3-flash',
-              );
-              const commitResult = this.markUpstreamSuccess(token.id, 'gemini-3-flash', sessionKey, retryState);
-              if (commitResult.kind === 'rejected') {
-                throw new HttpException(
-                  `Session affinity confirmation rejected: ${commitResult.reason}`,
-                  HttpStatus.CONFLICT,
+                  'gemini-3-flash',
                 );
+                const commitResult = this.markUpstreamSuccess(token.id, 'gemini-3-flash', sessionKey, retryState);
+                if (commitResult.kind === 'rejected') {
+                  throw new HttpException(
+                    `Session affinity confirmation rejected: ${commitResult.reason}`,
+                    HttpStatus.CONFLICT,
+                  );
+                }
+                const transformed = this.toAnthropicChatResponse(
+                  transformResponse(response, downgradedSignatureContext, request.model),
+                );
+                return {
+                  ...transformed,
+                  model: request.model,
+                };
               }
-              const transformed = this.toAnthropicChatResponse(
-                transformResponse(response, downgradedSignatureContext, request.model),
-              );
-              return {
-                ...transformed,
-                model: request.model,
-              };
+            } catch (downgradeErr) {
+              effectiveError = downgradeErr;
             }
-          } catch (downgradeErr) {
-            effectiveError = downgradeErr;
+          }
+
+          lastError = effectiveError;
+          const shouldRetry = await this.applyUpstreamPenalty(
+            token.id,
+            effectiveTargetModel,
+            lastError,
+            retryState,
+          );
+          if (!shouldRetry) {
+            throw lastError;
           }
         }
-
-        lastError = effectiveError;
-        const shouldRetry = await this.applyUpstreamPenalty(
-          token.id,
-          effectiveTargetModel,
-          lastError,
-          retryState,
-        );
-        if (!shouldRetry) {
-          throw lastError;
-        }
+      }
+      throw lastError || new Error('Request failed after retries');
+    } finally {
+      if (!streamTransferred) {
+        this.retryPolicy.disposeTokenRetryState(retryState);
       }
     }
-    throw lastError || new Error('Request failed after retries');
   }
 
   private processAnthropicInternalStream(
@@ -765,14 +776,20 @@ export class ProxyService {
   async handleGeminiGenerateContent(
     model: string,
     request: GeminiRequest,
+    clientSignal?: AbortSignal,
   ): Promise<GeminiResponse> {
-    return this.handlePreflightedGeminiGenerateContent(model, preflightNativeGeminiRequest(request));
+    return this.handlePreflightedGeminiGenerateContent(
+      model,
+      preflightNativeGeminiRequest(request),
+      clientSignal,
+    );
   }
 
   /** Controller callers must run the shared structural preflight before invoking this method. */
   async handlePreflightedGeminiGenerateContent(
     model: string,
     preflightRequest: GeminiInternalRequest['request'],
+    clientSignal?: AbortSignal,
   ): Promise<GeminiResponse> {
     const normalizedModel = this.normalizeGeminiModel(model);
     const targetModel = this.resolveTargetModel(normalizedModel);
@@ -781,87 +798,97 @@ export class ProxyService {
 
     let lastError: unknown = null;
     const maxRetries = await this.getModelRetryBudget(targetModel);
-    const retryState = this.createTokenRetryState();
+    const retryState = this.createTokenRetryState(clientSignal);
 
-    for (let i = 0; i < maxRetries; i++) {
-      await this.waitBeforeRetry(i, maxRetries, 'Gemini');
+    try {
+      for (let i = 0; i < maxRetries; i++) {
+        await this.waitBeforeRetry(i, maxRetries, 'Gemini');
 
-      const token = await this.selectRetryToken(retryState, targetModel);
-      if (!token) {
-        if (lastError) {
-          throw lastError;
-        }
-        throw new AccountPoolUnavailableException(
-          'All model-capable accounts are exhausted or rate limited',
-          HttpStatus.TOO_MANY_REQUESTS,
-        );
-      }
-      const effectiveTargetModel = this.accountLeaseService.resolveDynamicModelForAccount(
-        token.id,
-        targetModel,
-      );
-
-      try {
-        const requestUserAgent = await resolveRequestUserAgent();
-        const internalBody = this.createGeminiInternalRequest(
-          effectiveTargetModel,
-          preflightRequest,
-          token.token.project_id ?? '',
-          'generate-content',
-          requestUserAgent,
-          { accountId: token.id, model: effectiveTargetModel },
-        );
-        this.applyInternalGenerationConstraints(internalBody, effectiveTargetModel, token.id);
-
-        const { result: response } = await this.generateInternalWithStreamFallback(
-          internalBody,
-          token.token.access_token,
-          token.token.upstream_proxy_url,
-          extraHeaders,
-          token.id,
-          effectiveTargetModel,
-        );
-
-        const commitResult = this.markUpstreamSuccess(token.id, effectiveTargetModel, undefined, retryState);
-        if (commitResult.kind === 'rejected') {
-          throw new HttpException(
-            `Session affinity confirmation rejected: ${commitResult.reason}`,
-            HttpStatus.CONFLICT,
+        const token = await this.selectRetryToken(retryState, targetModel);
+        if (!token) {
+          if (lastError) {
+            throw lastError;
+          }
+          throw new AccountPoolUnavailableException(
+            'All model-capable accounts are exhausted or rate limited',
+            HttpStatus.TOO_MANY_REQUESTS,
           );
         }
-        return this.normalizeGeminiGenerateResponse(response);
-      } catch (err) {
-        if (err instanceof BadRequestException) {
-          throw err;
-        }
-        lastError = err;
-
-        const shouldRetry = await this.applyUpstreamPenalty(
+        const effectiveTargetModel = this.accountLeaseService.resolveDynamicModelForAccount(
           token.id,
-          effectiveTargetModel,
-          lastError,
-          retryState,
+          targetModel,
         );
-        if (!shouldRetry) {
-          throw lastError;
+
+        try {
+          const requestUserAgent = await resolveRequestUserAgent();
+          const internalBody = this.createGeminiInternalRequest(
+            effectiveTargetModel,
+            preflightRequest,
+            token.token.project_id ?? '',
+            'generate-content',
+            requestUserAgent,
+            { accountId: token.id, model: effectiveTargetModel },
+          );
+          this.applyInternalGenerationConstraints(internalBody, effectiveTargetModel, token.id);
+
+          const { result: response } = await this.generateInternalWithStreamFallback(
+            internalBody,
+            token.token.access_token,
+            token.token.upstream_proxy_url,
+            extraHeaders,
+            token.id,
+            effectiveTargetModel,
+          );
+
+          const commitResult = this.markUpstreamSuccess(token.id, effectiveTargetModel, undefined, retryState);
+          if (commitResult.kind === 'rejected') {
+            throw new HttpException(
+              `Session affinity confirmation rejected: ${commitResult.reason}`,
+              HttpStatus.CONFLICT,
+            );
+          }
+          return this.normalizeGeminiGenerateResponse(response);
+        } catch (err) {
+          if (err instanceof BadRequestException) {
+            throw err;
+          }
+          lastError = err;
+
+          const shouldRetry = await this.applyUpstreamPenalty(
+            token.id,
+            effectiveTargetModel,
+            lastError,
+            retryState,
+          );
+          if (!shouldRetry) {
+            throw lastError;
+          }
         }
       }
-    }
 
-    throw lastError || new Error('Gemini request failed after retries');
+      throw lastError || new Error('Gemini request failed after retries');
+    } finally {
+      this.retryPolicy.disposeTokenRetryState(retryState);
+    }
   }
 
   async handleGeminiStreamGenerateContent(
     model: string,
     request: GeminiRequest,
+    clientSignal?: AbortSignal,
   ): Promise<Observable<string>> {
-    return this.handlePreflightedGeminiStreamGenerateContent(model, preflightNativeGeminiRequest(request));
+    return this.handlePreflightedGeminiStreamGenerateContent(
+      model,
+      preflightNativeGeminiRequest(request),
+      clientSignal,
+    );
   }
 
   /** Controller callers must run the shared structural preflight before invoking this method. */
   async handlePreflightedGeminiStreamGenerateContent(
     model: string,
     preflightRequest: GeminiInternalRequest['request'],
+    clientSignal?: AbortSignal,
   ): Promise<Observable<string>> {
     const normalizedModel = this.normalizeGeminiModel(model);
     const targetModel = this.resolveTargetModel(normalizedModel);
@@ -870,89 +897,97 @@ export class ProxyService {
 
     let lastError: unknown = null;
     const maxRetries = await this.getModelRetryBudget(targetModel);
-    const retryState = this.createTokenRetryState();
+    const retryState = this.createTokenRetryState(clientSignal);
+    let streamTransferred = false;
 
-    for (let i = 0; i < maxRetries; i++) {
-      await this.waitBeforeRetry(
-        i,
-        maxRetries,
-        'Gemini stream',
-      );
+    try {
+      for (let i = 0; i < maxRetries; i++) {
+        await this.waitBeforeRetry(
+          i,
+          maxRetries,
+          'Gemini stream',
+        );
 
-      const token = await this.selectRetryToken(retryState, targetModel);
-      if (!token) {
-        if (lastError) {
-          throw lastError;
+        const token = await this.selectRetryToken(retryState, targetModel);
+        if (!token) {
+          if (lastError) {
+            throw lastError;
+          }
+          throw new AccountPoolUnavailableException(
+            'All model-capable accounts are exhausted or rate limited',
+            HttpStatus.TOO_MANY_REQUESTS,
+          );
         }
-        throw new AccountPoolUnavailableException(
-          'All model-capable accounts are exhausted or rate limited',
-          HttpStatus.TOO_MANY_REQUESTS,
-        );
-      }
-      const effectiveTargetModel = this.accountLeaseService.resolveDynamicModelForAccount(
-        token.id,
-        targetModel,
-      );
-
-      try {
-        const requestUserAgent = await resolveRequestUserAgent();
-        const internalBody = this.createGeminiInternalRequest(
-          effectiveTargetModel,
-          preflightRequest,
-          token.token.project_id ?? '',
-          'generate-content',
-          requestUserAgent,
-          { accountId: token.id, model: effectiveTargetModel },
-        );
-        this.applyInternalGenerationConstraints(internalBody, effectiveTargetModel, token.id);
-
-        const { result: stream, startedAt } = await this.executeUpstreamAttempt(
+        const effectiveTargetModel = this.accountLeaseService.resolveDynamicModelForAccount(
           token.id,
-          effectiveTargetModel,
-          () => this.geminiClient.streamGenerateInternal(
-            internalBody,
-            token.token.access_token,
-            token.token.upstream_proxy_url,
-            extraHeaders,
+          targetModel,
+        );
+
+        try {
+          const requestUserAgent = await resolveRequestUserAgent();
+          const internalBody = this.createGeminiInternalRequest(
+            effectiveTargetModel,
+            preflightRequest,
+            token.token.project_id ?? '',
+            'generate-content',
+            requestUserAgent,
+            { accountId: token.id, model: effectiveTargetModel },
+          );
+          this.applyInternalGenerationConstraints(internalBody, effectiveTargetModel, token.id);
+
+          const { result: stream, startedAt } = await this.executeUpstreamAttempt(
             token.id,
-          ),
-        );
-        const streamHealth = this.createStreamHealthLifecycle(
-          token.id,
-          effectiveTargetModel,
-          startedAt,
-          token.releaseReservation,
-          undefined,
-          retryState.sessionGeneration,
-          retryState.breakerGeneration,
-          retryState.requestId,
-          retryState.tableIncarnation,
-          retryState,
-        );
-        retryState.activeReservation = undefined;
-        return this.passthroughSseStream(
-          stream,
-          streamHealth,
-        );
-      } catch (err) {
-        if (err instanceof BadRequestException) {
-          throw err;
-        }
-        lastError = err;
+            effectiveTargetModel,
+            () => this.geminiClient.streamGenerateInternal(
+              internalBody,
+              token.token.access_token,
+              token.token.upstream_proxy_url,
+              extraHeaders,
+              token.id,
+            ),
+          );
+          const streamHealth = this.createStreamHealthLifecycle(
+            token.id,
+            effectiveTargetModel,
+            startedAt,
+            token.releaseReservation,
+            undefined,
+            retryState.sessionGeneration,
+            retryState.breakerGeneration,
+            retryState.requestId,
+            retryState.tableIncarnation,
+            retryState,
+          );
+          retryState.activeReservation = undefined;
+          streamTransferred = true;
+          return this.passthroughSseStream(
+            stream,
+            streamHealth,
+          );
+        } catch (err) {
+          if (err instanceof BadRequestException) {
+            throw err;
+          }
+          lastError = err;
 
-        const shouldRetry = await this.applyUpstreamPenalty(
-          token.id,
-          effectiveTargetModel,
-          lastError,
-          retryState,
-        );
-        if (!shouldRetry) {
-          throw lastError;
+          const shouldRetry = await this.applyUpstreamPenalty(
+            token.id,
+            effectiveTargetModel,
+            lastError,
+            retryState,
+          );
+          if (!shouldRetry) {
+            throw lastError;
+          }
         }
+      }
+
+      throw lastError || new Error('Gemini stream request failed after retries');
+    } finally {
+      if (!streamTransferred) {
+        this.retryPolicy.disposeTokenRetryState(retryState);
       }
     }
-
-    throw lastError || new Error('Gemini stream request failed after retries');
   }
 
   private passthroughSseStream(
@@ -1250,6 +1285,7 @@ export class ProxyService {
     request: OpenAIChatRequest,
     outputProtocol: OpenAIOutputProtocol = 'chat-completions',
     responsesConfiguration?: OpenAIResponsesConfiguration,
+    clientSignal?: AbortSignal,
   ): Promise<OpenAIChatResponse | Observable<string>> {
     const sessionKey = this.extractOpenAISessionKey(request);
 
@@ -1267,92 +1303,123 @@ export class ProxyService {
     // Retry loop for account selection
     let lastError: unknown = null;
     const maxRetries = await this.getModelRetryBudget(targetModel);
-    const retryState = this.createTokenRetryState();
+    const retryState = this.createTokenRetryState(clientSignal);
+    let streamTransferred = false;
 
-    for (let i = 0; i < maxRetries; i++) {
-      await this.waitBeforeRetry(
-        i,
-        maxRetries,
-        'OpenAI-compatible',
-      );
+    try {
+      for (let i = 0; i < maxRetries; i++) {
+        await this.waitBeforeRetry(
+          i,
+          maxRetries,
+          'OpenAI-compatible',
+        );
 
-      // 1. Get Token
-      const token = await this.selectRetryToken(retryState, targetModel, sessionKey);
-      if (!token) {
-        if (lastError) {
-          throw lastError;
+        // 1. Get Token
+        const token = await this.selectRetryToken(retryState, targetModel, sessionKey);
+        if (!token) {
+          if (lastError) {
+            throw lastError;
+          }
+          throw new AccountPoolUnavailableException(
+            'All model-capable accounts are exhausted or rate limited',
+            HttpStatus.TOO_MANY_REQUESTS,
+          );
         }
-        throw new AccountPoolUnavailableException(
-          'All model-capable accounts are exhausted or rate limited',
-          HttpStatus.TOO_MANY_REQUESTS,
+        const effectiveTargetModel = this.accountLeaseService.resolveDynamicModelForAccount(
+          token.id,
+          targetModel,
         );
-      }
-      const effectiveTargetModel = this.accountLeaseService.resolveDynamicModelForAccount(
-        token.id,
-        targetModel,
-      );
 
-      const signatureContext: SignatureContext = {
-        accountId: token.id,
-        model: effectiveTargetModel,
-      };
+        const signatureContext: SignatureContext = {
+          accountId: token.id,
+          model: effectiveTargetModel,
+        };
 
-      try {
-        const projectId = token.token.project_id ?? '';
-        const requestUserAgent = await resolveRequestUserAgent();
-        const geminiBody = transformClaudeRequestIn(
-          claudeRequest,
-          projectId,
-          requestUserAgent,
-          signatureContext,
-        );
-        geminiBody.model = effectiveTargetModel;
-        this.applyInternalGenerationConstraints(geminiBody, effectiveTargetModel, token.id);
+        try {
+          const projectId = token.token.project_id ?? '';
+          const requestUserAgent = await resolveRequestUserAgent();
+          const geminiBody = transformClaudeRequestIn(
+            claudeRequest,
+            projectId,
+            requestUserAgent,
+            signatureContext,
+          );
+          geminiBody.model = effectiveTargetModel;
+          this.applyInternalGenerationConstraints(geminiBody, effectiveTargetModel, token.id);
 
-        // Use v1internal API (same as Anthropic handler)
-        if (request.stream) {
-          try {
-            const { result: stream, startedAt } = await this.executeUpstreamAttempt(
-              token.id,
-              effectiveTargetModel,
-              () => this.geminiClient.streamGenerateInternal(
+          // Use v1internal API (same as Anthropic handler)
+          if (request.stream) {
+            try {
+              const { result: stream, startedAt } = await this.executeUpstreamAttempt(
+                token.id,
+                effectiveTargetModel,
+                () => this.geminiClient.streamGenerateInternal(
+                  geminiBody,
+                  token.token.access_token,
+                  token.token.upstream_proxy_url,
+                  extraHeaders,
+                  token.id,
+                ),
+              );
+              const streamHealth = this.createStreamHealthLifecycle(
+                token.id,
+                effectiveTargetModel,
+                startedAt,
+                token.releaseReservation,
+                sessionKey,
+                retryState.sessionGeneration,
+                retryState.breakerGeneration,
+                retryState.requestId,
+                retryState.tableIncarnation,
+                retryState,
+              );
+              retryState.activeReservation = undefined;
+              streamTransferred = true;
+              return this.createOpenAIProtocolStream(
+                stream,
+                request.model,
+                outputProtocol,
+                streamOptions,
+                signatureContext,
+                responsesConfiguration,
+                streamHealth,
+              );
+            } catch (streamError) {
+              if (this.retryPolicy.shouldFailoverImmediately(streamError)) {
+                throw streamError;
+              }
+              this.logger.warn(
+                'Stream path fallback: operation=openai_request reason=stream_to_non_stream',
+              );
+
+              const { result: response } = await this.generateInternalWithStreamFallback(
                 geminiBody,
                 token.token.access_token,
                 token.token.upstream_proxy_url,
                 extraHeaders,
                 token.id,
-              ),
-            );
-            const streamHealth = this.createStreamHealthLifecycle(
-              token.id,
-              effectiveTargetModel,
-              startedAt,
-              token.releaseReservation,
-              sessionKey,
-              retryState.sessionGeneration,
-              retryState.breakerGeneration,
-              retryState.requestId,
-              retryState.tableIncarnation,
-              retryState,
-            );
-            retryState.activeReservation = undefined;
-            return this.createOpenAIProtocolStream(
-              stream,
-              request.model,
-              outputProtocol,
-              streamOptions,
-              signatureContext,
-              responsesConfiguration,
-              streamHealth,
-            );
-          } catch (streamError) {
-            if (this.retryPolicy.shouldFailoverImmediately(streamError)) {
-              throw streamError;
+                effectiveTargetModel,
+              );
+              const commitResult = this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
+              if (commitResult.kind === 'rejected') {
+                throw new HttpException(
+                  `Session affinity confirmation rejected: ${commitResult.reason}`,
+                  HttpStatus.CONFLICT,
+                );
+              }
+              const claudeResponse = transformResponse(response, signatureContext);
+              const openaiResponse = this.convertClaudeToOpenAIResponse(
+                claudeResponse,
+                request.model,
+                response.usageMetadata,
+                outputProtocol,
+              );
+              streamTransferred = true;
+              return outputProtocol === 'responses'
+                ? this.createSyntheticResponsesStream(openaiResponse, responsesConfiguration)
+                : this.createSyntheticOpenAIStream(openaiResponse, streamOptions);
             }
-            this.logger.warn(
-              'Stream path fallback: operation=openai_request reason=stream_to_non_stream',
-            );
-
+          } else {
             const { result: response } = await this.generateInternalWithStreamFallback(
               geminiBody,
               token.token.access_token,
@@ -1368,57 +1435,35 @@ export class ProxyService {
                 HttpStatus.CONFLICT,
               );
             }
+            // Transform Gemini response to OpenAI format
             const claudeResponse = transformResponse(response, signatureContext);
-            const openaiResponse = this.convertClaudeToOpenAIResponse(
+            return this.convertClaudeToOpenAIResponse(
               claudeResponse,
               request.model,
               response.usageMetadata,
               outputProtocol,
             );
-            return outputProtocol === 'responses'
-              ? this.createSyntheticResponsesStream(openaiResponse, responsesConfiguration)
-              : this.createSyntheticOpenAIStream(openaiResponse, streamOptions);
           }
-        } else {
-          const { result: response } = await this.generateInternalWithStreamFallback(
-            geminiBody,
-            token.token.access_token,
-            token.token.upstream_proxy_url,
-            extraHeaders,
+        } catch (err) {
+          lastError = err;
+
+          const shouldRetry = await this.applyUpstreamPenalty(
             token.id,
             effectiveTargetModel,
+            lastError,
+            retryState,
           );
-          const commitResult = this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
-          if (commitResult.kind === 'rejected') {
-            throw new HttpException(
-              `Session affinity confirmation rejected: ${commitResult.reason}`,
-              HttpStatus.CONFLICT,
-            );
+          if (!shouldRetry) {
+            throw lastError;
           }
-          // Transform Gemini response to OpenAI format
-          const claudeResponse = transformResponse(response, signatureContext);
-          return this.convertClaudeToOpenAIResponse(
-            claudeResponse,
-            request.model,
-            response.usageMetadata,
-            outputProtocol,
-          );
-        }
-      } catch (err) {
-        lastError = err;
-
-        const shouldRetry = await this.applyUpstreamPenalty(
-          token.id,
-          effectiveTargetModel,
-          lastError,
-          retryState,
-        );
-        if (!shouldRetry) {
-          throw lastError;
         }
       }
+      throw lastError || new Error('Request failed after retries');
+    } finally {
+      if (!streamTransferred) {
+        this.retryPolicy.disposeTokenRetryState(retryState);
+      }
     }
-    throw lastError || new Error('Request failed after retries');
   }
 
   private async generateInternalWithStreamFallback(

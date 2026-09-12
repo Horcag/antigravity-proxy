@@ -78,7 +78,7 @@ describe('CaManager', () => {
       expect(fs.existsSync(launcherPath)).toBe(true);
       const wrapperScript = fs.readFileSync(launcherPath, 'utf-8');
       expect(wrapperScript).toContain('#!/bin/sh');
-      expect(wrapperScript).toContain('PROXY_URL="http://127.0.0.1:8046"');
+      expect(wrapperScript).toContain('PROXY_URL="http://127.0.0.1:8045"');
       expect(wrapperScript).toContain(agyNativePath);
 
       // Update observer state must be initialized

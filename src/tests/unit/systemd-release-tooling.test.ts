@@ -1639,4 +1639,102 @@ esac
     const unit = readFileSync(join(root, 'etc/systemd/system/antigravity-proxy.service'), 'utf8');
     expect(unit).toContain('ExecStart=/opt/antigravity-proxy/current/bin/node /opt/antigravity-proxy/current/dist/cli.js serve');
   }, 30_000);
+
+  it('T17-F02 Probe C04: Failed rollback unit restore preserves both concurrent replacement and previous backup', () => {
+    const root = createRoot();
+    execFileSync(
+      'bash',
+      [
+        '-c',
+        `
+          set -eu
+          export ROOT_PREFIX="${root}"
+          source scripts/release-lib.sh
+          root_prefix="$ROOT_PREFIX"
+
+          unit_file="/etc/systemd/system/antigravity-proxy.service"
+          unit_fs="$(root_path "$unit_file")"
+          mkdir -p "$(dirname "$unit_fs")"
+          mkdir -p "$ROOT_PREFIX/backup"
+
+          migration_unit_backup_fs="$ROOT_PREFIX/backup/unit.backup"
+          printf "PRIOR_BACKUP\\n" > "$migration_unit_backup_fs"
+          migration_unit_backup_identity="$(publication_identity "$migration_unit_backup_fs")"
+          migration_unit_published_identity="published-identity-123"
+          migration_unit_had_file=1
+          migration_unit_rename_completed=1
+
+          rm -f "$unit_fs"
+
+          eval "quarantine_owned_path_real() $(declare -f quarantine_owned_path | tail -n +2)"
+          quarantine_owned_path() {
+            local target="$1"
+            if [ "$target" = "$unit_fs" ]; then
+              printf "CONCURRENT_REPLACEMENT\\n" > "$unit_fs"
+              return 2
+            fi
+            quarantine_owned_path_real "$@"
+          }
+
+          set +e
+          restore_migration_unit_state
+          status=$?
+          set -e
+
+          [ "$status" -eq 1 ] || exit 10
+          [ "$(cat "$unit_fs")" = "CONCURRENT_REPLACEMENT" ] || exit 11
+          [ "$(cat "$migration_unit_backup_fs")" = "PRIOR_BACKUP" ] || exit 12
+        `,
+      ],
+      { cwd: process.cwd(), encoding: 'utf8' },
+    );
+  });
+
+  it('T17-F02 Probe C05: Failed rollback wants restore preserves both concurrent replacement and previous backup', () => {
+    const root = createRoot();
+    execFileSync(
+      'bash',
+      [
+        '-c',
+        `
+          set -eu
+          export ROOT_PREFIX="${root}"
+          source scripts/release-lib.sh
+          root_prefix="$ROOT_PREFIX"
+
+          migration_wants_fs="$ROOT_PREFIX/etc/systemd/system/multi-user.target.wants/antigravity-proxy.service"
+          mkdir -p "$(dirname "$migration_wants_fs")"
+          mkdir -p "$ROOT_PREFIX/backup"
+
+          migration_wants_backup_fs="$ROOT_PREFIX/backup/wants.backup"
+          ln -s "/prior/target" "$migration_wants_backup_fs"
+          migration_wants_backup_identity="$(publication_identity "$migration_wants_backup_fs")"
+          migration_wants_published_identity="published-wants-id-123"
+          migration_wants_had_entry=1
+
+          rm -f "$migration_wants_fs"
+
+          eval "quarantine_owned_path_real() $(declare -f quarantine_owned_path | tail -n +2)"
+          quarantine_owned_path() {
+            local target="$1"
+            if [ "$target" = "$migration_wants_fs" ]; then
+              ln -s "/concurrent/replacement" "$migration_wants_fs"
+              return 2
+            fi
+            quarantine_owned_path_real "$@"
+          }
+
+          set +e
+          restore_migration_wants_state
+          status=$?
+          set -e
+
+          [ "$status" -eq 1 ] || exit 20
+          [ "$(readlink "$migration_wants_fs")" = "/concurrent/replacement" ] || exit 21
+          [ "$(readlink "$migration_wants_backup_fs")" = "/prior/target" ] || exit 22
+        `,
+      ],
+      { cwd: process.cwd(), encoding: 'utf8' },
+    );
+  });
 });

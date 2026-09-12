@@ -228,6 +228,7 @@ describe('ProxyController Responses reasoning output', () => {
       }),
       'responses',
       expect.any(Object),
+      undefined,
     );
   });
 

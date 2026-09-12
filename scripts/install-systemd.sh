@@ -123,11 +123,11 @@ create_release
 release_runtime_probe
 
 if [ "$mode" = migrate ]; then
-  stage_legacy_migration_set
   if [ "$migration_topology" = legacy-only ]; then
     legacy_user_systemd stop
     legacy_stopped=1
   fi
+  stage_legacy_migration_set
   publish_staged_migration_set
 else
   write_environment_if_missing

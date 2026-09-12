@@ -2357,7 +2357,7 @@ describe('AccountLeaseService parity scheduling replay', () => {
         scheduling_mode: 'balance',
       }),
     );
-    const warnSpy = vi.spyOn((service as any).logger, 'warn').mockImplementation(() => undefined);
+    vi.spyOn((service as any).logger, 'warn').mockImplementation(() => undefined);
     const cooldownUntil = Date.now() + 30_000;
     (service as any).accountCooldowns.set('acc-1', cooldownUntil);
     (service as any).accountCooldowns.set('acc-2', cooldownUntil);

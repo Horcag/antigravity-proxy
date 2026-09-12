@@ -3,12 +3,12 @@ import http2 from 'node:http2';
 import https from 'node:https';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
-import stream, { type Readable } from 'node:stream';
+import type { Readable } from 'node:stream';
 import { logger } from '../../../shared/logging/logger';
 import { AccountLeaseService } from './account-lease.service';
 import { CloudAccount } from '../../cloud-account/types';
 import { RateLimitReason } from './rate-limit-tracker';
-import { CaManager, parseTargetAuthority } from './cert/ca-manager';
+import { parseTargetAuthority } from './cert/ca-manager';
 import {
   type MigrationCapability,
   isVerifiedSessionKey,
@@ -202,7 +202,7 @@ export class CloudCodeFailoverGateway {
         if (!res.writableFinished) {
           try {
             res.destroy(new Error('Gateway Timeout: Logical request deadline exceeded'));
-          } catch {}
+          } catch { /* empty */ }
         }
       }
     }, LOGICAL_REQUEST_DEADLINE_MS);
@@ -395,7 +395,7 @@ export class CloudCodeFailoverGateway {
           ? this.accountLeaseService.getSessionBinding(sessionKey)
           : null;
       let attemptGeneration = lease?.generation ?? initialBinding?.generation ?? 1;
-      let attemptTableIncarnation = lease?.tableIncarnation ?? initialBinding?.tableIncarnation;
+      const attemptTableIncarnation = lease?.tableIncarnation ?? initialBinding?.tableIncarnation;
       let migrationCapability: MigrationCapability | null = null;
 
       const needsMigration = Boolean(
@@ -442,7 +442,7 @@ export class CloudCodeFailoverGateway {
                 `[CloudCodeGateway] Candidate migration renewal rejected for session ${sessionKey}`,
               );
             }
-          } catch {}
+          } catch { /* empty */ }
         }, 15000);
         candidateRenewalTimer.unref?.();
       }
@@ -719,7 +719,7 @@ export class CloudCodeFailoverGateway {
                 streamDecompressor.on('error', () => {});
                 try {
                   streamDecompressor.destroy();
-                } catch {}
+                } catch { /* empty */ }
               }
             };
 
