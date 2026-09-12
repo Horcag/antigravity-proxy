@@ -83,8 +83,8 @@ export function extractCommentsFromContent(content: string, filePath?: string): 
       text: c.type === 'Line' ? `//${c.value}` : `/*${c.value}*/`,
       line: c.loc.start.line,
     }));
-  } catch {
-    return [];
+  } catch (cause: unknown) {
+    throw new Error(`Debt audit could not parse ${filePath ?? '<input>'}`, { cause });
   }
 }
 
@@ -111,7 +111,7 @@ export function findDebtViolations(): DebtViolation[] {
       }
 
       const content = fs.readFileSync(filePath, 'utf8');
-      const comments = extractCommentsFromContent(content, filePath);
+      const comments = extractCommentsFromContent(content, relativePath);
 
       for (const comment of comments) {
         // 1. Forbid inline ESLint configuration comments (e.g. /* eslint "rule": "off" */ or /* eslint-env */)
@@ -192,21 +192,27 @@ export function findDebtViolations(): DebtViolation[] {
 }
 
 export function runDebtCheck(): number {
-  const configViolations = checkEslintConfig();
-  const fileViolations = findDebtViolations();
-  const allViolations = [...configViolations, ...fileViolations.map((v) => v.message)];
+  try {
+    const configViolations = checkEslintConfig();
+    const fileViolations = findDebtViolations();
+    const allViolations = [...configViolations, ...fileViolations.map((v) => v.message)];
 
-  if (allViolations.length > 0) {
-    console.error('Code quality and architecture debt baseline check FAILED.');
-    console.error('New or unexplained bypasses, suppresses, or rule disables are forbidden:');
-    for (const violation of allViolations) {
-      console.error(`- ${violation}`);
+    if (allViolations.length > 0) {
+      console.error('Code quality and architecture debt baseline check FAILED.');
+      console.error('New or unexplained bypasses, suppresses, or rule disables are forbidden:');
+      for (const violation of allViolations) {
+        console.error(`- ${violation}`);
+      }
+      return 1;
     }
+
+    console.log('Architecture debt baseline OK: 0 unapproved exception entries or unexplained suppressions.');
+    return 0;
+  } catch (err: unknown) {
+    console.error('Code quality and architecture debt baseline check FAILED.');
+    console.error((err as Error).message);
     return 1;
   }
-
-  console.log('Architecture debt baseline OK: 0 unapproved exception entries or unexplained suppressions.');
-  return 0;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

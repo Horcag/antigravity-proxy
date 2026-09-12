@@ -8,7 +8,7 @@ import {
 } from '../../modules/cloud-account/persistence/production-owner-gate';
 import { ConnectIngressService, isLocalPeer } from '../../modules/proxy-gateway/server/connect-ingress.service';
 import { AdminController } from '../../admin/admin.controller';
-import { extractCommentsFromContent } from '../../../scripts/quality/check-debt-baseline';
+import { extractCommentsFromContent, runDebtCheck } from '../../../scripts/quality/check-debt-baseline';
 import { countPhysicalLines } from '../../../scripts/quality/file-size-policy';
 import { verifyBaselineIntegrity } from '../../../scripts/quality/check-file-size';
 import fs from 'node:fs';
@@ -195,6 +195,45 @@ describe('Oracle Turn 4 Hardening Suite', () => {
       const comments3 = extractCommentsFromContent(code3);
       expect(comments3).toHaveLength(3);
     });
+
+    it('fails closed when parser fails or receives unparseable content (T7-F01)', () => {
+      // 1. extractCommentsFromContent throws with filepath when syntax is unparseable
+      expect(() => {
+        extractCommentsFromContent('const = ; // unparseable syntax', 'src/broken.ts');
+      }).toThrow(/Debt audit could not parse src\/broken\.ts/);
+
+      // 2. verify that runDebtCheck catches parse error, logs failure, and returns 1 without printing OK
+      const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        const exitCode = runDebtCheck();
+        expect(exitCode).toBe(0);
+        expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('Architecture debt baseline OK'));
+      } finally {
+        consoleErrorSpy.mockRestore();
+        consoleLogSpy.mockRestore();
+      }
+    }, 20_000);
+
+    it('CLI returns exit code 1, logs file path, and omits success summary when a file fails to parse (T7-F01 CLI)', () => {
+      const brokenFile = path.join(process.cwd(), 'src/temp-broken-test.ts');
+      fs.writeFileSync(brokenFile, 'const = ; // unparseable syntax');
+      try {
+        const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        try {
+          const exitCode = runDebtCheck();
+          expect(exitCode).toBe(1);
+          expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining('Debt audit could not parse src/temp-broken-test.ts'));
+          expect(consoleLogSpy).not.toHaveBeenCalledWith(expect.stringContaining('Architecture debt baseline OK'));
+        } finally {
+          consoleErrorSpy.mockRestore();
+          consoleLogSpy.mockRestore();
+        }
+      } finally {
+        fs.unlinkSync(brokenFile);
+      }
+    }, 20_000);
   });
 
   describe('T4-F03: File Size Line Counting', () => {
