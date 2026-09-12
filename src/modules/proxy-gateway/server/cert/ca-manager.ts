@@ -66,6 +66,20 @@ export class CaManager {
 
     const caExists = fs.existsSync(caKeyPath) && fs.existsSync(caCertPath);
     const leafExists = fs.existsSync(leafKeyPath) && fs.existsSync(leafCertPath);
+    let shouldRegenerateLeaf = !leafExists;
+
+    if (leafExists) {
+      try {
+        const certObj = new crypto.X509Certificate(fs.readFileSync(leafCertPath));
+        const san = certObj.subjectAltName || '';
+        if (san.includes('*') || san.includes('localhost') || san.includes('127.0.0.1')) {
+          logger.info('Existing leaf certificate contains obsolete/wildcard SANs. Regenerating leaf certificate under existing root CA...');
+          shouldRegenerateLeaf = true;
+        }
+      } catch {
+        shouldRegenerateLeaf = true;
+      }
+    }
 
     if (!caExists) {
       logger.info('Generating local root CA for transparent Antigravity CLI failover...');
@@ -88,7 +102,7 @@ export class CaManager {
       fs.chmodSync(caCertPath, 0o644);
     }
 
-    if (!leafExists || !caExists) {
+    if (shouldRegenerateLeaf || !caExists) {
       logger.info('Generating leaf certificate for CloudCode domains...');
       const csrPath = path.join(certsDir, 'cloudcode.csr');
       const extPath = path.join(certsDir, 'cloudcode.ext');

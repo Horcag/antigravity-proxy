@@ -76,8 +76,12 @@ export interface PolicyResult {
 
 export function countPhysicalLines(filePath: string): number {
   const content = fs.readFileSync(filePath, 'utf-8');
-  // Count physical lines by splitting on newline
-  return content.split(/\r?\n/).length;
+  if (content.length === 0) return 0;
+  const lines = content.split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === '') {
+    return lines.length - 1;
+  }
+  return lines.length;
 }
 
 export function globToRegex(pattern: string): RegExp {
@@ -131,7 +135,7 @@ export function discoverSourceFiles(
   for (const sourceRoot of config.source_roots) {
     const resolvedSourceRoot = path.resolve(resolvedRepoRoot, sourceRoot);
     if (!fs.existsSync(resolvedSourceRoot) || !fs.statSync(resolvedSourceRoot).isDirectory()) {
-      continue;
+      throw new PolicyConfigurationError(`Configured source_root does not exist or is not a directory: ${sourceRoot}`);
     }
 
     const walk = (currentDir: string) => {

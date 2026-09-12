@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { execFileSync } from 'node:child_process';
 import * as path from 'node:path';
 import {
   discoverSourceFiles,
@@ -41,6 +42,61 @@ function formatJsonReport(result: PolicyResult, scannedCount: number, thresholds
   return JSON.stringify(payload, null, 2);
 }
 
+function getGitFileContent(repoRoot: string, gitRef: string, filePath: string): string | null {
+  try {
+    return execFileSync('git', ['show', `${gitRef}:${filePath}`], {
+      cwd: repoRoot,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    return null;
+  }
+}
+
+export function verifyBaselineIntegrity(
+  repoRoot: string,
+  candidateBaseline: Record<string, number>,
+  baselineRelPath: string,
+): void {
+  const gitPath = baselineRelPath.replaceAll('\\', '/');
+
+  // Try origin/main, then HEAD
+  let trustedJson = getGitFileContent(repoRoot, 'origin/main', gitPath);
+  if (!trustedJson) {
+    trustedJson = getGitFileContent(repoRoot, 'HEAD', gitPath);
+  }
+
+  if (trustedJson) {
+    let trustedBaseline: Record<string, number>;
+    try {
+      const parsed = JSON.parse(trustedJson);
+      trustedBaseline = (parsed.files || {}) as Record<string, number>;
+    } catch {
+      return;
+    }
+
+    // 1. Forbid adding any new unbaselined files to baseline
+    for (const key of Object.keys(candidateBaseline)) {
+      if (trustedBaseline[key] === undefined) {
+        throw new PolicyConfigurationError(
+          `Baseline tampering detected: Cannot add new oversized file to baseline: ${key}. New files must be <= 500 lines.`,
+        );
+      }
+    }
+
+    // 2. Forbid manually increasing the cap
+    for (const [key, candidateLines] of Object.entries(candidateBaseline)) {
+      const trustedLines = trustedBaseline[key];
+      if (trustedLines !== undefined && candidateLines > trustedLines) {
+        throw new PolicyConfigurationError(
+          `Baseline tampering detected: Baseline limit for ${key} cannot be manually increased from ${trustedLines} to ${candidateLines}. Baseline can only ratchet down.`,
+        );
+      }
+    }
+  }
+}
+
 function main(): void {
   const args = process.argv.slice(2);
   let repoRoot = process.cwd();
@@ -69,6 +125,10 @@ function main(): void {
     const config = loadConfig(configPath);
     const baselinePath = path.resolve(repoRoot, config.baseline_path);
     const baseline = loadBaseline(baselinePath);
+
+    // Verify baseline integrity against trusted git reference to prevent manual inflation
+    verifyBaselineIntegrity(repoRoot, baseline, config.baseline_path);
+
     const discovered = discoverSourceFiles(repoRoot, config);
 
     if (updateBaseline) {
@@ -86,21 +146,8 @@ function main(): void {
       }
     }
 
-    let activeBaseline = baseline;
-    try {
-      const reduced = buildReducedBaseline(discovered, baseline, config.thresholds);
-      const isDifferent =
-        Object.keys(reduced).length !== Object.keys(baseline).length ||
-        Object.entries(reduced).some(([k, v]) => baseline[k] !== v);
-      if (isDifferent) {
-        writeBaseline(baselinePath, reduced, config.thresholds);
-        activeBaseline = reduced;
-      }
-    } catch {
-      // If there are regressions or new debt, evaluateFileSizes will report them below.
-    }
-
-    const result = evaluateFileSizes(discovered, activeBaseline, config.thresholds);
+    // Normal check is STRICTLY READ-ONLY: never mutate baseline on disk during check
+    const result = evaluateFileSizes(discovered, baseline, config.thresholds);
 
     if (format === 'json') {
       console.log(formatJsonReport(result, Object.keys(discovered).length, config.thresholds));

@@ -18,6 +18,7 @@ import type { AccountLeaseQuotaCatalogRefreshResult } from './account-lease-quot
 import { AccountLeaseTokenCache } from './account-lease-token-cache';
 import { AccountLeaseHydrationPolicy } from './account-lease-hydration-policy';
 import { AccountLeaseFulfillmentPolicy } from './account-lease-fulfillment-policy';
+import { ProductionOwnerGate } from '@/modules/cloud-account/persistence/production-owner-gate';
 import {
   AccountLeaseSelectionPolicy,
   type SessionBindingEntry,
@@ -238,16 +239,16 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleInit() {
+    await ProductionOwnerGate.acquireExclusiveOwnership();
     await this.loadAccounts();
-    void this.refreshQuotaCatalog({ force: true }).catch((error: unknown) => {
-      this.logger.warn('Startup quota catalog refresh failed', error);
-    });
+    void this.refreshQuotaCatalog({ force: true }).catch((err) => this.logger.warn('Startup quota refresh failed', err));
     this.startQuotaCatalogRefreshTimer();
   }
 
   async onModuleDestroy() {
     this.stopQuotaCatalogRefreshTimer();
     await this.quotaRefreshPolicy.shutdown();
+    await ProductionOwnerGate.releaseExclusiveOwnership();
   }
 
   async loadAccounts(): Promise<number> {
@@ -273,10 +274,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     return count;
   }
 
-  refreshQuotaCatalog(options: {
-    force?: boolean;
-    model?: string;
-  } = {}): Promise<AccountLeaseQuotaCatalogRefreshResult> {
+  refreshQuotaCatalog(options: { force?: boolean; model?: string } = {}): Promise<AccountLeaseQuotaCatalogRefreshResult> {
     return this.quotaRefreshPolicy.refreshQuotaCatalog(options);
   }
 

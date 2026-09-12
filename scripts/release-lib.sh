@@ -1236,14 +1236,8 @@ smoke_check() {
     case "${RELEASE_TEST_SMOKE:-pass}" in
       pass) return 0 ;;
       fail) return 1 ;;
-      fail-first)
-        [ "$migration_smoke_check_count" -ne 1 ]
-        return
-        ;;
-      fail-restored)
-        [ "$migration_smoke_check_count" -ne 2 ]
-        return
-        ;;
+      fail-first) [ "$migration_smoke_check_count" -ne 1 ]; return ;;
+      fail-restored) [ "$migration_smoke_check_count" -ne 2 ]; return ;;
       *) die "Unknown RELEASE_TEST_SMOKE mode: $RELEASE_TEST_SMOKE" ;;
     esac
   fi
@@ -1283,27 +1277,28 @@ smoke_check() {
     fi
 
     curl_exit=0
-    health_code="$(curl -q --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' --max-time "$request_timeout" "$base_url/health" 2>/dev/null)" || curl_exit=$?
+    health_tmp="$(mktemp)"
+    health_code="$(curl -q --noproxy '*' --silent --max-time "$request_timeout" --write-out '%{http_code}' --output "$health_tmp" "$base_url/health" 2>/dev/null)" || curl_exit=$?
+    health_body="$(cat "$health_tmp" 2>/dev/null || true)"; rm -f "$health_tmp"
 
     if [ "$curl_exit" -eq 0 ] && [ "$health_code" = 200 ]; then
-      ready=1
-      break
+      if [ -n "$health_body" ]; then
+        if ! printf '%s' "$health_body" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' || \
+           ! printf '%s' "$health_body" | grep -q '"connect_ready"[[:space:]]*:[[:space:]]*true'; then
+          printf 'Health endpoint responded 200 but connect_ready is not true: %s\n' "$health_body" >&2; return 1
+        fi
+      fi
+      ready=1; break
     fi
 
     # Tolerated transient startup states while PID initializes:
-    # curl exit 7 (connection refused), exit 28 (timeout), exit 52 (empty reply), exit 56 (reset), or HTTP status 000
     if [ "$curl_exit" -eq 7 ] || [ "$curl_exit" -eq 28 ] || [ "$curl_exit" -eq 52 ] || [ "$curl_exit" -eq 56 ] || [ "$health_code" = '000' ]; then
-      current_time="$(date +%s)"
-      elapsed=$((current_time - start_time))
-      if [ "$elapsed" -ge "$timeout_secs" ]; then
-        break
-      fi
-      sleep "$poll_interval"
-      continue
+      current_time="$(date +%s)"; elapsed=$((current_time - start_time))
+      if [ "$elapsed" -ge "$timeout_secs" ]; then break; fi
+      sleep "$poll_interval"; continue
     fi
 
-    # Permanent bad health (e.g. 500, 404, etc.) must fail immediately, not be masked
-    printf 'Health endpoint returned unexpected HTTP status %s (curl exit %s)\n' "$health_code" "$curl_exit" >&2
+    printf 'Health endpoint returned unexpected HTTP status %s (curl exit %s, body: %s)\n' "$health_code" "$curl_exit" "$health_body" >&2
     return 1
   done
 

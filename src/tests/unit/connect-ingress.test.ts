@@ -269,4 +269,53 @@ describe('ConnectIngressService', () => {
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
+
+  it('rejects disallowed destinations with HTTP 403 (RFC1918, loopback, cloud metadata, bracketed IPv6)', async () => {
+    const server = http.createServer();
+    const ingress = new ConnectIngressService();
+    ingress.attach(server);
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const port = (server.address() as net.AddressInfo).port;
+
+    const testTargets = [
+      '10.0.0.1:443',
+      '192.168.1.1:8443',
+      '169.254.169.254:443',
+      '127.1:443',
+      '2130706433:443',
+      '127.0.0.1:443',
+      '[::1]:443',
+      'localhost:443',
+    ];
+
+    for (const target of testTargets) {
+      const resp = await new Promise<string>((resolve, reject) => {
+        const client = net.connect(port, '127.0.0.1', () => {
+          client.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`);
+        });
+        client.on('data', (d) => {
+          client.destroy();
+          resolve(d.toString('utf-8'));
+        });
+        client.on('error', reject);
+      });
+      expect(resp).toContain('HTTP/1.1 403 Forbidden');
+    }
+
+    ingress.close();
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('removes connect listener and cleans up active sockets on close()', () => {
+    const server = http.createServer();
+    const ingress = new ConnectIngressService();
+    ingress.attach(server);
+
+    expect(server.listenerCount('connect')).toBe(1);
+    ingress.close();
+    expect(server.listenerCount('connect')).toBe(0);
+  });
 });
+

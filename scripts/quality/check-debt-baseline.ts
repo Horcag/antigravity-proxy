@@ -8,15 +8,11 @@ const ignoredDirectories = new Set([
   'node_modules',
   'dist',
   'coverage',
-  '.agent-work',
   '.git',
 ]);
 
 const sourceFilePattern = /\.(?:js|jsx|ts|tsx|mjs|cjs)$/u;
-const debtRulePattern = /\b(?:complexity|max-lines|max-params)\b/u;
-const eslintDisablePattern = /(?:\/\/|\/\*|\*)\s*eslint-disable(?:-next-line|-line)?/u;
-const tsDirectivePattern = /(?:\/\/|\/\*|\*)\s*@ts-(?:ignore|expect-error|nocheck)\b/u;
-const disableReasonPattern = /--\s*\S/u;
+const debtRules = new Set(['complexity', 'max-lines', 'max-params']);
 
 // Excluded files (the validator itself)
 const ignoredFiles = new Set<string>([
@@ -61,10 +57,35 @@ function listSourceFiles(directory: string): string[] {
   return files;
 }
 
+export interface ExtractedComment {
+  type: 'line' | 'block';
+  text: string;
+  line: number;
+}
+
+export function extractCommentsFromContent(content: string): ExtractedComment[] {
+  const comments: ExtractedComment[] = [];
+  // Tokenize comments vs string literals to prevent matching comments inside strings
+  const re = /(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`)|(\/\/[^\r\n]*)|(\/\*[\s\S]*?\*\/)/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = re.exec(content)) !== null) {
+    if (match[1] || match[2]) {
+      const text = match[1] || match[2];
+      const type = match[1] ? 'line' : 'block';
+      const offset = match.index;
+      // Calculate 1-based line number from character offset
+      const line = content.slice(0, offset).split(/\r?\n/).length;
+      comments.push({ type, text, line });
+    }
+  }
+  return comments;
+}
+
 export interface DebtViolation {
   file: string;
   line: number;
-  type: 'unapproved-debt-disable' | 'missing-disable-reason' | 'unexplained-ts-directive';
+  type: 'unapproved-debt-disable' | 'missing-disable-reason' | 'blanket-disable-forbidden' | 'inline-config-forbidden' | 'unexplained-ts-directive';
   message: string;
 }
 
@@ -82,61 +103,84 @@ export function findDebtViolations(): DebtViolation[] {
       if (ignoredFiles.has(relativePath)) {
         continue;
       }
-      const lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/u);
 
-      lines.forEach((line, index) => {
-        const lineNum = index + 1;
+      const content = fs.readFileSync(filePath, 'utf8');
+      const comments = extractCommentsFromContent(content);
 
-        // Check ESLint disable comments
-        if (eslintDisablePattern.test(line)) {
-          const hasReason = disableReasonPattern.test(line);
+      for (const comment of comments) {
+        // 1. Forbid inline ESLint configuration comments (e.g. /* eslint "rule": "off" */ or /* eslint-env */)
+        if (/\/\*\s*eslint\b(?!\s*-(?:disable|enable))/i.test(comment.text)) {
+          violations.push({
+            file: relativePath,
+            line: comment.line,
+            type: 'inline-config-forbidden',
+            message: `${relativePath}:${comment.line} Inline ESLint rule configuration (/* eslint ... */) is forbidden. Configure rules in eslint.config.mjs.`,
+          });
+        }
 
-          // If disabling an architectural debt rule
-          if (debtRulePattern.test(line)) {
-            if (!allowedInlineDebtDisableFiles.has(relativePath)) {
-              violations.push({
-                file: relativePath,
-                line: lineNum,
-                type: 'unapproved-debt-disable',
-                message: `${relativePath}:${lineNum} architecture debt disable is not in legacy allowlist`,
-              });
-              return;
-            }
-            if (!hasReason) {
-              violations.push({
-                file: relativePath,
-                line: lineNum,
-                type: 'missing-disable-reason',
-                message: `${relativePath}:${lineNum} architecture debt disable requires a local reason (-- <reason>)`,
-              });
-              return;
-            }
-          }
-
-          // General eslint-disable should have an explanation
-          if (!hasReason) {
+        // 2. Check eslint-disable directives
+        const disableMatch = /(?:\/\/|\/\*)\s*eslint-disable(?:-next-line|-line)?\s*(.*?)(?:\*\/|$)/u.exec(comment.text);
+        if (disableMatch) {
+          const rest = disableMatch[1];
+          if (!rest.includes('--')) {
             violations.push({
               file: relativePath,
-              line: lineNum,
+              line: comment.line,
               type: 'missing-disable-reason',
-              message: `${relativePath}:${lineNum} eslint-disable must include an explanation (-- <reason>)`,
+              message: `${relativePath}:${comment.line} eslint-disable must specify rule names and an explanation (-- <reason>)`,
             });
+          } else {
+            const [rulesPart, ...reasonParts] = rest.split('--');
+            const rules = rulesPart.trim().split(/\s+/).filter(Boolean);
+            const reason = reasonParts.join('--').trim();
+
+            // Blanket disable without rule names is forbidden
+            if (rules.length === 0) {
+              violations.push({
+                file: relativePath,
+                line: comment.line,
+                type: 'blanket-disable-forbidden',
+                message: `${relativePath}:${comment.line} Blanket eslint-disable without specific rule names is forbidden. Specific rules must be named before '-- <reason>'.`,
+              });
+            } else {
+              for (const rule of rules) {
+                if (debtRules.has(rule)) {
+                  if (!allowedInlineDebtDisableFiles.has(relativePath)) {
+                    violations.push({
+                      file: relativePath,
+                      line: comment.line,
+                      type: 'unapproved-debt-disable',
+                      message: `${relativePath}:${comment.line} Architecture debt disable (${rule}) is not in legacy allowlist`,
+                    });
+                  }
+                }
+              }
+            }
+
+            if (!reason) {
+              violations.push({
+                file: relativePath,
+                line: comment.line,
+                type: 'missing-disable-reason',
+                message: `${relativePath}:${comment.line} eslint-disable must include an explanation (-- <reason>)`,
+              });
+            }
           }
         }
 
-        // Check TypeScript suppression directives (@ts-ignore, @ts-expect-error, @ts-nocheck)
-        if (tsDirectivePattern.test(line)) {
-          const hasReason = disableReasonPattern.test(line);
+        // 3. Check TypeScript suppression directives (@ts-ignore, @ts-expect-error, @ts-nocheck)
+        if (/@ts-(?:ignore|expect-error|nocheck)\b/u.test(comment.text)) {
+          const hasReason = /--\s*\S/u.test(comment.text);
           if (!hasReason) {
             violations.push({
               file: relativePath,
-              line: lineNum,
+              line: comment.line,
               type: 'unexplained-ts-directive',
-              message: `${relativePath}:${lineNum} TypeScript suppression directive must include an explanation (-- <reason>)`,
+              message: `${relativePath}:${comment.line} TypeScript suppression directive must include an explanation (-- <reason>)`,
             });
           }
         }
-      });
+      }
     }
   }
 

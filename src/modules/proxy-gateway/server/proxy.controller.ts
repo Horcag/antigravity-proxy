@@ -63,6 +63,7 @@ import {
 } from './openai-protocol-error';
 import { isMultipartParserOrLimitError } from './fastify-multipart.provider';
 import { type OpenAIResponsesConfiguration } from '../antigravity/OpenAIResponsesStreamingMapper';
+import { extractRequestAbortSignal } from './request-abort-signal';
 import {
   isValidBase64,
   type MediaKind,
@@ -254,7 +255,7 @@ export class ProxyController {
         request,
         'text-completions',
         undefined,
-        this.extractRequestAbortSignal(req),
+        extractRequestAbortSignal(req, res),
       );
       if (body.stream && this.isObservableLike(result)) {
         this.writeSseResponse(res, result);
@@ -289,7 +290,7 @@ export class ProxyController {
         request,
         'responses',
         configuration,
-        this.extractRequestAbortSignal(req),
+        extractRequestAbortSignal(req, res),
       );
       if (body.stream && this.isObservableLike(result)) {
         this.writeSseResponse(res, result, 'responses');
@@ -603,26 +604,6 @@ export class ProxyController {
     }
   }
 
-  private extractRequestAbortSignal(request?: FastifyRequest): AbortSignal | undefined {
-    if (!request) return undefined;
-    if ((request as any).signal instanceof AbortSignal) {
-      return (request as any).signal;
-    }
-    const raw = request.raw;
-    if (!raw) return undefined;
-    if (raw.destroyed || raw.closed) {
-      return AbortSignal.abort();
-    }
-    const controller = new AbortController();
-    const onClose = () => {
-      if (!raw.complete) {
-        controller.abort();
-      }
-    };
-    raw.once('close', onClose);
-    return controller.signal;
-  }
-
   private async respondOpenAIChatCompletions(
     body: OpenAIChatRequest,
     res: FastifyReply,
@@ -633,7 +614,7 @@ export class ProxyController {
         body,
         'chat-completions',
         undefined,
-        this.extractRequestAbortSignal(request),
+        extractRequestAbortSignal(request, res),
       );
 
       if (body.stream && this.isObservableLike(result)) {
@@ -660,7 +641,7 @@ export class ProxyController {
     try {
       const result = await this.proxyService.handleAnthropicMessages(
         body,
-        this.extractRequestAbortSignal(request),
+        extractRequestAbortSignal(request, res),
       );
 
       if (body.stream && this.isObservableLike(result)) {

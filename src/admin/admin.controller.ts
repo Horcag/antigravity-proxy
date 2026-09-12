@@ -1,4 +1,5 @@
-import { Body, Controller, Delete, Get, Param, Post, Put, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpStatus, Param, Post, Put, Query, Res, UseGuards } from '@nestjs/common';
+import type { FastifyReply } from 'fastify';
 import { AdminGuard } from '@/modules/proxy-gateway/server/guards/admin.guard';
 import { ConnectIngressService } from '@/modules/proxy-gateway/server/connect-ingress.service';
 import { AdminService, OAuthExchangeRequest } from './admin.service';
@@ -20,10 +21,20 @@ export class AdminController {
   constructor(private readonly adminService: AdminService) {}
 
   @Get('health')
-  health() {
+  health(@Res({ passthrough: true }) res?: FastifyReply) {
+    const isConnectReady = ConnectIngressService.isReady();
+    if (!isConnectReady) {
+      if (res) {
+        res.status(HttpStatus.SERVICE_UNAVAILABLE);
+      }
+      return {
+        ok: false,
+        connect_ready: false,
+      };
+    }
     return {
       ok: true,
-      connect_ready: ConnectIngressService.isReady(),
+      connect_ready: true,
     };
   }
 
