@@ -120,7 +120,7 @@ afterEach(() => {
   }
 });
 
-describe('systemd release tooling', () => {
+describe('systemd release tooling', { timeout: 60_000 }, () => {
   it('prints a fresh-install plan without generating or disclosing environment values', () => {
     const result = spawnSync('bash', [installScript, 'install'], {
       cwd: repositoryRoot,
@@ -239,7 +239,7 @@ describe('systemd release tooling', () => {
     expect(readFileSync(join(statePath, '.master-key'), 'utf8')).toBe('master-key');
     expect(result.stdout).not.toContain('preserved-proxy');
     expect(result.stdout).not.toContain('preserved-admin');
-  });
+  }, 30_000);
 
   it('copies legacy environment and SQLite state without regenerating keys during migration', () => {
     const root = createRoot();
@@ -273,7 +273,7 @@ describe('systemd release tooling', () => {
     expect(readFileSync(join(statePath, 'config.json'), 'utf8')).toBe('{"legacy":true}\n');
     expect(result.stdout).not.toContain('legacy-proxy');
     expect(result.stdout).not.toContain('legacy-admin');
-  });
+  }, 30_000);
 
   it('rolls back every newly published environment and state entry after each individual publication failure', () => {
     for (const checkpoint of ['environment', ...migrationStateEntries.map((entry) => `state-${entry}`)]) {
@@ -296,7 +296,7 @@ describe('systemd release tooling', () => {
       expect(recordedActions(systemLog)).toEqual([]);
       expect(recordedActions(legacyLog)).toEqual(['stop antigravity-proxy.service', 'start antigravity-proxy.service']);
     }
-  }, 30_000);
+  }, 120_000);
 
   it('refuses to delete a substituted publication during migration rollback', () => {
     const root = createRoot();

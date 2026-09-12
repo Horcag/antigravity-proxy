@@ -13,3 +13,5 @@ cloud-accounts-export*.json
 .env
 .env.*
 !.env.example
+.codex/
+.mcp.json

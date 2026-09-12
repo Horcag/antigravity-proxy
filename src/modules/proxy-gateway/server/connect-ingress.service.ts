@@ -6,6 +6,30 @@ import { CaManager } from './cert/ca-manager';
 import { CloudCodeFailoverGateway } from './cloudcode-failover-gateway';
 import { AccountLeaseService } from './account-lease.service';
 
+export interface ParsedConnectAuthority {
+  hostname: string;
+  port: number;
+}
+
+export function parseConnectAuthority(destination: string | undefined): ParsedConnectAuthority | null {
+  if (!destination || typeof destination !== 'string') return null;
+  const trimmed = destination.trim();
+  const match = /^([a-zA-Z0-9.-]+):([0-9]{1,5})$/.exec(trimmed);
+  if (!match) return null;
+  const hostname = match[1].toLowerCase();
+  const port = Number(match[2]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  if (
+    hostname.startsWith('.') ||
+    hostname.endsWith('.') ||
+    hostname.includes('..') ||
+    hostname.startsWith('-')
+  ) {
+    return null;
+  }
+  return { hostname, port };
+}
+
 export class ConnectIngressService {
   private h2Server: http2.Http2SecureServer | null = null;
   private failoverGateway: CloudCodeFailoverGateway;
@@ -70,8 +94,13 @@ export class ConnectIngressService {
     });
 
     const destination = req.url || '';
-    const [host, portStr] = destination.split(':');
-    const port = parseInt(portStr || '443', 10);
+    const parsed = parseConnectAuthority(destination);
+    if (!parsed) {
+      logger.warn(`[ConnectIngress] Malformed CONNECT destination rejected: ${destination}`);
+      clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
 
     clientSocket.on('error', (err) => {
       logger.debug(`[ConnectIngress] Client socket error for ${destination}: ${err.message}`);
@@ -95,7 +124,7 @@ export class ConnectIngressService {
     }
 
     // 2. Standard TCP tunnel for non-target destinations
-    const upstreamSocket = net.connect(port, host, () => {
+    const upstreamSocket = net.connect(parsed.port, parsed.hostname, () => {
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head && head.length > 0) {
         upstreamSocket.write(head);

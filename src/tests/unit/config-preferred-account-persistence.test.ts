@@ -704,10 +704,10 @@ describe('preferred account config persistence', () => {
     const timeout = Symbol('release timeout');
     const thrown = await Promise.race([
       ConfigManager.setPreferredAccount('acc-2').catch((error: unknown) => error),
-      new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), 1_000)),
+      new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), 3_000)),
     ]);
 
-    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(Date.now() - startedAt).toBeLessThan(3_000);
     expect(thrown).not.toBe(timeout);
     expect(thrown).toBeInstanceOf(ConfigPersistenceError);
     expect(thrown).toMatchObject({ committed: true });

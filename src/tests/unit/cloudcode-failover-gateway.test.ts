@@ -491,14 +491,20 @@ describe('AccountLeaseSelectionPolicy session affinity and parallel session dist
     ).toBe(false);
 
     // 3. Start migration by req-1 towards acc-2
-    expect(policy.startSessionMigration(sessionKey, 1, 'acc-2', 'req-1')).toBe(true);
+    const migrationCapability = policy.startSessionMigration(sessionKey, 1, 'acc-2', 'req-1');
+    expect(migrationCapability).toMatchObject({
+      sessionKey,
+      generation: 2,
+      ownerRequestId: 'req-1',
+      targetAccountId: 'acc-2',
+    });
     const migrating = policy.getSessionBinding(sessionKey);
     expect(migrating?.state).toBe('migrating');
     expect(migrating?.generation).toBe(2);
     expect(migrating?.migratingToAccountId).toBe('acc-2');
 
     // 4. Another request req-2 cannot steal migration (Probe C05)
-    expect(policy.startSessionMigration(sessionKey, 1, 'acc-3', 'req-2')).toBe(false);
+    expect(policy.startSessionMigration(sessionKey, 1, 'acc-3', 'req-2')).toBeNull();
 
     // 5. Wrong owner cannot confirm (Probe C08)
     expect(

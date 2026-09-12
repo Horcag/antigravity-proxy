@@ -8,6 +8,28 @@ export interface AccountLeaseRateLimitReader {
 
 export type SessionState = 'active' | 'migrating';
 
+export interface MigrationCapability {
+  sessionKey: string;
+  generation: number;
+  ownerRequestId: string;
+  targetAccountId: string;
+}
+
+export interface CacheHintEntry {
+  accountId: string;
+  expiresAt: number;
+}
+
+export function isHintSessionKey(key: string | undefined): boolean {
+  return typeof key === 'string' && (key.startsWith('hint:') || key.startsWith('cache-hint:'));
+}
+
+export function isVerifiedSessionKey(key: string | undefined): boolean {
+  if (typeof key !== 'string' || !key.trim()) return false;
+  if (isHintSessionKey(key)) return false;
+  return true;
+}
+
 export interface SessionBindingEntry {
   accountId: string;
   generation: number;
@@ -64,6 +86,7 @@ function compareCodeUnits(left: string, right: string): number {
 export class AccountLeaseSelectionPolicy {
   private currentIndex = 0;
   private sessionBindings: Map<string, SessionBindingEntry> = new Map();
+  private cacheHintBindings: Map<string, CacheHintEntry> = new Map();
   private parityRequestCount = 0;
   private parityErrorCount = 0;
   private noGoBlocked = false;
@@ -80,12 +103,50 @@ export class AccountLeaseSelectionPolicy {
 
   clearSessions(): void {
     this.sessionBindings.clear();
+    this.cacheHintBindings.clear();
+  }
+
+  recordCacheHint(hintKey: string, accountId: string, ttlMs = 300000): void {
+    const now = Date.now();
+    if (this.cacheHintBindings.size >= 5000) {
+      for (const [k, v] of this.cacheHintBindings.entries()) {
+        if (v.expiresAt <= now) {
+          this.cacheHintBindings.delete(k);
+        }
+      }
+      if (this.cacheHintBindings.size >= 5000) {
+        const oldestKey = this.cacheHintBindings.keys().next().value;
+        if (oldestKey) this.cacheHintBindings.delete(oldestKey);
+      }
+    }
+    this.cacheHintBindings.set(hintKey, {
+      accountId,
+      expiresAt: now + ttlMs,
+    });
+  }
+
+  getCacheHint(hintKey: string): string | null {
+    const entry = this.cacheHintBindings.get(hintKey);
+    if (!entry || entry.expiresAt <= Date.now()) {
+      if (entry) this.cacheHintBindings.delete(hintKey);
+      return null;
+    }
+    return entry.accountId;
+  }
+
+  clearCacheHints(): void {
+    this.cacheHintBindings.clear();
   }
 
   clearSessionBindingsForUnavailableAccounts(availableAccountIds: ReadonlySet<string>): void {
     for (const [sessionKey, binding] of this.sessionBindings.entries()) {
       if (!availableAccountIds.has(binding.accountId)) {
         this.sessionBindings.delete(sessionKey);
+      }
+    }
+    for (const [hintKey, hint] of this.cacheHintBindings.entries()) {
+      if (!availableAccountIds.has(hint.accountId)) {
+        this.cacheHintBindings.delete(hintKey);
       }
     }
   }
@@ -152,6 +213,13 @@ export class AccountLeaseSelectionPolicy {
     if (!sessionKey || !accountId) {
       return false;
     }
+    // Hard session bindings are ONLY for verified session keys (Gate 9, T12-F04)
+    if (!isVerifiedSessionKey(sessionKey)) {
+      if (isHintSessionKey(sessionKey)) {
+        this.recordCacheHint(sessionKey, accountId, Math.max(0, expiresAt - Date.now()));
+      }
+      return false;
+    }
     const current = this.sessionBindings.get(sessionKey);
     const now = Date.now();
     if (current && current.expiresAt > now) {
@@ -206,11 +274,12 @@ export class AccountLeaseSelectionPolicy {
     currentGeneration: number,
     targetAccountId: string,
     ownerRequestId?: string,
-  ): boolean {
-    if (!sessionKey || !ownerRequestId || !targetAccountId) return false;
+  ): MigrationCapability | null {
+    if (!sessionKey || !ownerRequestId || !targetAccountId) return null;
+    if (!isVerifiedSessionKey(sessionKey)) return null;
     const current = this.sessionBindings.get(sessionKey);
     if (!current) {
-      return false;
+      return null;
     }
     const now = Date.now();
 
@@ -225,39 +294,56 @@ export class AccountLeaseSelectionPolicy {
           migrationExpiresAt: now + 30000,
           lastActivityAt: now,
         });
-        return true;
+        return {
+          sessionKey,
+          generation: current.generation,
+          ownerRequestId,
+          targetAccountId,
+        };
       }
       // If previous migration expired/abandoned, allow new owner to take over
       if (isMigrationExpired) {
+        const newGen = current.generation + 1;
         this.sessionBindings.set(sessionKey, {
           ...current,
           state: 'migrating',
-          generation: current.generation + 1,
+          generation: newGen,
           migratingToAccountId: targetAccountId,
           migrationOwnerRequestId: ownerRequestId,
           migrationExpiresAt: now + 30000,
           lastActivityAt: now,
         });
-        return true;
+        return {
+          sessionKey,
+          generation: newGen,
+          ownerRequestId,
+          targetAccountId,
+        };
       }
       // Active migration owned by another request; reject concurrent migration (Probe C05, C09)
-      return false;
+      return null;
     }
 
     if (current.generation !== currentGeneration) {
-      return false;
+      return null;
     }
 
+    const newGen = currentGeneration + 1;
     this.sessionBindings.set(sessionKey, {
       ...current,
       state: 'migrating',
-      generation: currentGeneration + 1,
+      generation: newGen,
       migratingToAccountId: targetAccountId,
       migrationOwnerRequestId: ownerRequestId,
       migrationExpiresAt: now + 30000,
       lastActivityAt: now,
     });
-    return true;
+    return {
+      sessionKey,
+      generation: newGen,
+      ownerRequestId,
+      targetAccountId,
+    };
   }
 
   failSessionMigrationCandidate(
@@ -387,15 +473,32 @@ export class AccountLeaseSelectionPolicy {
     sessionKey: string | undefined,
     now: number,
   ): AccountLeaseSelectionEntry<T> | null {
-    const stickyBinding = this.getValidSessionBinding(sessionKey, now);
-    if (!stickyBinding) {
+    if (!sessionKey) {
       return null;
     }
 
-    // In migrating state, do not speculatively route followers to unconfirmed migratingToAccountId
-    const targetAccountId = stickyBinding.accountId;
+    // 1. Hard verified session binding
+    if (isVerifiedSessionKey(sessionKey)) {
+      const stickyBinding = this.getValidSessionBinding(sessionKey, now);
+      if (stickyBinding) {
+        // In migrating state, do not speculatively route followers to unconfirmed migratingToAccountId
+        const targetAccountId = stickyBinding.accountId;
+        return candidates.find(([accountId]) => accountId === targetAccountId) ?? null;
+      }
+    }
 
-    return candidates.find(([accountId]) => accountId === targetAccountId) ?? null;
+    // 2. Cache-hint placement locality (soft affinity, no migration state, bounded storage)
+    if (isHintSessionKey(sessionKey)) {
+      const hintAccountId = this.getCacheHint(sessionKey);
+      if (hintAccountId) {
+        const hintCandidate = candidates.find(([accountId]) => accountId === hintAccountId);
+        if (hintCandidate) {
+          return hintCandidate;
+        }
+      }
+    }
+
+    return null;
   }
 
   private pickRoundRobinEntry<T>(

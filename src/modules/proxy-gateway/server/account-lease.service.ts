@@ -18,7 +18,16 @@ import type { AccountLeaseQuotaCatalogRefreshResult } from './account-lease-quot
 import { AccountLeaseTokenCache } from './account-lease-token-cache';
 import { AccountLeaseHydrationPolicy } from './account-lease-hydration-policy';
 import { AccountLeaseFulfillmentPolicy } from './account-lease-fulfillment-policy';
-import { AccountLeaseSelectionPolicy, type SessionBindingEntry } from './account-lease-selection-policy';
+import {
+  AccountLeaseSelectionPolicy,
+  type SessionBindingEntry,
+  type MigrationCapability,
+  isVerifiedSessionKey,
+  isHintSessionKey,
+} from './account-lease-selection-policy';
+
+export type { MigrationCapability };
+export { isVerifiedSessionKey, isHintSessionKey };
 import { AccountLeaseModelPolicy } from './account-lease-model-policy';
 import { normalizeModelId, type AccountLeaseTokenData } from './account-lease-token-types';
 import {
@@ -732,7 +741,13 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     ttlMs?: number,
     expectedGeneration?: number,
   ): boolean {
-    if (!sessionKey) {
+    if (!sessionKey || !accountId) {
+      return false;
+    }
+    if (!isVerifiedSessionKey(sessionKey)) {
+      if (isHintSessionKey(sessionKey)) {
+        this.selectionPolicy.recordCacheHint(sessionKey, accountId, ttlMs);
+      }
       return false;
     }
     const expiresAt = Date.now() + (ttlMs ?? this.stickySessionTtlMs);
@@ -748,7 +763,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     currentGeneration: number,
     targetAccountId: string,
     ownerRequestId?: string,
-  ): boolean {
+  ): MigrationCapability | null {
     return this.selectionPolicy.startSessionMigration(
       sessionKey,
       currentGeneration,
@@ -796,45 +811,58 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     ttlMs?: number,
   ): boolean {
     if (!sessionKey || !accountId) return false;
-    const current = this.getSessionBinding(sessionKey);
-    const expiresAt = Date.now() + (ttlMs ?? this.stickySessionTtlMs);
 
-    if (current && current.state === 'migrating') {
-      return this.selectionPolicy.confirmSessionMigration(
-        sessionKey,
-        expectedGeneration ?? current.generation,
-        accountId,
-        ownerRequestId ?? current.migrationOwnerRequestId,
-        expiresAt,
-      );
-    }
-
-    if (current && current.accountId !== accountId) {
-      if (ownerRequestId) {
-        const started = this.selectionPolicy.startSessionMigration(
-          sessionKey,
-          current.generation,
-          accountId,
-          ownerRequestId,
-        );
-        if (started) {
-          return this.selectionPolicy.confirmSessionMigration(
-            sessionKey,
-            current.generation + 1,
-            accountId,
-            ownerRequestId,
-            expiresAt,
-          );
-        }
+    // Gate 9 & T12-F04: Hint isolation. Unverified session keys (e.g. hint:prefix:...)
+    // must NEVER mutate hard session bindings or trigger migration.
+    if (!isVerifiedSessionKey(sessionKey)) {
+      if (isHintSessionKey(sessionKey)) {
+        this.selectionPolicy.recordCacheHint(sessionKey, accountId, ttlMs);
       }
       return false;
     }
 
+    const current = this.selectionPolicy.getSessionBinding(sessionKey);
+    const expiresAt = Date.now() + (ttlMs ?? this.stickySessionTtlMs);
+
+    // Gate 5 & T12-F02 3.2: Existing migration confirmation
+    if (current && current.state === 'migrating') {
+      // Must supply ownerRequestId and expectedGeneration! Never inherit owner from current state!
+      if (!ownerRequestId || expectedGeneration === undefined) {
+        return false;
+      }
+      return this.selectionPolicy.confirmSessionMigration(
+        sessionKey,
+        expectedGeneration,
+        accountId,
+        ownerRequestId,
+        expiresAt,
+      );
+    }
+
+    // Gate 3 & T12-F02 3.1: Attempting a different account when active on another without active migration
+    if (current && current.accountId !== accountId) {
+      return false;
+    }
+
+    // Refresh existing active binding on same account
+    if (current && current.accountId === accountId) {
+      if (expectedGeneration !== undefined && expectedGeneration !== current.generation) {
+        return false;
+      }
+      return this.selectionPolicy.bindSession(
+        sessionKey,
+        accountId,
+        expiresAt,
+        expectedGeneration ?? current.generation,
+      );
+    }
+
+    // Initial binding for new/expired session
     return this.selectionPolicy.bindSession(
       sessionKey,
       accountId,
       expiresAt,
-      expectedGeneration ?? current?.generation,
+      expectedGeneration,
     );
   }
 

@@ -191,6 +191,7 @@ export class ProxyService {
     sessionKey?: string,
     sessionGeneration?: number,
     expectedBreakerGeneration?: number,
+    ownerRequestId?: string,
   ): StreamHealthLifecycle {
     let hasMarkedSuccess = false;
     let hasRecordedFailure = false;
@@ -216,6 +217,7 @@ export class ProxyService {
           sessionKey,
           sessionGeneration,
           expectedBreakerGeneration,
+          ownerRequestId,
         );
         this.accountLeaseService.recordPerformanceSuccess?.(
           accountId,
@@ -243,19 +245,21 @@ export class ProxyService {
     model: string,
     sessionKey?: string,
     retryState?: ProxyTokenRetryState,
-  ): void {
+  ): boolean {
     retryState?.activeReservation?.();
     if (retryState) {
       retryState.activeReservation = undefined;
     }
-    this.retryPolicy.markUpstreamSuccess(
+    const confirmed = this.retryPolicy.markUpstreamSuccess(
       accountId,
       model,
       sessionKey,
       retryState?.sessionGeneration,
       retryState?.breakerGeneration,
+      retryState?.requestId,
     );
     this.accountLeaseService.recordPerformanceSuccess?.(accountId, model);
+    return confirmed;
   }
 
   private async executeUpstreamAttempt<T>(
@@ -427,6 +431,7 @@ export class ProxyService {
             sessionKey,
             retryState.sessionGeneration,
             retryState.breakerGeneration,
+            retryState.requestId,
           );
           retryState.activeReservation = undefined;
           return this.processAnthropicInternalStream(
@@ -493,6 +498,7 @@ export class ProxyService {
                 sessionKey,
                 retryState.sessionGeneration,
                 retryState.breakerGeneration,
+                retryState.requestId,
               );
               retryState.activeReservation = undefined;
               return this.processAnthropicInternalStream(
@@ -877,6 +883,7 @@ export class ProxyService {
           undefined,
           retryState.sessionGeneration,
           retryState.breakerGeneration,
+          retryState.requestId,
         );
         retryState.activeReservation = undefined;
         return this.passthroughSseStream(
@@ -1277,6 +1284,7 @@ export class ProxyService {
               sessionKey,
               retryState.sessionGeneration,
               retryState.breakerGeneration,
+              retryState.requestId,
             );
             retryState.activeReservation = undefined;
             return this.createOpenAIProtocolStream(

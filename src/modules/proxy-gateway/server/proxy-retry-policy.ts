@@ -1,15 +1,22 @@
+import crypto from 'node:crypto';
 import { CloudAccount } from '@/modules/cloud-account/types';
 import { calculateRetryDelay, sleep } from '../antigravity/retry-utils';
 import { UpstreamRequestError } from './clients/upstream-error';
 import { proxyModelAvailabilityStore } from './proxy-model-availability-store';
 import { isStrictAuthenticationFailure } from '@/modules/cloud-account/services/strict-authentication-classifier';
 import { RateLimitReason } from './rate-limit-tracker';
+import {
+  type MigrationCapability,
+  isVerifiedSessionKey,
+} from './account-lease-selection-policy';
 
 export interface ProxyTokenRetryState {
   attemptedAccountIds: Set<string>;
+  requestId: string;
   activeReservation?: () => void;
   sessionGeneration?: number;
   breakerGeneration?: number;
+  migrationCapability?: MigrationCapability;
 }
 
 export interface ProxyRetryAccountLeaseService {
@@ -51,6 +58,18 @@ export interface ProxyRetryAccountLeaseService {
     ownerRequestId?: string,
     ttlMs?: number,
   ): boolean;
+  startSessionMigration?(
+    sessionKey: string | undefined,
+    currentGeneration: number,
+    targetAccountId: string,
+    ownerRequestId?: string,
+  ): MigrationCapability | null;
+  failSessionMigrationCandidate?(
+    sessionKey: string | undefined,
+    expectedGeneration: number,
+    failedAccountId: string,
+    ownerRequestId?: string,
+  ): boolean;
   getSessionBinding?(sessionKey: string | undefined): { generation: number } | null;
 }
 
@@ -74,6 +93,7 @@ export class ProxyRetryPolicy {
   createTokenRetryState(): ProxyTokenRetryState {
     return {
       attemptedAccountIds: new Set<string>(),
+      requestId: crypto.randomUUID(),
     };
   }
 
@@ -84,6 +104,10 @@ export class ProxyRetryPolicy {
   ): Promise<CloudAccount | null> {
     retryState.activeReservation?.();
     retryState.activeReservation = undefined;
+
+    const isRetryAttempt = retryState.attemptedAccountIds.size > 0;
+
+    let selectedAccount: CloudAccount | null = null;
 
     if (this.accountLeaseService.acquireAttemptLease) {
       const lease = await this.accountLeaseService.acquireAttemptLease({
@@ -99,29 +123,55 @@ export class ProxyRetryPolicy {
       retryState.activeReservation = lease.releaseReservation;
       retryState.sessionGeneration = lease.generation;
       retryState.breakerGeneration = lease.breakerGeneration;
-      return lease.account;
+      selectedAccount = lease.account;
+    } else {
+      const token = await this.accountLeaseService.getNextToken({
+        sessionKey,
+        excludeAccountIds: Array.from(retryState.attemptedAccountIds),
+        model,
+        deferSessionBinding: true,
+      });
+      if (!token) {
+        return null;
+      }
+
+      retryState.attemptedAccountIds.add(token.id);
+      retryState.activeReservation = token.releaseReservation;
+      if (sessionKey && this.accountLeaseService.getSessionBinding) {
+        retryState.sessionGeneration =
+          this.accountLeaseService.getSessionBinding(sessionKey)?.generation ?? 1;
+      }
+      if (this.accountLeaseService.getBreakerGeneration) {
+        retryState.breakerGeneration = this.accountLeaseService.getBreakerGeneration(token.id);
+      }
+      selectedAccount = token;
     }
 
-    const token = await this.accountLeaseService.getNextToken({
-      sessionKey,
-      excludeAccountIds: Array.from(retryState.attemptedAccountIds),
-      model,
-      deferSessionBinding: true,
-    });
-    if (!token) {
-      return null;
+    // Gate 4: If this is a retry attempt on a verified session, initiate versioned migration to the candidate account
+    if (
+      selectedAccount &&
+      sessionKey &&
+      isVerifiedSessionKey(sessionKey) &&
+      isRetryAttempt &&
+      typeof this.accountLeaseService.startSessionMigration === 'function'
+    ) {
+      const currentGen =
+        retryState.sessionGeneration ??
+        this.accountLeaseService.getSessionBinding?.(sessionKey)?.generation ??
+        1;
+      const migrationCap = this.accountLeaseService.startSessionMigration(
+        sessionKey,
+        currentGen,
+        selectedAccount.id,
+        retryState.requestId,
+      );
+      if (migrationCap) {
+        retryState.sessionGeneration = migrationCap.generation;
+        retryState.migrationCapability = migrationCap;
+      }
     }
 
-    retryState.attemptedAccountIds.add(token.id);
-    retryState.activeReservation = token.releaseReservation;
-    if (sessionKey && this.accountLeaseService.getSessionBinding) {
-      retryState.sessionGeneration =
-        this.accountLeaseService.getSessionBinding(sessionKey)?.generation ?? 1;
-    }
-    if (this.accountLeaseService.getBreakerGeneration) {
-      retryState.breakerGeneration = this.accountLeaseService.getBreakerGeneration(token.id);
-    }
-    return token;
+    return selectedAccount;
   }
 
   async waitBeforeRetry(
@@ -153,24 +203,29 @@ export class ProxyRetryPolicy {
     sessionKey?: string,
     expectedGeneration?: number,
     expectedBreakerGeneration?: number,
-  ): void {
+    ownerRequestId?: string,
+  ): boolean {
+    let sessionConfirmed = true;
     if (sessionKey) {
       if (typeof this.accountLeaseService.confirmOrBindSession === 'function') {
-        this.accountLeaseService.confirmOrBindSession(
+        sessionConfirmed = this.accountLeaseService.confirmOrBindSession(
           sessionKey,
           accountId,
           expectedGeneration,
+          ownerRequestId,
         );
       } else if (this.accountLeaseService.bindSession) {
         if (expectedGeneration !== undefined) {
-          this.accountLeaseService.bindSession(sessionKey, accountId, undefined, expectedGeneration);
+          sessionConfirmed =
+            this.accountLeaseService.bindSession(sessionKey, accountId, undefined, expectedGeneration) !==
+            false;
         } else {
-          this.accountLeaseService.bindSession(sessionKey, accountId);
+          sessionConfirmed = this.accountLeaseService.bindSession(sessionKey, accountId) !== false;
         }
       }
     }
     if (!model) {
-      return;
+      return sessionConfirmed;
     }
 
     if (expectedBreakerGeneration !== undefined) {
@@ -184,6 +239,7 @@ export class ProxyRetryPolicy {
     if (expectedBreakerGeneration === undefined || currentBreaker === expectedBreakerGeneration) {
       proxyModelAvailabilityStore.clearModel(accountId, model);
     }
+    return sessionConfirmed;
   }
 
   async applyUpstreamPenalty(
@@ -195,6 +251,17 @@ export class ProxyRetryPolicy {
     retryState?.activeReservation?.();
     if (retryState) {
       retryState.activeReservation = undefined;
+    }
+    if (
+      retryState?.migrationCapability &&
+      typeof this.accountLeaseService.failSessionMigrationCandidate === 'function'
+    ) {
+      this.accountLeaseService.failSessionMigrationCandidate(
+        retryState.migrationCapability.sessionKey,
+        retryState.sessionGeneration ?? retryState.migrationCapability.generation,
+        accountId,
+        retryState.requestId,
+      );
     }
     this.accountLeaseService.recordParityError();
 
