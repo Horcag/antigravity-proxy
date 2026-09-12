@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import tls from 'node:tls';
 import { getCaCertPath, getCaKeyPath, getCertsDir } from '../../../../shared/paths';
@@ -153,7 +154,65 @@ export class CaManager {
     );
     logger.info(`Merged trust bundle ready at: ${trustBundlePath}`);
 
+    this.ensureAgyLauncher();
+
     return this.secureContext;
+  }
+
+  static ensureAgyLauncher(): void {
+    const homeDir = os.homedir();
+    const agyPath = path.join(homeDir, '.local', 'bin', 'agy');
+    const agyBinPath = path.join(homeDir, '.local', 'bin', 'agy.bin');
+
+    try {
+      if (!fs.existsSync(agyPath) && !fs.existsSync(agyBinPath)) {
+        return;
+      }
+
+      let shouldRewrap = false;
+      if (fs.existsSync(agyPath)) {
+        const buffer = Buffer.alloc(4);
+        const fd = fs.openSync(agyPath, 'r');
+        fs.readSync(fd, buffer, 0, 4, 0);
+        fs.closeSync(fd);
+
+        // Check if agy is an ELF binary (magic: 0x7f, 'E', 'L', 'F')
+        if (buffer[0] === 0x7f && buffer[1] === 0x45 && buffer[2] === 0x4c && buffer[3] === 0x46) {
+          logger.info('[CaManager] Detected ELF binary at agy path; moving to agy.bin and restoring failover wrapper');
+          fs.renameSync(agyPath, agyBinPath);
+          shouldRewrap = true;
+        }
+      } else if (fs.existsSync(agyBinPath)) {
+        shouldRewrap = true;
+      }
+
+      if (shouldRewrap) {
+        const wrapperScript = `#!/usr/bin/env bash
+# Managed Antigravity CLI Launcher with Transparent HTTPS Proxy Failover
+
+PROXY_PORT="\${AG_PROXY_PORT:-8046}"
+PROXY_URL="\${HTTPS_PROXY:-http://127.0.0.1:\${PROXY_PORT}}"
+TRUST_BUNDLE="\${SSL_CERT_FILE:-${homeDir}/.antigravity-proxy/certs/agy-trust.pem}"
+
+if [[ ! -f "$TRUST_BUNDLE" ]]; then
+  TRUST_BUNDLE="${homeDir}/.antigravity-proxy/certs/ca.crt"
+fi
+
+export HTTPS_PROXY="$PROXY_URL"
+export https_proxy="$PROXY_URL"
+export NO_PROXY="localhost,127.0.0.1,::1"
+export no_proxy="localhost,127.0.0.1,::1"
+export SSL_CERT_FILE="$TRUST_BUNDLE"
+export AGY_CLI_DISABLE_AUTO_UPDATE="true"
+
+exec "${agyBinPath}" "$@"
+`;
+        fs.writeFileSync(agyPath, wrapperScript, { encoding: 'utf-8', mode: 0o755 });
+        logger.info(`[CaManager] Restored failover launcher at ${agyPath}`);
+      }
+    } catch (err) {
+      logger.warn('[CaManager] Failed to ensure agy launcher wrapper', err);
+    }
   }
 
   static getTrustBundlePath(): string {
