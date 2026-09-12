@@ -193,38 +193,20 @@ export class ProxyService {
     expectedBreakerGeneration?: number,
     ownerRequestId?: string,
     tableIncarnation?: number,
+    retryState?: ProxyTokenRetryState,
   ): StreamHealthLifecycle {
     let hasMarkedSuccess = false;
     let hasRecordedFailure = false;
     let hasCleanedUp = false;
-    let renewalTimer: NodeJS.Timeout | null = null;
-
-    if (sessionKey && sessionGeneration !== undefined && ownerRequestId) {
-      renewalTimer = setInterval(() => {
-        try {
-          this.accountLeaseService.renewSessionMigration?.(
-            sessionKey,
-            sessionGeneration,
-            ownerRequestId,
-            30000,
-            tableIncarnation,
-          );
-        } catch {
-          // ignore renewal errors during active streaming
-        }
-      }, 15000);
-      renewalTimer.unref?.();
-    }
 
     const cleanup = (): void => {
-      if (renewalTimer) {
-        clearInterval(renewalTimer);
-        renewalTimer = null;
-      }
       if (hasCleanedUp) {
         return;
       }
       hasCleanedUp = true;
+      if (retryState) {
+        this.retryPolicy.stopMigrationRenewal(retryState);
+      }
       releaseReservation?.();
     };
 
@@ -241,14 +223,14 @@ export class ProxyService {
           expectedBreakerGeneration,
           ownerRequestId,
           tableIncarnation,
+          retryState,
         );
         if (commitResult.kind === 'rejected') {
           return false;
         }
         hasMarkedSuccess = true;
-        if (renewalTimer) {
-          clearInterval(renewalTimer);
-          renewalTimer = null;
+        if (retryState) {
+          this.retryPolicy.stopMigrationRenewal(retryState);
         }
         this.accountLeaseService.recordPerformanceSuccess?.(
           accountId,
@@ -290,6 +272,7 @@ export class ProxyService {
       retryState?.breakerGeneration,
       retryState?.requestId,
       retryState?.tableIncarnation,
+      retryState,
     );
     this.accountLeaseService.recordPerformanceSuccess?.(accountId, model);
     return commitResult;
@@ -353,8 +336,8 @@ export class ProxyService {
       });
   }
 
-  private createTokenRetryState(): ProxyTokenRetryState {
-    return this.retryPolicy.createTokenRetryState();
+  private createTokenRetryState(signal?: AbortSignal): ProxyTokenRetryState {
+    return this.retryPolicy.createTokenRetryState(signal);
   }
 
   private async selectRetryToken(
@@ -466,6 +449,7 @@ export class ProxyService {
             retryState.breakerGeneration,
             retryState.requestId,
             retryState.tableIncarnation,
+            retryState,
           );
           retryState.activeReservation = undefined;
           return this.processAnthropicInternalStream(
@@ -518,6 +502,7 @@ export class ProxyService {
               downgradedSignatureContext,
             );
             this.applyInternalGenerationConstraints(downgradedBody, 'gemini-3-flash', token.id);
+
             if (request.stream) {
               const { result: stream, startedAt } = await this.executeUpstreamAttempt(
                 token.id,
@@ -540,6 +525,7 @@ export class ProxyService {
                 retryState.breakerGeneration,
                 retryState.requestId,
                 retryState.tableIncarnation,
+                retryState,
               );
               retryState.activeReservation = undefined;
               return this.processAnthropicInternalStream(
@@ -940,6 +926,8 @@ export class ProxyService {
           retryState.sessionGeneration,
           retryState.breakerGeneration,
           retryState.requestId,
+          retryState.tableIncarnation,
+          retryState,
         );
         retryState.activeReservation = undefined;
         return this.passthroughSseStream(
@@ -1345,6 +1333,7 @@ export class ProxyService {
               retryState.breakerGeneration,
               retryState.requestId,
               retryState.tableIncarnation,
+              retryState,
             );
             retryState.activeReservation = undefined;
             return this.createOpenAIProtocolStream(

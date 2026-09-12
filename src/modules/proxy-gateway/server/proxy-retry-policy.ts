@@ -21,6 +21,7 @@ export interface ProxyTokenRetryState {
   tableIncarnation?: number;
   breakerGeneration?: number;
   migrationCapability?: MigrationCapability;
+  migrationRenewalTimer?: NodeJS.Timeout;
 }
 
 export interface ProxyRetryAccountLeaseService {
@@ -49,13 +50,14 @@ export interface ProxyRetryAccountLeaseService {
     account: CloudAccount;
     sessionKey?: string;
     generation: number;
-    tableIncarnation: number;
-    breakerGeneration: number;
+    tableIncarnation?: number;
+    breakerGeneration?: number;
     releaseReservation: () => void;
   } | null>;
-  getBreakerGeneration?(accountId: string): number;
   getTableIncarnation?(): number;
-  markModelSuccess?(accountIdOrEmail: string, model: string, expectedBreakerGeneration?: number): void;
+  getBreakerGeneration?(accountId: string): number | undefined;
+  markModelSuccess?(accountId: string, model: string, breakerGeneration?: number): void;
+  recordPerformanceSuccess?(accountId: string, model: string, latencyMs?: number): void;
   bindSession?(
     sessionKey: string | undefined,
     accountId: string,
@@ -112,11 +114,64 @@ export class ProxyRetryPolicy {
     private readonly logger: ProxyRetryLogger,
   ) {}
 
-  createTokenRetryState(): ProxyTokenRetryState {
-    return {
+  createTokenRetryState(signal?: AbortSignal): ProxyTokenRetryState {
+    const retryState: ProxyTokenRetryState = {
       attemptedAccountIds: new Set<string>(),
       requestId: crypto.randomUUID(),
     };
+    if (signal) {
+      const onAbort = () => {
+        this.stopMigrationRenewal(retryState);
+      };
+      if (signal.aborted) {
+        onAbort();
+      } else {
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    }
+    return retryState;
+  }
+
+  startMigrationRenewal(retryState: ProxyTokenRetryState, sessionKey?: string): void {
+    this.stopMigrationRenewal(retryState);
+    if (!sessionKey || !retryState.migrationCapability) return;
+
+    const migrationCap = retryState.migrationCapability;
+    const renewalIntervalMs = 20000;
+
+    retryState.migrationRenewalTimer = setInterval(() => {
+      if (typeof this.accountLeaseService.renewSessionMigration === 'function') {
+        const expectedGen = retryState.sessionGeneration ?? migrationCap.generation;
+        const renewed = this.accountLeaseService.renewSessionMigration(
+          sessionKey,
+          expectedGen,
+          retryState.requestId,
+          60000,
+          retryState.tableIncarnation,
+        );
+        if (!renewed) {
+          this.logger.warn(
+            `[ProxyRetryPolicy] Migration renewal rejected for session ${sessionKey}; stopping renewal`,
+          );
+          this.stopMigrationRenewal(retryState);
+        }
+      }
+    }, renewalIntervalMs);
+    retryState.migrationRenewalTimer.unref?.();
+  }
+
+  stopMigrationRenewal(retryState?: ProxyTokenRetryState): void {
+    if (retryState?.migrationRenewalTimer) {
+      clearInterval(retryState.migrationRenewalTimer);
+      retryState.migrationRenewalTimer = undefined;
+    }
+  }
+
+  disposeTokenRetryState(retryState?: ProxyTokenRetryState): void {
+    if (!retryState) return;
+    this.stopMigrationRenewal(retryState);
+    retryState.activeReservation?.();
+    retryState.activeReservation = undefined;
   }
 
   async selectRetryToken(
@@ -209,6 +264,7 @@ export class ProxyRetryPolicy {
         retryState.sessionGeneration = migrationCap.generation;
         retryState.tableIncarnation = migrationCap.tableIncarnation;
         retryState.migrationCapability = migrationCap;
+        this.startMigrationRenewal(retryState, sessionKey);
       }
     }
 
@@ -246,7 +302,11 @@ export class ProxyRetryPolicy {
     expectedBreakerGeneration?: number,
     ownerRequestId?: string,
     expectedIncarnation?: number,
+    retryState?: ProxyTokenRetryState,
   ): AffinityCommitResult {
+    if (retryState) {
+      this.stopMigrationRenewal(retryState);
+    }
     let commitResult: AffinityCommitResult = { kind: 'not-applicable' };
     if (sessionKey) {
       if (typeof this.accountLeaseService.confirmOrBindSession === 'function') {
@@ -305,6 +365,9 @@ export class ProxyRetryPolicy {
     error: unknown,
     retryState?: ProxyTokenRetryState,
   ): Promise<boolean> {
+    if (retryState) {
+      this.stopMigrationRenewal(retryState);
+    }
     retryState?.activeReservation?.();
     if (retryState) {
       retryState.activeReservation = undefined;

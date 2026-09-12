@@ -854,7 +854,30 @@ restore_migration_unit_state() {
     backup_quarantine_path="$owned_quarantine_path"
     backup_quarantine_dir="$owned_quarantine_dir"
   fi
-  if ! quarantine_owned_path "$unit_fs" "$migration_unit_published_identity" file "migration system unit"; then
+  local q_unit_status=0
+  quarantine_owned_path "$unit_fs" "$migration_unit_published_identity" file "migration system unit" || q_unit_status=$?
+  if [ "$q_unit_status" -ne 0 ]; then
+    if [ "$q_unit_status" -eq 2 ]; then
+      if [ "$migration_unit_had_file" = 0 ]; then
+        migration_unit_backup_fs=''
+        migration_unit_backup_identity=''
+        migration_unit_published_identity=''
+        migration_unit_rename_completed=0
+        return 0
+      fi
+      if ! mv -Tn -- "$backup_quarantine_path" "$unit_fs" || { [ -e "$backup_quarantine_path" ] || [ -L "$backup_quarantine_path" ]; }; then
+        rm -rf -- "$backup_quarantine_dir" 2>/dev/null || true
+        printf '%s\n' "Refusing to restore migration system unit without overwriting a concurrent replacement: $unit_fs" >&2
+        return 1
+      fi
+      rmdir -- "$backup_quarantine_dir" 2>/dev/null || true
+      fsync_directory "$(dirname "$unit_fs")"
+      migration_unit_backup_fs=''
+      migration_unit_backup_identity=''
+      migration_unit_published_identity=''
+      migration_unit_rename_completed=0
+      return 0
+    fi
     printf '%s\n' "Refusing to restore over substituted migration system unit: $unit_fs" >&2
     return 1
   fi
@@ -897,7 +920,28 @@ restore_migration_wants_state() {
     backup_quarantine_path="$owned_quarantine_path"
     backup_quarantine_dir="$owned_quarantine_dir"
   fi
-  if ! quarantine_owned_path "$migration_wants_fs" "$migration_wants_published_identity" link "migration system wants entry"; then
+  local q_wants_status=0
+  quarantine_owned_path "$migration_wants_fs" "$migration_wants_published_identity" link "migration system wants entry" || q_wants_status=$?
+  if [ "$q_wants_status" -ne 0 ]; then
+    if [ "$q_wants_status" -eq 2 ]; then
+      if [ "$migration_wants_had_entry" = 0 ]; then
+        migration_wants_published_identity=''
+        migration_wants_backup_fs=''
+        migration_wants_backup_identity=''
+        return 0
+      fi
+      if ! mv -Tn -- "$backup_quarantine_path" "$migration_wants_fs" || { [ -e "$backup_quarantine_path" ] || [ -L "$backup_quarantine_path" ]; }; then
+        rm -rf -- "$backup_quarantine_dir" 2>/dev/null || true
+        printf '%s\n' "Refusing to restore migration system wants entry without overwriting a concurrent replacement: $migration_wants_fs" >&2
+        return 1
+      fi
+      rmdir -- "$backup_quarantine_dir" 2>/dev/null || true
+      fsync_directory "$(dirname "$migration_wants_fs")"
+      migration_wants_published_identity=''
+      migration_wants_backup_fs=''
+      migration_wants_backup_identity=''
+      return 0
+    fi
     printf '%s\n' "Refusing to restore substituted migration system wants entry: $migration_wants_fs" >&2
     return 1
   fi
@@ -921,7 +965,14 @@ restore_migration_wants_state() {
 }
 
 migration_wants_rollback_is_safe() {
-  [ -z "$migration_wants_published_identity" ] || matches_publication_identity "$migration_wants_fs" "$migration_wants_published_identity"
+  if [ -z "$migration_wants_published_identity" ]; then
+    return 0
+  fi
+  if ! matches_publication_identity "$migration_wants_fs" "$migration_wants_published_identity"; then
+    printf '%s\n' "Refusing to restore substituted migration system wants entry: $migration_wants_fs" >&2
+    return 1
+  fi
+  return 0
 }
 
 complete_migration_unit_rollback() {

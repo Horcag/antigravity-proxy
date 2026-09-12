@@ -3,9 +3,11 @@ import { CloudCodeFailoverGateway } from '../../modules/proxy-gateway/server/clo
 import { AccountLeaseService } from '../../modules/proxy-gateway/server/account-lease.service';
 import { ConnectIngressService } from '../../modules/proxy-gateway/server/connect-ingress.service';
 import { ProxyRetryPolicy } from '../../modules/proxy-gateway/server/proxy-retry-policy';
+import { ProxyConfigSchema } from '../../modules/config/types';
 import { EventEmitter } from 'node:events';
 import { Readable, PassThrough } from 'node:stream';
 import * as zlib from 'node:zlib';
+import { randomBytes } from 'node:crypto';
 import type { CloudAccount } from '../../modules/cloud-account/types';
 
 function createMockStream(chunks: Array<string | Buffer> = ['{"candidates":[]}']): any {
@@ -46,17 +48,27 @@ function createMockResponse(): any {
   res.statusCode = 200;
   res.headersSent = false;
   res.writableEnded = false;
+  const writtenChunks: Buffer[] = [];
+  res.writtenChunks = writtenChunks;
   res.writeHead = vi.fn((statusCode, headers) => {
     res.statusCode = statusCode;
     res.headers = headers;
     res.headersSent = true;
   });
-  res.end = vi.fn(() => {
+  res.end = vi.fn((chunk?: any) => {
+    if (chunk) {
+      writtenChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
     res.writableEnded = true;
     res.emit('finish');
     res.emit('close');
   });
-  res.write = vi.fn(() => true);
+  res.write = vi.fn((chunk: any) => {
+    if (chunk) {
+      writtenChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return true;
+  });
   return res;
 }
 
@@ -929,5 +941,298 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     );
     expect(renewedAfterConfirm).toBe(false);
   });
+
+  // T16-F01 Probe C01: Boundary chunk crossing 64KB inspection budget forwards 100% of consumed bytes without data loss
+  it('T16-F01: Boundary chunk crossing 64KB inspection budget forwards 100% of consumed bytes without data loss', async () => {
+    const sessionKey = 'session:relay-budget-cross';
+    leaseService.bindSession(sessionKey, 'acc-1');
+
+    // Create a valid JSON body > 64KB (e.g. 80KB)
+    const filler = 'X'.repeat(79900);
+    const fullBodyStr = JSON.stringify({ candidates: [{ content: { parts: [{ text: filler }] } }] });
+    const fullBodyBuf = Buffer.from(fullBodyStr, 'utf-8');
+    expect(fullBodyBuf.length).toBeGreaterThan(65536);
+
+    // Split into chunk1 (40KB) and chunk2 (rest, ~40KB).
+    // chunk1 + chunk2 crosses the 64KB inspection budget during chunk2!
+    const chunk1 = fullBodyBuf.subarray(0, 40000);
+    const chunk2 = fullBodyBuf.subarray(40000);
+
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async () => {
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'application/json' },
+        bodyStream: createMockStream([chunk1, chunk2]),
+        bufferedBody: fullBodyBuf,
+      };
+    });
+
+    const req = createMockRequest({
+      headers: {
+        host: 'daily-cloudcode-pa.googleapis.com',
+        'x-session-id': 'relay-budget-cross',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+    });
+    const res = createMockResponse();
+
+    await gateway.handleRequest(req, res);
+
+    expect(res.writeHead).toHaveBeenCalledWith(200, expect.any(Object));
+    const receivedBody = Buffer.concat(res.writtenChunks);
+    expect(receivedBody.length).toBe(fullBodyBuf.length);
+    expect(receivedBody.equals(fullBodyBuf)).toBe(true);
+  });
+
+  // T16-F01: Chunk partition invariance verifies byte-for-byte identical client forwarding
+  it('T16-F01: Chunk partition invariance verifies byte-for-byte identical client forwarding', async () => {
+    const sessionKey = 'session:chunk-invariance';
+    leaseService.bindSession(sessionKey, 'acc-1');
+
+    const filler = 'Y'.repeat(80000);
+    const fullBodyStr = JSON.stringify({ candidates: [{ content: { parts: [{ text: filler }] } }] });
+    const fullBodyBuf = Buffer.from(fullBodyStr, 'utf-8');
+
+    async function runWithChunks(chunks: Buffer[]): Promise<Buffer> {
+      vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async () => {
+        return {
+          statusCode: 200,
+          headers: { 'content-type': 'application/json' },
+          bodyStream: createMockStream(chunks),
+          bufferedBody: fullBodyBuf,
+        };
+      });
+
+      const req = createMockRequest({
+        headers: {
+          host: 'daily-cloudcode-pa.googleapis.com',
+          'x-session-id': 'chunk-invariance',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+      });
+      const res = createMockResponse();
+      await gateway.handleRequest(req, res);
+      return Buffer.concat(res.writtenChunks);
+    }
+
+    // Partition 1: 1KB chunks
+    const chunks1KB: Buffer[] = [];
+    for (let i = 0; i < fullBodyBuf.length; i += 1024) {
+      chunks1KB.push(fullBodyBuf.subarray(i, i + 1024));
+    }
+    const result1KB = await runWithChunks(chunks1KB);
+
+    // Partition 2: 16KB chunks
+    const chunks16KB: Buffer[] = [];
+    for (let i = 0; i < fullBodyBuf.length; i += 16384) {
+      chunks16KB.push(fullBodyBuf.subarray(i, i + 16384));
+    }
+    const result16KB = await runWithChunks(chunks16KB);
+
+    // Partition 3: Boundary-crossing (48KB + remainder)
+    const chunksBoundary = [fullBodyBuf.subarray(0, 48000), fullBodyBuf.subarray(48000)];
+    const resultBoundary = await runWithChunks(chunksBoundary);
+
+    expect(result1KB.equals(fullBodyBuf)).toBe(true);
+    expect(result16KB.equals(fullBodyBuf)).toBe(true);
+    expect(resultBoundary.equals(fullBodyBuf)).toBe(true);
+    expect(result1KB.equals(resultBoundary)).toBe(true);
+  });
+
+  // T16-F01 Probe C02: Encoded gzip reaching raw budget flushes decompressor and validates response without premature 502
+  it('T16-F01 Probe C02: Encoded gzip reaching raw budget flushes decompressor and validates response without premature 502', async () => {
+    const sessionKey = 'session:gzip-flush-test';
+    leaseService.bindSession(sessionKey, 'acc-1');
+
+    const event = `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Hello from SSE' }] } }] })}\n\n`;
+    const randomPadding = randomBytes(70000).toString('base64');
+    const fullSse = event + `: keepalive ${randomPadding}\n\n`;
+    const gzipped = zlib.gzipSync(Buffer.from(fullSse, 'utf-8'));
+    expect(gzipped.length).toBeGreaterThan(65536);
+
+    const compressedChunks: Buffer[] = [];
+    const chunkSize = 16384;
+    for (let i = 0; i < gzipped.length; i += chunkSize) {
+      compressedChunks.push(gzipped.subarray(i, i + chunkSize));
+    }
+
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async () => {
+      return {
+        statusCode: 200,
+        headers: {
+          'content-type': 'text/event-stream',
+          'content-encoding': 'gzip',
+        },
+        bodyStream: createMockStream(compressedChunks),
+        bufferedBody: gzipped,
+      };
+    });
+
+    const req = createMockRequest({
+      headers: {
+        host: 'daily-cloudcode-pa.googleapis.com',
+        'x-session-id': 'gzip-flush-test',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }),
+    });
+    const res = createMockResponse();
+
+    await gateway.handleRequest(req, res);
+
+    expect(res.writeHead).toHaveBeenCalledWith(200, expect.any(Object));
+    expect(res.statusCode).toBe(200);
+    const receivedCompressed = Buffer.concat(res.writtenChunks);
+    expect(receivedCompressed.length).toBeGreaterThan(0);
+    const decompressed = zlib.gunzipSync(receivedCompressed);
+    expect(decompressed.toString('utf-8')).toContain('Hello from SSE');
+  });
+
+  // T16-F02 Probe C03: Abort while hydration is pending behind barrier settles acquisition immediately to null before barrier release
+  it('T16-F02 Probe C03: Abort while hydration is pending behind barrier settles acquisition immediately to null before barrier release', async () => {
+    const abortController = new AbortController();
+    let barrierReleased = false;
+    let finalizeSettled = false;
+
+    let resolveBarrier!: () => void;
+    const barrierPromise = new Promise<void>((resolve) => {
+      resolveBarrier = () => {
+        barrierReleased = true;
+        resolve();
+      };
+    });
+
+    vi.spyOn(leaseService as any, 'finalizeSelectedToken').mockImplementation(async () => {
+      await barrierPromise;
+      return null;
+    });
+
+    const acquirePromise = leaseService.acquireAttemptLease({
+      signal: abortController.signal,
+    }).then((res) => {
+      finalizeSettled = true;
+      return res;
+    });
+
+    // Before barrier releases, trigger abort
+    abortController.abort();
+
+    const lease = await acquirePromise;
+    expect(finalizeSettled).toBe(true);
+    expect(barrierReleased).toBe(false);
+    expect(lease).toBeNull();
+
+    resolveBarrier();
+  });
+
+  // T16-F03 Probe C04: ProxyRetryPolicy starts migration renewal upon capability issuance and sustains capability beyond 60s
+  it('T16-F03 Probe C04: ProxyRetryPolicy starts migration renewal upon capability issuance and sustains capability beyond 60s', async () => {
+    vi.useFakeTimers();
+    try {
+      const policy = new ProxyRetryPolicy(leaseService as any, { log: () => {}, warn: () => {} });
+      const sessionKey = 'session:migration-sustain-test';
+      leaseService.bindSession(sessionKey, 'acc-1');
+
+      const abortController = new AbortController();
+      const retryState = policy.createTokenRetryState(abortController.signal);
+      retryState.attemptedAccountIds.add('acc-1');
+
+      const selectedAccount = await policy.selectRetryToken(
+        retryState,
+        'gemini-2.5-pro',
+        sessionKey,
+      );
+
+      expect(selectedAccount).not.toBeNull();
+      expect(selectedAccount?.id).toBe('acc-2');
+      expect(retryState.migrationCapability).toBeDefined();
+      expect(retryState.migrationRenewalTimer).toBeDefined();
+
+      // Advance time by 75 seconds (beyond default 60s lease)
+      await vi.advanceTimersByTimeAsync(75000);
+
+      const binding = leaseService.getSessionBinding(sessionKey);
+      expect(binding).not.toBeNull();
+      expect(binding?.state).toBe('migrating');
+      expect(binding?.migratingToAccountId).toBe('acc-2');
+
+      policy.markUpstreamSuccess(
+        selectedAccount!.id,
+        'gemini-2.5-pro',
+        sessionKey,
+        retryState.sessionGeneration,
+        retryState.breakerGeneration,
+        retryState.requestId,
+        retryState.tableIncarnation,
+        retryState,
+      );
+
+      expect(retryState.migrationRenewalTimer).toBeUndefined();
+      const confirmedBinding = leaseService.getSessionBinding(sessionKey);
+      expect(confirmedBinding?.state).toBe('active');
+      expect(confirmedBinding?.accountId).toBe('acc-2');
+
+      policy.disposeTokenRetryState(retryState);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Config Normalization: Explicit null in legacy config fields normalizes to default values
+  it('Config Normalization: Explicit null in legacy config fields normalizes to default values', () => {
+    const legacyNullConfig = {
+      enabled: null,
+      host: null,
+      port: null,
+      api_key: null,
+      admin_api_key: null,
+      auto_start: null,
+      backend_canary_enabled: null,
+      parity_enabled: null,
+      parity_shadow_enabled: null,
+      parity_kill_switch: null,
+      parity_no_go_mismatch_rate: null,
+      parity_no_go_error_rate: null,
+      scheduling_mode: null,
+      max_concurrency_per_account: null,
+      max_wait_seconds: null,
+      preferred_account_id: null,
+      circuit_breaker_enabled: null,
+      circuit_breaker_backoff_steps: null,
+      custom_mapping: null,
+      anthropic_mapping: null,
+      request_timeout: null,
+      upstream_proxy: null,
+      experimental: null,
+    };
+
+    const parsed = ProxyConfigSchema.parse(legacyNullConfig);
+    expect(parsed.enabled).toBe(true);
+    expect(parsed.host).toBe('127.0.0.1');
+    expect(parsed.port).toBe(8045);
+    expect(parsed.api_key).toBe('');
+    expect(parsed.admin_api_key).toBe('');
+    expect(parsed.auto_start).toBe(true);
+    expect(parsed.backend_canary_enabled).toBe(true);
+    expect(parsed.parity_enabled).toBe(true);
+    expect(parsed.parity_shadow_enabled).toBe(false);
+    expect(parsed.parity_kill_switch).toBe(false);
+    expect(parsed.parity_no_go_mismatch_rate).toBe(0.15);
+    expect(parsed.parity_no_go_error_rate).toBe(0.4);
+    expect(parsed.scheduling_mode).toBe('cache-first');
+    expect(parsed.max_concurrency_per_account).toBe(8);
+    expect(parsed.max_wait_seconds).toBe(2);
+    expect(parsed.preferred_account_id).toBe('');
+    expect(parsed.circuit_breaker_enabled).toBe(true);
+    expect(parsed.circuit_breaker_backoff_steps).toEqual([60, 300, 1800, 7200]);
+    expect(parsed.custom_mapping).toEqual({});
+    expect(parsed.anthropic_mapping).toEqual({});
+    expect(parsed.request_timeout).toBe(120);
+    expect(parsed.upstream_proxy).toEqual({ enabled: false, url: '' });
+    expect(parsed.experimental).toEqual({ enable_cloud_code_meta: false });
+  });
 });
+
 

@@ -739,6 +739,8 @@ export class CloudCodeFailoverGateway {
               });
             };
 
+            let isFlushedAfterRawCap = false;
+
             const evaluateDecision = (streamEnded: boolean) => {
               if (settled) return;
               const inspectionBuffer = streamDecompressor
@@ -764,7 +766,11 @@ export class CloudCodeFailoverGateway {
               }
 
               // Local inspection budget exhausted without qualifying frame:
-              if (totalRawBytes >= inspectionBudget || decompressedBytes >= inspectionBudget) {
+              const isBudgetExhausted = streamDecompressor
+                ? (decompressedBytes >= inspectionBudget || (totalRawBytes >= inspectionBudget && isFlushedAfterRawCap))
+                : (totalRawBytes >= inspectionBudget);
+
+              if (isBudgetExhausted) {
                 settled = true;
                 cleanup();
                 bodyStream.pause();
@@ -781,18 +787,12 @@ export class CloudCodeFailoverGateway {
               streamDecompressor.on('data', (dChunk: Buffer) => {
                 if (settled) return;
                 const buf = Buffer.isBuffer(dChunk) ? dChunk : Buffer.from(dChunk);
-                if (decompressedBytes + buf.length > inspectionBudget) {
-                  const remaining = Math.max(0, inspectionBudget - decompressedBytes);
-                  if (remaining > 0) {
-                    const slice = buf.subarray(0, remaining);
-                    decompressedChunks.push(slice);
-                    decompressedBytes += slice.length;
-                  }
-                  evaluateDecision(false);
-                  return;
+                if (decompressedBytes < inspectionBudget) {
+                  const remaining = inspectionBudget - decompressedBytes;
+                  const slice = buf.length > remaining ? buf.subarray(0, remaining) : buf;
+                  decompressedChunks.push(slice);
+                  decompressedBytes += slice.length;
                 }
-                decompressedChunks.push(buf);
-                decompressedBytes += buf.length;
                 evaluateDecision(false);
               });
 
@@ -805,27 +805,14 @@ export class CloudCodeFailoverGateway {
               if (settled) return;
               const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
 
-              if (totalRawBytes + buf.length > inspectionBudget) {
-                const remaining = Math.max(0, inspectionBudget - totalRawBytes);
-                if (remaining > 0) {
-                  const slice = buf.subarray(0, remaining);
-                  chunks.push(slice);
-                  totalRawBytes += slice.length;
-                  if (streamDecompressor) {
-                    try {
-                      streamDecompressor.write(slice);
-                    } catch (err) {
-                      handleDecompressorError(err);
-                      return;
-                    }
-                  }
-                }
-                evaluateDecision(false);
-                return;
-              }
-
+              // T16-F01: Preserve every consumed byte that may later be forwarded.
+              // Never slice or drop suffix bytes of boundary-crossing transport chunks.
               chunks.push(buf);
               totalRawBytes += buf.length;
+
+              if (totalRawBytes >= inspectionBudget) {
+                bodyStream.pause();
+              }
 
               if (streamDecompressor) {
                 try {
@@ -834,7 +821,7 @@ export class CloudCodeFailoverGateway {
                     bodyStream.pause();
                     const onDrain = () => {
                       streamDecompressor?.removeListener('drain', onDrain);
-                      if (!settled) {
+                      if (!settled && totalRawBytes < inspectionBudget) {
                         bodyStream.resume();
                       }
                     };
@@ -844,7 +831,21 @@ export class CloudCodeFailoverGateway {
                   handleDecompressorError(err);
                   return;
                 }
-                evaluateDecision(false);
+
+                if (totalRawBytes >= inspectionBudget) {
+                  // Give asynchronous decompressor an opportunity to process already-admitted input
+                  try {
+                    streamDecompressor.flush(() => {
+                      if (!settled) {
+                        isFlushedAfterRawCap = true;
+                        evaluateDecision(false);
+                      }
+                    });
+                  } catch {
+                    isFlushedAfterRawCap = true;
+                    evaluateDecision(false);
+                  }
+                }
               } else {
                 evaluateDecision(false);
               }

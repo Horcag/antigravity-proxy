@@ -623,23 +623,30 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         return null;
       }
 
-      const onAbort = () => {
-        releaseReservationOnce();
-      };
-      options?.signal?.addEventListener('abort', onAbort, { once: true });
+      let onAbort: (() => void) | undefined;
+      const abortPromise = new Promise<null>((resolve) => {
+        onAbort = () => {
+          releaseReservationOnce();
+          resolve(null);
+        };
+        options?.signal?.addEventListener('abort', onAbort, { once: true });
+      });
 
       // Hydration and post-hydration revalidation occur outside the critical section
       let finalized: CloudAccount | null = null;
       try {
-        finalized = await this.finalizeSelectedToken(
+        const hydrationPromise = this.finalizeSelectedToken(
           accountId,
           tokenData,
           nowSeconds,
           sessionKey,
           options?.deferSessionBinding,
         );
+        hydrationPromise.catch(() => {});
 
-        if (options?.signal?.aborted) {
+        finalized = await Promise.race([hydrationPromise, abortPromise]);
+
+        if (options?.signal?.aborted || !finalized) {
           releaseReservationOnce();
           return null;
         }
@@ -680,7 +687,9 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         releaseReservationOnce();
         throw err;
       } finally {
-        options?.signal?.removeEventListener('abort', onAbort);
+        if (onAbort) {
+          options?.signal?.removeEventListener('abort', onAbort);
+        }
       }
 
       const idempotentRelease = () => {
