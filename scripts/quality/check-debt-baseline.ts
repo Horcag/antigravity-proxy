@@ -1,5 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import ts from 'typescript';
 
 const projectRoot = process.cwd();
 const eslintConfigPath = path.join(projectRoot, 'eslint.config.mjs');
@@ -12,7 +13,6 @@ const ignoredDirectories = new Set([
 ]);
 
 const sourceFilePattern = /\.(?:js|jsx|ts|tsx|mjs|cjs)$/u;
-const debtRules = new Set(['complexity', 'max-lines', 'max-params']);
 
 // Excluded files (the validator itself)
 const ignoredFiles = new Set<string>([
@@ -34,6 +34,10 @@ function checkEslintConfig(): string[] {
 
   if (disabledDebtRulePattern.test(eslintConfig)) {
     violations.push('eslint.config.mjs contains globally disabled architecture debt rules (complexity, max-lines, max-params)');
+  }
+
+  if (!eslintConfig.includes('noInlineConfig: true')) {
+    violations.push('eslint.config.mjs must enforce linterOptions.noInlineConfig: true');
   }
 
   return violations;
@@ -65,19 +69,17 @@ export interface ExtractedComment {
 
 export function extractCommentsFromContent(content: string): ExtractedComment[] {
   const comments: ExtractedComment[] = [];
-  // Tokenize comments vs string literals to prevent matching comments inside strings
-  const re = /(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`)|(\/\/[^\r\n]*)|(\/\*[\s\S]*?\*\/)/g;
-  let match: RegExpExecArray | null;
-
-  while ((match = re.exec(content)) !== null) {
-    if (match[1] || match[2]) {
-      const text = match[1] || match[2];
-      const type = match[1] ? 'line' : 'block';
-      const offset = match.index;
-      // Calculate 1-based line number from character offset
+  const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, ts.LanguageVariant.Standard, content);
+  let token = scanner.scan();
+  while (token !== ts.SyntaxKind.EndOfFileToken) {
+    if (token === ts.SyntaxKind.SingleLineCommentTrivia || token === ts.SyntaxKind.MultiLineCommentTrivia) {
+      const text = scanner.getTokenText();
+      const type = token === ts.SyntaxKind.SingleLineCommentTrivia ? 'line' : 'block';
+      const offset = scanner.getTokenPos();
       const line = content.slice(0, offset).split(/\r?\n/).length;
       comments.push({ type, text, line });
     }
+    token = scanner.scan();
   }
   return comments;
 }
@@ -118,10 +120,10 @@ export function findDebtViolations(): DebtViolation[] {
           });
         }
 
-        // 2. Check eslint-disable directives
-        const disableMatch = /(?:\/\/|\/\*)\s*eslint-disable(?:-next-line|-line)?\s*(.*?)(?:\*\/|$)/u.exec(comment.text);
+        // 2. Check eslint-disable directives (handles single-line and multi-line comments)
+        const disableMatch = /(?:\/\/|\/\*)\s*eslint-disable(?:-next-line|-line)?\s*([\s\S]*?)(?:\*\/|$)/u.exec(comment.text);
         if (disableMatch) {
-          const rest = disableMatch[1];
+          const rest = disableMatch[1].trim();
           if (!rest.includes('--')) {
             violations.push({
               file: relativePath,
@@ -131,7 +133,7 @@ export function findDebtViolations(): DebtViolation[] {
             });
           } else {
             const [rulesPart, ...reasonParts] = rest.split('--');
-            const rules = rulesPart.trim().split(/\s+/).filter(Boolean);
+            const rules = rulesPart.split(/[\s,]+/).map((r) => r.trim()).filter(Boolean);
             const reason = reasonParts.join('--').trim();
 
             // Blanket disable without rule names is forbidden
@@ -144,15 +146,13 @@ export function findDebtViolations(): DebtViolation[] {
               });
             } else {
               for (const rule of rules) {
-                if (debtRules.has(rule)) {
-                  if (!allowedInlineDebtDisableFiles.has(relativePath)) {
-                    violations.push({
-                      file: relativePath,
-                      line: comment.line,
-                      type: 'unapproved-debt-disable',
-                      message: `${relativePath}:${comment.line} Architecture debt disable (${rule}) is not in legacy allowlist`,
-                    });
-                  }
+                if (!allowedInlineDebtDisableFiles.has(relativePath)) {
+                  violations.push({
+                    file: relativePath,
+                    line: comment.line,
+                    type: 'unapproved-debt-disable',
+                    message: `${relativePath}:${comment.line} Rule disable (${rule}) is not in approved allowlist`,
+                  });
                 }
               }
             }

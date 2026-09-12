@@ -18,7 +18,7 @@ export function parseConnectAuthority(destination: string | undefined): ParsedCo
   let hostname = '';
   let port = 0;
 
-  const ipv6Match = /^\[([a-fA-F0-9:]+)\]:([0-9]{1,5})$/.exec(trimmed);
+  const ipv6Match = /^\[([a-fA-F0-9:.%]+)\]:([0-9]{1,5})$/.exec(trimmed);
   if (ipv6Match) {
     hostname = ipv6Match[1].toLowerCase();
     port = Number(ipv6Match[2]);
@@ -30,12 +30,12 @@ export function parseConnectAuthority(destination: string | undefined): ParsedCo
   }
 
   if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
-  if (
+  if (!ipv6Match && (
     hostname.startsWith('.') ||
     hostname.endsWith('.') ||
     hostname.includes('..') ||
     hostname.startsWith('-')
-  ) {
+  )) {
     return null;
   }
   return { hostname, port };
@@ -73,44 +73,97 @@ export function parseIpToUint32(ipStr: string): number | null {
   return null;
 }
 
+function isDisallowedIpv4(uint: number): boolean {
+  const b0 = (uint >>> 24) & 0xff;
+  const b1 = (uint >>> 16) & 0xff;
+  if (b0 === 0 || b0 === 127 || b0 === 10 || b0 >= 224) return true;
+  if (b0 === 172 && b1 >= 16 && b1 <= 31) return true;
+  if (b0 === 192 && b1 === 168) return true;
+  if (b0 === 169 && b1 === 254) return true;
+  if (b0 === 100 && b1 >= 64 && b1 <= 127) return true;
+  return false;
+}
+
+function parseIpv6(ipStr: string): number[] | null {
+  let str = ipStr.trim().toLowerCase();
+  if (str.startsWith('[') && str.endsWith(']')) str = str.slice(1, -1);
+  const zoneIndex = str.indexOf('%');
+  if (zoneIndex !== -1) str = str.slice(0, zoneIndex);
+
+  const lastColon = str.lastIndexOf(':');
+  if (lastColon !== -1) {
+    const potentialIpv4 = str.slice(lastColon + 1);
+    if (potentialIpv4.includes('.')) {
+      const v4Uint = parseIpToUint32(potentialIpv4);
+      if (v4Uint === null) return null;
+      str = str.slice(0, lastColon) + ':' + ((v4Uint >>> 16) & 0xffff).toString(16) + ':' + (v4Uint & 0xffff).toString(16);
+    }
+  }
+
+  const doubleColonCount = (str.match(/::/g) || []).length;
+  if (doubleColonCount > 1) return null;
+
+  let parts: string[];
+  if (doubleColonCount === 1) {
+    const [left, right] = str.split('::');
+    const leftParts = left ? left.split(':') : [];
+    const rightParts = right ? right.split(':') : [];
+    const missing = 8 - (leftParts.length + rightParts.length);
+    if (missing < 1) return null;
+    parts = [...leftParts, ...Array(missing).fill('0'), ...rightParts];
+  } else {
+    parts = str.split(':');
+    if (parts.length !== 8) return null;
+  }
+
+  const words: number[] = [];
+  for (const part of parts) {
+    if (!/^[0-9a-f]{1,4}$/i.test(part)) return null;
+    words.push(parseInt(part, 16));
+  }
+  return words;
+}
+
 export function isDisallowedIp(ip: string): boolean {
   if (!ip) return true;
-  let normalized = ip.toLowerCase();
-  if (normalized.startsWith('::ffff:')) {
-    normalized = normalized.slice(7);
+  let normalized = ip.toLowerCase().trim();
+  if (normalized.startsWith('[') && normalized.endsWith(']')) {
+    normalized = normalized.slice(1, -1);
   }
 
+  // 1. Try IPv4
   const uint = parseIpToUint32(normalized);
-  if (uint !== null) {
-    const b0 = (uint >>> 24) & 0xff;
-    const b1 = (uint >>> 16) & 0xff;
-    // 0.0.0.0/8 (Current network)
-    if (b0 === 0) return true;
-    // 127.0.0.0/8 (Loopback)
-    if (b0 === 127) return true;
-    // 10.0.0.0/8 (RFC 1918 Private)
-    if (b0 === 10) return true;
-    // 172.16.0.0/12 (RFC 1918 Private: 172.16.0.0 - 172.31.255.255)
-    if (b0 === 172 && (b1 >= 16 && b1 <= 31)) return true;
-    // 192.168.0.0/16 (RFC 1918 Private)
-    if (b0 === 192 && b1 === 168) return true;
-    // 169.254.0.0/16 (Link-local / Cloud metadata)
-    if (b0 === 169 && b1 === 254) return true;
-    // 100.64.0.0/10 (Carrier-grade NAT: 100.64.0.0 - 100.127.255.255)
-    if (b0 === 100 && (b1 >= 64 && b1 <= 127)) return true;
-    // 224.0.0.0/4 (Multicast) or 240.0.0.0/4 (Reserved)
-    if (b0 >= 224) return true;
+  if (uint !== null) return isDisallowedIpv4(uint);
+
+  // 2. Try IPv6
+  const words = parseIpv6(normalized);
+  if (words !== null) {
+    // Loopback ::1 (all representations: ::1, 0:0:0:0:0:0:0:1, ::0001, [::1], etc.)
+    if (words.slice(0, 7).every((w) => w === 0) && words[7] === 1) return true;
+    // Unspecified ::
+    if (words.every((w) => w === 0)) return true;
+
+    // IPv4-mapped (::ffff:x.x.x.x) or IPv4-compatible (::x.x.x.x) or NAT64 (64:ff9b::x.x.x.x)
+    if (
+      (words[0] === 0 && words[1] === 0 && words[2] === 0 && words[3] === 0 && words[4] === 0 && words[5] === 0xffff) ||
+      (words[0] === 0 && words[1] === 0 && words[2] === 0 && words[3] === 0 && words[4] === 0 && words[5] === 0) ||
+      (words[0] === 0x64 && words[1] === 0xff9b && words[2] === 0 && words[3] === 0 && words[4] === 0 && words[5] === 0)
+    ) {
+      const v4Uint = ((words[6] << 16) | words[7]) >>> 0;
+      return isDisallowedIpv4(v4Uint);
+    }
+
+    // ULA fc00::/7 (fc.. or fd..)
+    if ((words[0] & 0xfe00) === 0xfc00) return true;
+    // Link-local fe80::/10 (fe8.. to feb..)
+    if ((words[0] & 0xffc0) === 0xfe80) return true;
+    // Multicast ff00::/8
+    if ((words[0] & 0xff00) === 0xff00) return true;
+    // Discard prefix 100::/64
+    if (words[0] === 0x0100 && words[1] === 0 && words[2] === 0 && words[3] === 0) return true;
+
     return false;
   }
-
-  // IPv6 checks
-  if (normalized === '::1' || normalized === '::') return true;
-  // Unique Local Address fc00::/7 (fc.. or fd..)
-  if (/^f[cd][0-9a-f]{2}:/i.test(normalized)) return true;
-  // Link-local fe80::/10 (fe8.., fe9.., fea.., feb..)
-  if (/^fe[89ab][0-9a-f]:/i.test(normalized)) return true;
-  // Multicast ff00::/8
-  if (/^ff[0-9a-f]{2}:/i.test(normalized)) return true;
 
   return false;
 }
@@ -119,6 +172,22 @@ export function isSelfOrLoopback(hostname: string): boolean {
   const h = hostname.toLowerCase();
   if (h === 'localhost') return true;
   return isDisallowedIp(h);
+}
+
+export function isLocalPeer(remoteAddress: string | undefined): boolean {
+  if (!remoteAddress) return false;
+  let normalized = remoteAddress.toLowerCase().trim();
+  if (normalized.startsWith('[') && normalized.endsWith(']')) normalized = normalized.slice(1, -1);
+  if (normalized === '127.0.0.1' || normalized === '::1' || normalized === 'localhost') return true;
+  const uint = parseIpToUint32(normalized);
+  if (uint !== null) return ((uint >>> 24) & 0xff) === 127;
+  const words = parseIpv6(normalized);
+  if (!words) return false;
+  if (words.slice(0, 7).every((w) => w === 0) && words[7] === 1) return true;
+  if (words.slice(0, 5).every((w) => w === 0) && words[5] === 0xffff) {
+    return ((((words[6] << 16) | words[7]) >>> 24) & 0xff) === 127;
+  }
+  return false;
 }
 
 export class ConnectIngressService {
@@ -135,12 +204,15 @@ export class ConnectIngressService {
   private attachedServer: http.Server | null = null;
   private connectListener: ((req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => void) | null = null;
   private readonly maxConcurrentSockets = 512;
+  private reservedSockets = 0;
+  private isClosed = false;
 
   constructor(accountLeaseService?: AccountLeaseService) {
     this.failoverGateway = new CloudCodeFailoverGateway(accountLeaseService);
   }
 
   attach(httpServer: http.Server): void {
+    this.isClosed = false;
     const secureContext = CaManager.ensureCertificates();
 
     this.h2Server = http2.createSecureServer(
@@ -149,7 +221,7 @@ export class ConnectIngressService {
         SNICallback: (servername, cb) => {
           if (servername && !CaManager.isTargetHost(servername)) {
             logger.warn(`[ConnectIngress] SNI servername not allowed: ${servername}`);
-            cb(new Error(`SNI servername not allowed: ${servername}`));
+            cb(new Error(`Untrusted host: ${servername}`), undefined);
             return;
           }
           cb(null, secureContext);
@@ -157,7 +229,7 @@ export class ConnectIngressService {
       },
       (req, res) => {
         this.failoverGateway.handleRequest(req, res).catch((err) => {
-          logger.error('[ConnectIngress] Gateway error handling request', err);
+          logger.error('[ConnectIngress] Error processing request in transparent gateway', err);
           if (!res.headersSent) {
             res.writeHead(502, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ error: { code: 502, message: String(err) } }));
@@ -194,10 +266,29 @@ export class ConnectIngressService {
     clientSocket: net.Socket,
     head: Buffer,
   ): void {
-    this.activeSockets.add(clientSocket);
-    clientSocket.once('close', () => {
-      this.activeSockets.delete(clientSocket);
+    if (this.isClosed) {
+      clientSocket.destroy();
+      return;
+    }
+
+    // Immediately enforce 60s timeout on client socket before any async operations
+    if (typeof clientSocket.setTimeout === 'function') {
+      clientSocket.setTimeout(60000, () => {
+        clientSocket.destroy();
+      });
+    }
+
+    clientSocket.on('error', (err) => {
+      logger.debug(`[ConnectIngress] Client socket error: ${err.message}`);
     });
+
+    // 1. Verify local peer trust model (CONNECT restricted to loopback)
+    if (clientSocket.remoteAddress && !isLocalPeer(clientSocket.remoteAddress) && process.env.AG_PROXY_ALLOW_REMOTE_CONNECT !== 'true') {
+      logger.warn(`[ConnectIngress] Non-local peer rejected for CONNECT: ${clientSocket.remoteAddress}`);
+      clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
 
     const destination = req.url || '';
     const parsed = parseConnectAuthority(destination);
@@ -208,31 +299,41 @@ export class ConnectIngressService {
       return;
     }
 
-    clientSocket.on('error', (err) => {
-      logger.debug(`[ConnectIngress] Client socket error for ${destination}: ${err.message}`);
+    const isTarget = CaManager.isTargetHost(destination);
+
+    // Enforce concurrency limit uniformly across both target and non-target requests
+    // Target uses 1 socket (clientSocket). Non-target uses 2 sockets (clientSocket + upstreamSocket).
+    const requiredSockets = isTarget ? 1 : 2;
+    if (this.activeSockets.size + this.reservedSockets + requiredSockets > this.maxConcurrentSockets) {
+      logger.warn(
+        `[ConnectIngress] Socket pool saturated (active=${this.activeSockets.size}, reserved=${this.reservedSockets}, cap=${this.maxConcurrentSockets}), rejecting ${destination}`,
+      );
+      clientSocket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+      clientSocket.destroy();
+      return;
+    }
+
+    this.activeSockets.add(clientSocket);
+    clientSocket.once('close', () => {
+      this.activeSockets.delete(clientSocket);
     });
 
-    // 1. If destination is Google CloudCode, terminate TLS and failover
-    const isTarget = CaManager.isTargetHost(destination);
     logger.info(`[ConnectIngress] CONNECT destination: ${destination} (intercepted=${isTarget})`);
 
+    // 2. If destination is Google CloudCode, terminate TLS and failover
     if (isTarget) {
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-      clientSocket.setTimeout(60000, () => {
-        clientSocket.destroy();
-      });
-
       if (head && head.length > 0) {
         clientSocket.unshift(head);
       }
 
-      if (this.h2Server) {
+      if (this.h2Server && !this.isClosed) {
         this.h2Server.emit('connection', clientSocket);
       }
       return;
     }
 
-    // 2. Standard TCP tunnel for non-target destinations
+    // 3. Standard TCP tunnel for non-target destinations
     if (isSelfOrLoopback(parsed.hostname) || (parsed.port !== 443 && parsed.port !== 8443)) {
       logger.warn(`[ConnectIngress] Non-target destination disallowed: ${destination}`);
       clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
@@ -240,35 +341,58 @@ export class ConnectIngressService {
       return;
     }
 
-    if (this.activeSockets.size >= this.maxConcurrentSockets) {
-      logger.warn(`[ConnectIngress] Socket pool saturated (${this.activeSockets.size}), rejecting tunnel for ${destination}`);
-      clientSocket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
-      clientSocket.destroy();
-      return;
-    }
+    // Reserve 1 socket slot for upstream during DNS lookup
+    this.reservedSockets++;
+    let hasReservation = true;
+    const releaseReservation = () => {
+      if (hasReservation) {
+        this.reservedSockets = Math.max(0, this.reservedSockets - 1);
+        hasReservation = false;
+      }
+    };
 
-    // Resolve DNS and verify that resolved IPs do not hit private/loopback/cloud-metadata ranges
+    let clientClosed = clientSocket.destroyed || clientSocket.closed;
+    const onEarlyClose = () => {
+      clientClosed = true;
+      releaseReservation();
+    };
+    clientSocket.once('close', onEarlyClose);
+
     dns.lookup(parsed.hostname, { all: true }, (lookupErr, addresses) => {
+      clientSocket.removeListener('close', onEarlyClose);
+      releaseReservation();
+
+      if (this.isClosed || clientClosed || clientSocket.destroyed || clientSocket.closed) {
+        return;
+      }
+
       if (lookupErr || !addresses || addresses.length === 0) {
         logger.warn(`[ConnectIngress] DNS lookup failed for ${parsed.hostname}: ${lookupErr?.message}`);
-        clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
-        clientSocket.destroy();
+        if (!clientSocket.destroyed && !clientSocket.closed) {
+          clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+          clientSocket.destroy();
+        }
         return;
       }
 
       const hasDisallowed = addresses.some((a) => isDisallowedIp(a.address));
       if (hasDisallowed) {
         logger.warn(`[ConnectIngress] Non-target destination resolved to disallowed address: ${parsed.hostname}`);
-        clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-        clientSocket.destroy();
+        if (!clientSocket.destroyed && !clientSocket.closed) {
+          clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          clientSocket.destroy();
+        }
+        return;
+      }
+
+      if (this.isClosed || clientClosed || clientSocket.destroyed || clientSocket.closed) {
         return;
       }
 
       const verifiedIp = addresses[0].address;
-      let clientClosed = false;
 
       const upstreamSocket = net.connect({ host: verifiedIp, port: parsed.port }, () => {
-        if (clientClosed) {
+        if (this.isClosed || clientClosed || clientSocket.destroyed || clientSocket.closed) {
           upstreamSocket.destroy();
           return;
         }
@@ -280,6 +404,11 @@ export class ConnectIngressService {
         upstreamSocket.pipe(clientSocket);
       });
 
+      this.activeSockets.add(upstreamSocket);
+      upstreamSocket.once('close', () => {
+        this.activeSockets.delete(upstreamSocket);
+      });
+
       clientSocket.once('close', () => {
         clientClosed = true;
         upstreamSocket.destroy();
@@ -289,19 +418,9 @@ export class ConnectIngressService {
         clientSocket.destroy();
       });
 
-      clientSocket.setTimeout(60000, () => {
-        clientSocket.destroy();
-        upstreamSocket.destroy();
-      });
-
       upstreamSocket.setTimeout(60000, () => {
         upstreamSocket.destroy();
         clientSocket.destroy();
-      });
-
-      this.activeSockets.add(upstreamSocket);
-      upstreamSocket.once('close', () => {
-        this.activeSockets.delete(upstreamSocket);
       });
 
       upstreamSocket.on('error', (err) => {
@@ -316,6 +435,8 @@ export class ConnectIngressService {
   }
 
   close(): void {
+    this.isClosed = true;
+    this.reservedSockets = 0;
     if (this.attachedServer && this.connectListener) {
       this.attachedServer.removeListener('connect', this.connectListener);
       this.connectListener = null;

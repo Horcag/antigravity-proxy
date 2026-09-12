@@ -170,34 +170,46 @@ describe('file-size policy ratchet engine', () => {
       expect(result.findings[0].message).toContain('Legacy debt grew by 1 lines');
     });
 
-    it('allows legacy files to reduce line count (baseline-reduced)', () => {
+    it('requires ratchet update when legacy files reduce line count (baseline-reduced is blocking)', () => {
       const files = { 'src/legacy.ts': 650 };
       const baseline = { 'src/legacy.ts': 800 };
       const result = evaluateFileSizes(files, baseline, defaultThresholds);
 
-      expect(result.exit_code).toBe(EXIT_OK);
+      expect(result.exit_code).toBe(EXIT_POLICY_ERROR);
       expect(result.findings).toHaveLength(1);
       expect(result.findings[0]).toMatchObject({
         path: 'src/legacy.ts',
         lines: 650,
         baseline_lines: 800,
         status: 'baseline-reduced',
-        blocking: false,
+        blocking: true,
       });
+
+      // Once baseline is ratcheted down via buildReducedBaseline, evaluateFileSizes passes
+      const reduced = buildReducedBaseline(files, baseline, defaultThresholds);
+      expect(reduced['src/legacy.ts']).toBe(650);
+      const ratchetedResult = evaluateFileSizes(files, reduced, defaultThresholds);
+      expect(ratchetedResult.exit_code).toBe(EXIT_OK);
     });
 
-    it('reports baseline-removed when a legacy file is deleted or refactored away', () => {
+    it('reports blocking baseline-removed when a legacy file is deleted or refactored away', () => {
       const files = {};
       const baseline = { 'src/deleted.ts': 900 };
       const result = evaluateFileSizes(files, baseline, defaultThresholds);
 
-      expect(result.exit_code).toBe(EXIT_OK);
+      expect(result.exit_code).toBe(EXIT_POLICY_ERROR);
       expect(result.findings).toHaveLength(1);
       expect(result.findings[0]).toMatchObject({
         path: 'src/deleted.ts',
         status: 'baseline-removed',
-        blocking: false,
+        blocking: true,
       });
+
+      // Once baseline is ratcheted down, deleted file is removed and check passes
+      const reduced = buildReducedBaseline(files, baseline, defaultThresholds);
+      expect(reduced['src/deleted.ts']).toBeUndefined();
+      const ratchetedResult = evaluateFileSizes(files, reduced, defaultThresholds);
+      expect(ratchetedResult.exit_code).toBe(EXIT_OK);
     });
   });
 

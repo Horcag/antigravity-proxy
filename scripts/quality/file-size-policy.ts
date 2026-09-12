@@ -210,10 +210,10 @@ export function evaluateFileSizes(
           path: filePath,
           lines: lineCount,
           baseline_lines: baselineLines,
-          severity: sizeSeverity(lineCount, thresholds) || 'warning',
+          severity: 'error',
           status: 'baseline-reduced',
-          blocking: false,
-          message: `Legacy debt was reduced by ${baselineLines - lineCount} lines`,
+          blocking: true,
+          message: `Legacy debt was reduced by ${baselineLines - lineCount} lines (from ${baselineLines} to ${lineCount}). Run 'npm run quality:ratchet' to lock in lower cap.`,
         });
       }
       continue;
@@ -242,10 +242,10 @@ export function evaluateFileSizes(
         path: baselinePath,
         lines: 0,
         baseline_lines: baselineLines,
-        severity: 'warning',
+        severity: 'error',
         status: 'baseline-removed',
-        blocking: false,
-        message: 'Legacy debt file was removed or left the configured source roots',
+        blocking: true,
+        message: 'Legacy debt file was removed or left the configured source roots. Run \'npm run quality:ratchet\' to remove it from baseline.',
       });
     }
   }

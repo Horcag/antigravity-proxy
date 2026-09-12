@@ -54,45 +54,97 @@ function getGitFileContent(repoRoot: string, gitRef: string, filePath: string): 
   }
 }
 
+function getCommitSha(repoRoot: string, ref: string): string | null {
+  try {
+    return execFileSync('git', ['rev-parse', '--verify', ref], {
+      cwd: repoRoot,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
 export function verifyBaselineIntegrity(
   repoRoot: string,
   candidateBaseline: Record<string, number>,
   baselineRelPath: string,
+  options?: { trustedRef?: string; trustedBaselineJson?: string },
 ): void {
   const gitPath = baselineRelPath.replaceAll('\\', '/');
 
-  // Try origin/main, then HEAD
-  let trustedJson = getGitFileContent(repoRoot, 'origin/main', gitPath);
+  let trustedJson: string | null = options?.trustedBaselineJson ?? null;
+  let resolvedRef: string | null = options?.trustedRef ?? null;
+  const headSha = getCommitSha(repoRoot, 'HEAD');
+
   if (!trustedJson) {
-    trustedJson = getGitFileContent(repoRoot, 'HEAD', gitPath);
+    const candidateRefs = [
+      options?.trustedRef,
+      process.env.QUALITY_TRUSTED_REF,
+      process.env.GITHUB_BASE_REF ? `origin/${process.env.GITHUB_BASE_REF}` : null,
+      process.env.GITHUB_EVENT_BEFORE && process.env.GITHUB_EVENT_BEFORE !== '0000000000000000000000000000000000000000'
+        ? process.env.GITHUB_EVENT_BEFORE
+        : null,
+      'origin/main',
+      'main',
+      'HEAD~1',
+    ].filter(Boolean) as string[];
+
+    for (const ref of candidateRefs) {
+      const refSha = getCommitSha(repoRoot, ref);
+      // If ref resolves to the current HEAD, it is NOT an independent ancestor: check parent ref~1
+      if (refSha && headSha && refSha === headSha) {
+        const parentRef = `${ref}~1`;
+        trustedJson = getGitFileContent(repoRoot, parentRef, gitPath);
+        if (trustedJson) {
+          resolvedRef = parentRef;
+          break;
+        }
+        continue;
+      }
+
+      trustedJson = getGitFileContent(repoRoot, ref, gitPath);
+      if (trustedJson) {
+        resolvedRef = ref;
+        break;
+      }
+    }
   }
 
-  if (trustedJson) {
-    let trustedBaseline: Record<string, number>;
-    try {
-      const parsed = JSON.parse(trustedJson);
-      trustedBaseline = (parsed.files || {}) as Record<string, number>;
-    } catch {
-      return;
-    }
+  // Fail-closed: Never fall back or allow unverified execution if trusted reference cannot be loaded
+  if (!trustedJson) {
+    throw new PolicyConfigurationError(
+      'Cannot verify baseline integrity: no valid trusted upstream git reference found. Please set QUALITY_TRUSTED_REF or ensure upstream history is available.',
+    );
+  }
 
-    // 1. Forbid adding any new unbaselined files to baseline
-    for (const key of Object.keys(candidateBaseline)) {
-      if (trustedBaseline[key] === undefined) {
-        throw new PolicyConfigurationError(
-          `Baseline tampering detected: Cannot add new oversized file to baseline: ${key}. New files must be <= 500 lines.`,
-        );
-      }
-    }
+  let trustedBaseline: Record<string, number>;
+  try {
+    const parsed = JSON.parse(trustedJson);
+    trustedBaseline = (parsed.files || {}) as Record<string, number>;
+  } catch (err: any) {
+    throw new PolicyConfigurationError(
+      `Failed to parse trusted baseline from git reference [${resolvedRef || 'unknown'}]: ${err?.message || err}`,
+    );
+  }
 
-    // 2. Forbid manually increasing the cap
-    for (const [key, candidateLines] of Object.entries(candidateBaseline)) {
-      const trustedLines = trustedBaseline[key];
-      if (trustedLines !== undefined && candidateLines > trustedLines) {
-        throw new PolicyConfigurationError(
-          `Baseline tampering detected: Baseline limit for ${key} cannot be manually increased from ${trustedLines} to ${candidateLines}. Baseline can only ratchet down.`,
-        );
-      }
+  // 1. Forbid adding any new unbaselined files to baseline
+  for (const key of Object.keys(candidateBaseline)) {
+    if (trustedBaseline[key] === undefined) {
+      throw new PolicyConfigurationError(
+        `Baseline tampering detected: Cannot add new oversized file to baseline: ${key}. New files must be <= 500 lines (trusted ref: ${resolvedRef}).`,
+      );
+    }
+  }
+
+  // 2. Forbid manually increasing the cap
+  for (const [key, candidateLines] of Object.entries(candidateBaseline)) {
+    const trustedLines = trustedBaseline[key];
+    if (trustedLines !== undefined && candidateLines > trustedLines) {
+      throw new PolicyConfigurationError(
+        `Baseline tampering detected: Baseline limit for ${key} cannot be manually increased from ${trustedLines} to ${candidateLines}. Baseline can only ratchet down (trusted ref: ${resolvedRef}).`,
+      );
     }
   }
 }
@@ -166,4 +218,6 @@ function main(): void {
   }
 }
 
-main();
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main();
+}

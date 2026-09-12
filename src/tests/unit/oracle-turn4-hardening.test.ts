@@ -10,6 +10,7 @@ import { ConnectIngressService } from '../../modules/proxy-gateway/server/connec
 import { AdminController } from '../../admin/admin.controller';
 import { extractCommentsFromContent } from '../../../scripts/quality/check-debt-baseline';
 import { countPhysicalLines } from '../../../scripts/quality/file-size-policy';
+import { verifyBaselineIntegrity } from '../../../scripts/quality/check-file-size';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -195,6 +196,39 @@ describe('Oracle Turn 4 Hardening Suite', () => {
       fs.writeFileSync(tmp, lines500, 'utf-8');
       expect(countPhysicalLines(tmp)).toBe(500);
       fs.unlinkSync(tmp);
+    });
+
+    it('rejects manual cap inflation against trusted baseline', () => {
+      const trustedJson = JSON.stringify({ files: { 'fileA.ts': 600 } });
+      const candidateBaseline = { 'fileA.ts': 601 };
+
+      expect(() => {
+        verifyBaselineIntegrity('/tmp', candidateBaseline, 'quality/file-size-policy.json', {
+          trustedBaselineJson: trustedJson,
+          trustedRef: 'origin/main',
+        });
+      }).toThrow(/Baseline tampering detected: Baseline limit for fileA.ts cannot be manually increased/);
+    });
+
+    it('rejects adding new oversized file to baseline', () => {
+      const trustedJson = JSON.stringify({ files: { 'fileA.ts': 600 } });
+      const candidateBaseline = { 'fileA.ts': 600, 'newOversized.ts': 550 };
+
+      expect(() => {
+        verifyBaselineIntegrity('/tmp', candidateBaseline, 'quality/file-size-policy.json', {
+          trustedBaselineJson: trustedJson,
+          trustedRef: 'origin/main',
+        });
+      }).toThrow(/Baseline tampering detected: Cannot add new oversized file to baseline/);
+    });
+
+    it('throws when trusted baseline JSON is corrupted', () => {
+      expect(() => {
+        verifyBaselineIntegrity('/tmp', {}, 'quality/file-size-policy.json', {
+          trustedBaselineJson: '{ corrupted json',
+          trustedRef: 'origin/main',
+        });
+      }).toThrow(/Failed to parse trusted baseline from git reference/);
     });
   });
 });

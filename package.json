@@ -22,7 +22,7 @@
     "quality:ratchet": "tsx scripts/quality/check-file-size.ts --update-baseline",
     "lint:debt": "tsx scripts/quality/check-debt-baseline.ts",
     "lint": "eslint . && npm run lint:debt && npm run quality:file-size",
-    "check": "npm run type-check && npm run lint && npm test && npm run build"
+    "check": "npm run type-check && npm run build && npm run lint && npm test"
   },
   "dependencies": {
     "@fastify/multipart": "^9.4.0",

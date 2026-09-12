@@ -286,6 +286,14 @@ describe('ConnectIngressService', () => {
       '2130706433:443',
       '127.0.0.1:443',
       '[::1]:443',
+      '[0:0:0:0:0:0:0:1]:443',
+      '[::0001]:443',
+      '[::ffff:127.0.0.1]:443',
+      '[::ffff:7f00:1]:443',
+      '[0:0:0:0:0:ffff:7f00:1]:443',
+      '[::ffff:a00:1]:443',
+      '[fc00::1]:443',
+      '[fe80::1]:443',
       'localhost:443',
     ];
 
@@ -316,6 +324,81 @@ describe('ConnectIngressService', () => {
     expect(server.listenerCount('connect')).toBe(1);
     ingress.close();
     expect(server.listenerCount('connect')).toBe(0);
+  });
+
+  it('handles client disconnect during DNS lookup without leaking sockets or throwing', async () => {
+    const server = http.createServer();
+    const ingress = new ConnectIngressService();
+    ingress.attach(server);
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const port = (server.address() as net.AddressInfo).port;
+
+    await new Promise<void>((resolve) => {
+      const client = net.connect(port, '127.0.0.1', () => {
+        client.write('CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n');
+        // Destroy client socket immediately to trigger close while DNS lookup is pending
+        client.destroy();
+        setTimeout(resolve, 50);
+      });
+    });
+
+    ingress.close();
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('enforces concurrency limit on target requests with HTTP 503', async () => {
+    const server = http.createServer();
+    const ingress = new ConnectIngressService();
+    ingress.attach(server);
+
+    // Simulate saturated socket pool
+    const fakeSockets = Array.from({ length: 512 }, () => new net.Socket());
+    for (const s of fakeSockets) {
+      (ingress as any).activeSockets.add(s);
+    }
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const port = (server.address() as net.AddressInfo).port;
+
+    const resp = await new Promise<string>((resolve) => {
+      const client = net.connect(port, '127.0.0.1', () => {
+        client.write('CONNECT cloudcode-pa.googleapis.com:443 HTTP/1.1\r\nHost: cloudcode-pa.googleapis.com:443\r\n\r\n');
+      });
+      client.on('data', (d) => {
+        client.destroy();
+        resolve(d.toString('utf-8'));
+      });
+    });
+
+    expect(resp).toContain('HTTP/1.1 503 Service Unavailable');
+
+    ingress.close();
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  it('ensures ingress.close() during DNS lookup does not create late upstream sockets', async () => {
+    const server = http.createServer();
+    const ingress = new ConnectIngressService();
+    ingress.attach(server);
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const port = (server.address() as net.AddressInfo).port;
+
+    await new Promise<void>((resolve) => {
+      const client = net.connect(port, '127.0.0.1', () => {
+        client.write('CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n');
+        // Close ingress immediately while DNS lookup is executing
+        ingress.close();
+        setTimeout(resolve, 100);
+      });
+    });
+
+    expect((ingress as any).activeSockets.size).toBe(0);
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 });
 

@@ -1244,15 +1244,11 @@ smoke_check() {
 
   local host port base_url admin_status listener main_pid service_user env_fs
   env_fs="$(root_path "$env_file")"
-  if [ ! -f "$env_fs" ]; then
-    printf 'Environment file is missing: %s\n' "$env_fs" >&2
-    return 1
-  fi
+  [ -f "$env_fs" ] || { printf 'Environment file is missing: %s\n' "$env_fs" >&2; return 1; }
   host="$(sed -n 's/^AG_PROXY_HOST=//p' "$env_fs" | tail -n 1)"
   port="$(sed -n 's/^AG_PROXY_PORT=//p' "$env_fs" | tail -n 1)"
   if [ -z "$host" ] || [ -z "$port" ]; then
-    printf 'Environment file lacks AG_PROXY_HOST or AG_PROXY_PORT: %s\n' "$env_fs" >&2
-    return 1
+    printf 'Environment file lacks AG_PROXY_HOST or AG_PROXY_PORT: %s\n' "$env_fs" >&2; return 1
   fi
   base_url="http://$host:$port"
 
@@ -1262,18 +1258,13 @@ smoke_check() {
   case "$timeout_secs" in ''|*[!0-9]*) timeout_secs=15 ;; esac
   case "$request_timeout" in ''|*[!0-9]*) request_timeout=2 ;; esac
 
-  local health_code='000'
-  local ready=0
-  local start_time current_time elapsed
+  local health_code='000' ready=0 curl_exit=0 active_state='' start_time current_time elapsed
   start_time="$(date +%s)"
-  local curl_exit=0
-  local active_state=''
 
   while true; do
     active_state="$(systemd show --property=ActiveState --value antigravity-proxy.service 2>/dev/null || true)"
     if [ "$active_state" = failed ]; then
-      printf 'Systemd service entered failed state during startup\n' >&2
-      return 1
+      printf 'Systemd service entered failed state during startup\n' >&2; return 1
     fi
 
     curl_exit=0
@@ -1282,11 +1273,11 @@ smoke_check() {
     health_body="$(cat "$health_tmp" 2>/dev/null || true)"; rm -f "$health_tmp"
 
     if [ "$curl_exit" -eq 0 ] && [ "$health_code" = 200 ]; then
-      if [ -n "$health_body" ]; then
-        if ! printf '%s' "$health_body" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' || \
-           ! printf '%s' "$health_body" | grep -q '"connect_ready"[[:space:]]*:[[:space:]]*true'; then
-          printf 'Health endpoint responded 200 but connect_ready is not true: %s\n' "$health_body" >&2; return 1
-        fi
+      if [ -z "$health_body" ]; then
+        printf 'Health endpoint responded 200 with empty body\n' >&2; return 1
+      fi
+      if ! node -e 'const r=process.argv[1]; try { const p=JSON.parse(r); process.exit(p&&p.ok===true&&p.connect_ready===true?0:1); } catch { process.exit(1); }' "$health_body"; then
+        printf 'Health endpoint response failed validation (expected {ok:true, connect_ready:true}): %s\n' "$health_body" >&2; return 1
       fi
       ready=1; break
     fi
@@ -1308,51 +1299,32 @@ smoke_check() {
   fi
 
   admin_status="$(curl -q --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' --max-time "$request_timeout" "$base_url/admin/status" 2>/dev/null || printf '000')"
-  case "$admin_status" in
-    401|403) ;;
-    *)
-      printf 'Unauthenticated admin endpoint returned unexpected HTTP %s\n' "$admin_status" >&2
-      return 1
-      ;;
-  esac
+  case "$admin_status" in 401|403) ;; *) printf 'Unauthenticated admin endpoint returned unexpected HTTP %s\n' "$admin_status" >&2; return 1 ;; esac
 
   listener="$(ss -ltnH "( sport = :$port )" 2>/dev/null || true)"
-  if ! printf '%s\n' "$listener" | grep -Fq "$host:$port"; then
-    printf 'Expected listener %s:%s is absent from listening sockets\n' "$host" "$port" >&2
-    return 1
-  fi
+  printf '%s\n' "$listener" | grep -Fq "$host:$port" || { printf 'Expected listener %s:%s is absent from listening sockets\n' "$host" "$port" >&2; return 1; }
 
   main_pid="$(systemd show --property=MainPID --value antigravity-proxy.service 2>/dev/null || true)"
-  case "$main_pid" in
-    ''|0|*[!0-9]*)
-      printf 'Systemd did not report a running MainPID: %s\n' "$main_pid" >&2
-      return 1
-      ;;
-  esac
+  case "$main_pid" in ''|0|*[!0-9]*) printf 'Systemd did not report a running MainPID: %s\n' "$main_pid" >&2; return 1 ;; esac
 
   listener="$(ss -ltnpH "( sport = :$port )" 2>/dev/null || true)"
-  if ! printf '%s\n' "$listener" | grep -Fq "$host:$port"; then
-    printf 'Expected listener %s:%s is absent from listening sockets with PID info\n' "$host" "$port" >&2
-    return 1
-  fi
-  if ! printf '%s\n' "$listener" | grep -Fq "pid=$main_pid,"; then
-    printf 'Systemd MainPID %s does not own listener %s:%s\n' "$main_pid" "$host" "$port" >&2
-    return 1
-  fi
+  printf '%s\n' "$listener" | grep -Fq "$host:$port" || { printf 'Expected listener %s:%s is absent from listening sockets with PID info\n' "$host" "$port" >&2; return 1; }
+  printf '%s\n' "$listener" | grep -Fq "pid=$main_pid," || { printf 'Systemd MainPID %s does not own listener %s:%s\n' "$main_pid" "$host" "$port" >&2; return 1; }
 
-  if ! systemd is-enabled --quiet antigravity-proxy.service; then
-    printf 'Antigravity Proxy service is not enabled in systemd\n' >&2
-    return 1
-  fi
-  if ! systemd is-active --quiet antigravity-proxy.service; then
-    printf 'Antigravity Proxy service is not active in systemd\n' >&2
-    return 1
-  fi
+  systemd is-enabled --quiet antigravity-proxy.service || { printf 'Antigravity Proxy service is not enabled in systemd\n' >&2; return 1; }
+  systemd is-active --quiet antigravity-proxy.service || { printf 'Antigravity Proxy service is not active in systemd\n' >&2; return 1; }
 
   service_user="$(systemd show --property=User --value antigravity-proxy.service 2>/dev/null || true)"
-  if [ "$service_user" != "$user_name" ]; then
-    printf 'Systemd service user %s does not match expected user %s\n' "$service_user" "$user_name" >&2
-    return 1
+  [ "$service_user" = "$user_name" ] || { printf 'Systemd service user %s does not match expected user %s\n' "$service_user" "$user_name" >&2; return 1; }
+
+  local ca_cert_file="/usr/local/share/antigravity-proxy/ca.crt"
+  [ -s "$ca_cert_file" ] || ca_cert_file="$(root_path "$state_dir")/certs/ca.crt"
+  if [ -s "$ca_cert_file" ]; then
+    local connect_probe_exit=0
+    curl -q --silent --max-time "$request_timeout" --proxy "http://$host:$port" --cacert "$ca_cert_file" --output /dev/null "https://cloudcode-pa.googleapis.com/v1/health" 2>/dev/null || connect_probe_exit=$?
+    if [ "$connect_probe_exit" -eq 60 ] || [ "$connect_probe_exit" -eq 35 ]; then
+      printf 'CONNECT TLS probe failed certificate or handshake verification (curl exit %s)\n' "$connect_probe_exit" >&2; return 1
+    fi
   fi
 
   return 0

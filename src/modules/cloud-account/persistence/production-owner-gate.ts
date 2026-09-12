@@ -32,14 +32,6 @@ export class ProductionOwnerGate {
   }
 
   static async acquireExclusiveOwnership(port?: number): Promise<void> {
-    if (
-      process.env.NODE_ENV === 'test' ||
-      process.env.AG_PROXY_ALLOW_CONCURRENT_DEV === 'true' ||
-      process.env.AG_PROXY_ALLOW_CONCURRENT_OWNER === '1'
-    ) {
-      return;
-    }
-
     if (this.ownerServer) {
       throw new SplitBrainPreventedException('Exclusive ownership is already held by this process.');
     }

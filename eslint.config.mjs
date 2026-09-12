@@ -3,7 +3,15 @@ import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
-  { ignores: ['dist/**', 'coverage/**', '.agent-work/**'] },
+  {
+    ignores: ['dist/**', 'coverage/**', '.agent-work/**'],
+  },
+  {
+    linterOptions: {
+      noInlineConfig: true,
+      reportUnusedDisableDirectives: 'error',
+    },
+  },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {

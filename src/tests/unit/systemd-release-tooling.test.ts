@@ -1400,16 +1400,13 @@ if [[ "$url" == *"/health" ]]; then
 
   if [ -f "$state_dir/health-code" ]; then
     code=$(<"$state_dir/health-code")
-    if [ "$code" = "000" ]; then
-      printf '000'
-      exit 7
-    fi
-    printf '%s' "$code"
-    exit 0
+    [ "$code" = "000" ] && { printf '000'; exit 7; }
+    printf '%s' "$code"; exit 0
   fi
-
-  printf '200'
-  exit 0
+  out_f="" prev=""
+  for a in "$@"; do [ "$prev" = "--output" ] && out_f="$a"; prev="$a"; done
+  [ -n "$out_f" ] && printf '{"ok":true,"connect_ready":true}' > "$out_f"
+  printf '200'; exit 0
 fi
 
 if [[ "$url" == *"/admin/status" ]]; then
