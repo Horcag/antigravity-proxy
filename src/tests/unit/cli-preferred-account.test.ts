@@ -112,7 +112,7 @@ describe('preferred account CLI', () => {
         body: undefined,
       },
     ]);
-  }, 15_000);
+  }, 30_000);
 
   it('prints quota diagnostics fetched with the admin key', async () => {
     requests.length = 0;

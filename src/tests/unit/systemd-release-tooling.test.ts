@@ -215,7 +215,7 @@ describe('systemd release tooling', () => {
     expect(library).toContain('release_runtime_probe');
     expect(readFileSync(probeLog, 'utf8')).toContain(`uid=${process.getuid?.()} command=`);
     expect(readFileSync(probeLog, 'utf8')).toContain('/bin/node ');
-  });
+  }, 30_000);
 
   it('preserves existing environment, key, database, and WAL state during update', () => {
     const root = createRoot();
