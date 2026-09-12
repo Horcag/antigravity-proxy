@@ -76,6 +76,7 @@ export interface ProxyRetryAccountLeaseService {
     currentGeneration: number,
     targetAccountId: string,
     ownerRequestId?: string,
+    expectedIncarnation?: number,
   ): MigrationCapability | null;
   renewSessionMigration?(
     sessionKey: string | undefined,
@@ -89,6 +90,7 @@ export interface ProxyRetryAccountLeaseService {
     expectedGeneration: number,
     failedAccountId: string,
     ownerRequestId?: string,
+    expectedIncarnation?: number,
   ): boolean;
   getSessionBinding?(sessionKey: string | undefined): { accountId?: string; generation: number } | null;
 }
@@ -201,6 +203,7 @@ export class ProxyRetryPolicy {
         currentGen,
         selectedAccount.id,
         retryState.requestId,
+        retryState.tableIncarnation,
       );
       if (migrationCap) {
         retryState.sessionGeneration = migrationCap.generation;
@@ -315,6 +318,7 @@ export class ProxyRetryPolicy {
         retryState.sessionGeneration ?? retryState.migrationCapability.generation,
         accountId,
         retryState.requestId,
+        retryState.tableIncarnation ?? retryState.migrationCapability.tableIncarnation,
       );
     }
     this.accountLeaseService.recordParityError();

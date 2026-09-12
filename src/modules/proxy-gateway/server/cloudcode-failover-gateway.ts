@@ -130,6 +130,8 @@ export class CloudCodeFailoverGateway {
 
     const targetHost = parsedAuthority.hostname;
 
+    const requestAbortController = new AbortController();
+
     const LOGICAL_REQUEST_DEADLINE_MS = 120000;
     const requestStartTime = Date.now();
     const deadlineAt = requestStartTime + LOGICAL_REQUEST_DEADLINE_MS;
@@ -145,11 +147,16 @@ export class CloudCodeFailoverGateway {
     // F6: Early disconnect cleanup handlers attached immediately before any async wait
     let clientAborted = false;
     let activeReleaseReservation: (() => void) | undefined;
+    let activeStopCandidateRenewal: (() => void) | undefined;
     let currentUpstreamReq: http.ClientRequest | undefined;
     let currentUpstreamRes: http.IncomingMessage | undefined;
     let responseCommitted = false;
 
     const cleanupActiveAttempt = () => {
+      if (activeStopCandidateRenewal) {
+        activeStopCandidateRenewal();
+        activeStopCandidateRenewal = undefined;
+      }
       if (activeReleaseReservation) {
         activeReleaseReservation();
         activeReleaseReservation = undefined;
@@ -158,6 +165,7 @@ export class CloudCodeFailoverGateway {
 
     const abortAll = () => {
       clientAborted = true;
+      requestAbortController.abort();
       clearLogicalDeadline();
       cleanupActiveAttempt();
       if (currentUpstreamReq && !currentUpstreamReq.destroyed) {
@@ -191,6 +199,11 @@ export class CloudCodeFailoverGateway {
         res.end(errorBody);
       } else {
         abortAll();
+        if (!res.writableFinished) {
+          try {
+            res.destroy(new Error('Gateway Timeout: Logical request deadline exceeded'));
+          } catch {}
+        }
       }
     }, LOGICAL_REQUEST_DEADLINE_MS);
     logicalDeadlineTimer.unref?.();
@@ -324,6 +337,7 @@ export class CloudCodeFailoverGateway {
             excludeAccountIds: Array.from(attemptedAccountIds),
             sessionKey,
             deferSessionBinding: true,
+            signal: requestAbortController.signal,
           });
         } else {
           const acc = await this.accountLeaseService.getNextToken({
@@ -381,6 +395,7 @@ export class CloudCodeFailoverGateway {
           ? this.accountLeaseService.getSessionBinding(sessionKey)
           : null;
       let attemptGeneration = lease?.generation ?? initialBinding?.generation ?? 1;
+      let attemptTableIncarnation = lease?.tableIncarnation ?? initialBinding?.tableIncarnation;
       let migrationCapability: MigrationCapability | null = null;
 
       const needsMigration = Boolean(
@@ -403,11 +418,42 @@ export class CloudCodeFailoverGateway {
           attemptGeneration,
           account.id,
           requestId,
+          attemptTableIncarnation,
         );
         if (migrationCapability) {
           attemptGeneration = migrationCapability.generation;
         }
       }
+
+      let candidateRenewalTimer: NodeJS.Timeout | null = null;
+      if (sessionKey && isVerifiedSessionKey(sessionKey) && migrationCapability) {
+        const cap = migrationCapability;
+        candidateRenewalTimer = setInterval(() => {
+          try {
+            const renewed = this.accountLeaseService?.renewSessionMigration?.(
+              sessionKey,
+              cap.generation,
+              requestId,
+              30000,
+              cap.tableIncarnation,
+            );
+            if (renewed === false) {
+              logger.warn(
+                `[CloudCodeGateway] Candidate migration renewal rejected for session ${sessionKey}`,
+              );
+            }
+          } catch {}
+        }, 15000);
+        candidateRenewalTimer.unref?.();
+      }
+
+      const stopCandidateRenewal = () => {
+        if (candidateRenewalTimer) {
+          clearInterval(candidateRenewalTimer);
+          candidateRenewalTimer = null;
+        }
+      };
+      activeStopCandidateRenewal = stopCandidateRenewal;
 
       // Prepare payload with account-specific project if applicable
       let payloadToSend = rawBody;
@@ -735,11 +781,18 @@ export class CloudCodeFailoverGateway {
               streamDecompressor.on('data', (dChunk: Buffer) => {
                 if (settled) return;
                 const buf = Buffer.isBuffer(dChunk) ? dChunk : Buffer.from(dChunk);
-                if (decompressedBytes < inspectionBudget) {
-                  const slice = buf.subarray(0, inspectionBudget - decompressedBytes);
-                  decompressedChunks.push(slice);
-                  decompressedBytes += slice.length;
+                if (decompressedBytes + buf.length > inspectionBudget) {
+                  const remaining = Math.max(0, inspectionBudget - decompressedBytes);
+                  if (remaining > 0) {
+                    const slice = buf.subarray(0, remaining);
+                    decompressedChunks.push(slice);
+                    decompressedBytes += slice.length;
+                  }
+                  evaluateDecision(false);
+                  return;
                 }
+                decompressedChunks.push(buf);
+                decompressedBytes += buf.length;
                 evaluateDecision(false);
               });
 
@@ -751,16 +804,47 @@ export class CloudCodeFailoverGateway {
             const onData = (chunk: Buffer) => {
               if (settled) return;
               const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+
+              if (totalRawBytes + buf.length > inspectionBudget) {
+                const remaining = Math.max(0, inspectionBudget - totalRawBytes);
+                if (remaining > 0) {
+                  const slice = buf.subarray(0, remaining);
+                  chunks.push(slice);
+                  totalRawBytes += slice.length;
+                  if (streamDecompressor) {
+                    try {
+                      streamDecompressor.write(slice);
+                    } catch (err) {
+                      handleDecompressorError(err);
+                      return;
+                    }
+                  }
+                }
+                evaluateDecision(false);
+                return;
+              }
+
               chunks.push(buf);
               totalRawBytes += buf.length;
 
               if (streamDecompressor) {
                 try {
-                  streamDecompressor.write(buf);
+                  const canAcceptMore = streamDecompressor.write(buf);
+                  if (!canAcceptMore) {
+                    bodyStream.pause();
+                    const onDrain = () => {
+                      streamDecompressor?.removeListener('drain', onDrain);
+                      if (!settled) {
+                        bodyStream.resume();
+                      }
+                    };
+                    streamDecompressor.once('drain', onDrain);
+                  }
                 } catch (err) {
                   handleDecompressorError(err);
                   return;
                 }
+                evaluateDecision(false);
               } else {
                 evaluateDecision(false);
               }
@@ -1023,37 +1107,13 @@ export class CloudCodeFailoverGateway {
             }
 
             responseCommitted = true;
+            stopCandidateRenewal();
             this.writeHeaders(res, statusCode, headers);
             break;
           }
         }
 
-        let streamingRenewalTimer: NodeJS.Timeout | null = null;
-        if (sessionKey && isVerifiedSessionKey(sessionKey) && migrationCapability) {
-          streamingRenewalTimer = setInterval(() => {
-            try {
-              this.accountLeaseService?.renewSessionMigration?.(
-                sessionKey,
-                attemptGeneration,
-                requestId,
-                30000,
-                migrationCapability.tableIncarnation,
-              );
-            } catch {}
-          }, 15000);
-          streamingRenewalTimer.unref?.();
-        }
-
-        const clearStreamingRenewal = () => {
-          if (streamingRenewalTimer) {
-            clearInterval(streamingRenewalTimer);
-            streamingRenewalTimer = null;
-          }
-        };
-
         const onStreamEnd = () => {
-          clearStreamingRenewal();
-          clearLogicalDeadline();
           if (bodyStream.trailers && typeof (res as any).addTrailers === 'function' && !res.writableEnded) {
             (res as any).addTrailers(bodyStream.trailers);
           }
@@ -1065,13 +1125,11 @@ export class CloudCodeFailoverGateway {
         bodyStream.once('end', onStreamEnd);
 
         res.once('close', () => {
-          clearStreamingRenewal();
           clearLogicalDeadline();
           bodyStream.destroy();
         });
 
         bodyStream.once('error', (err) => {
-          clearStreamingRenewal();
           logger.warn('[CloudCodeGateway] Upstream streaming error', err);
           if (!res.writableEnded) {
             res.destroy(err);
@@ -1138,7 +1196,6 @@ export class CloudCodeFailoverGateway {
 
         await relayCompletionPromise;
 
-        clearStreamingRenewal();
         clearLogicalDeadline();
         cleanupActiveAttempt();
         return;

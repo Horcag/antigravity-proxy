@@ -293,14 +293,21 @@ export class AccountLeaseSelectionPolicy {
     currentGeneration: number,
     targetAccountId: string,
     ownerRequestId?: string,
+    expectedIncarnation?: number,
   ): MigrationCapability | null {
     if (!sessionKey || !ownerRequestId || !targetAccountId) return null;
     if (!isVerifiedSessionKey(sessionKey)) return null;
+    if (expectedIncarnation !== undefined && expectedIncarnation !== this.tableIncarnation) {
+      return null;
+    }
     const current = this.sessionBindings.get(sessionKey);
     if (!current) {
       return null;
     }
     if (current.tableIncarnation !== this.tableIncarnation) {
+      return null;
+    }
+    if (expectedIncarnation !== undefined && current.tableIncarnation !== expectedIncarnation) {
       return null;
     }
     const now = Date.now();
@@ -403,11 +410,14 @@ export class AccountLeaseSelectionPolicy {
     expectedGeneration: number,
     failedAccountId: string,
     ownerRequestId?: string,
+    expectedIncarnation?: number,
   ): boolean {
     if (!sessionKey || !failedAccountId || !ownerRequestId) return false;
+    if (expectedIncarnation !== undefined && expectedIncarnation !== this.tableIncarnation) return false;
     const current = this.sessionBindings.get(sessionKey);
     if (!current || current.state !== 'migrating') return false;
     if (current.tableIncarnation !== this.tableIncarnation) return false;
+    if (expectedIncarnation !== undefined && current.tableIncarnation !== expectedIncarnation) return false;
     if (current.generation !== expectedGeneration) return false;
     if (current.migrationOwnerRequestId !== ownerRequestId) return false;
     if (current.migratingToAccountId === failedAccountId) {

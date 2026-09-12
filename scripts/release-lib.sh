@@ -723,6 +723,24 @@ restore_migration_release_topology() {
     quarantine_owned_path "$path" "$expected_identity" link "migration release link" migration-release-link || q_link_status=$?
     if [ "$q_link_status" -ne 0 ]; then
       if [ "$q_link_status" -eq 2 ]; then
+        if [ -z "$prior_id" ]; then
+          continue
+        fi
+        local restore_staging_dir
+        restore_staging_dir="$(umask 077 && mktemp -d "$(dirname "$path")/.restore.XXXXXX")" || {
+          printf '%s\n' "Refusing to create staging dir for restoring absent migration link: $path" >&2
+          rollback_failed=1
+          continue
+        }
+        restored_link="$restore_staging_dir/restore"
+        if ! ln -s "releases/$prior_id" "$restored_link" || ! mv -Tn -- "$restored_link" "$path" || { [ -e "$restored_link" ] || [ -L "$restored_link" ]; }; then
+          rm -rf -- "$restore_staging_dir" 2>/dev/null || true
+          printf '%s\n' "Refusing to restore migration release link without overwriting a concurrent replacement: $path" >&2
+          rollback_failed=1
+          continue
+        fi
+        rmdir -- "$restore_staging_dir" 2>/dev/null || true
+        fsync_directory "$(dirname "$path")"
         continue
       fi
       printf '%s\n' "Refusing to restore substituted migration release link: $path" >&2
@@ -743,9 +761,11 @@ restore_migration_release_topology() {
     fi
     fsync_directory "$(dirname "$path")"
   done
-  migration_link_paths=()
-  migration_link_identities=()
-  migration_link_previous_ids=()
+  if [ "$rollback_failed" -eq 0 ]; then
+    migration_link_paths=()
+    migration_link_identities=()
+    migration_link_previous_ids=()
+  fi
   return "$rollback_failed"
 }
 

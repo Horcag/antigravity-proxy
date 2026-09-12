@@ -246,6 +246,10 @@ export class ProxyService {
           return false;
         }
         hasMarkedSuccess = true;
+        if (renewalTimer) {
+          clearInterval(renewalTimer);
+          renewalTimer = null;
+        }
         this.accountLeaseService.recordPerformanceSuccess?.(
           accountId,
           model,

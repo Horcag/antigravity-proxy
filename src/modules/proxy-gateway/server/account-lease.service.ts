@@ -73,6 +73,7 @@ export interface GetNextTokenOptions {
   excludeAccountIds?: string[];
   model?: string;
   deferSessionBinding?: boolean;
+  signal?: AbortSignal;
 }
 
 type TokenData = AccountLeaseTokenData;
@@ -553,11 +554,16 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         return null;
       }
 
+      if (options?.signal?.aborted) {
+        return null;
+      }
+
       let accountId: string;
       let tokenData: TokenData;
       let releaseReservation: () => void;
       let breakerGeneration = 0;
       let generation = 1;
+      let admissionTableIncarnation = 1;
 
       let selectedTokenEntry: TokenEntry | null = null;
 
@@ -596,12 +602,31 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         [accountId, tokenData] = selectedTokenEntry;
         releaseReservation = this.acquireWorkReservation(accountId);
         breakerGeneration = this.getBreakerGeneration(accountId);
+        admissionTableIncarnation = this.selectionPolicy.getTableIncarnation();
         generation = sessionKey
           ? (this.getSessionBinding(sessionKey)?.generation ?? 1)
           : 1;
       } finally {
         releaseMutex();
       }
+
+      let isReservationReleased = false;
+      const releaseReservationOnce = () => {
+        if (!isReservationReleased) {
+          isReservationReleased = true;
+          releaseReservation();
+        }
+      };
+
+      if (options?.signal?.aborted) {
+        releaseReservationOnce();
+        return null;
+      }
+
+      const onAbort = () => {
+        releaseReservationOnce();
+      };
+      options?.signal?.addEventListener('abort', onAbort, { once: true });
 
       // Hydration and post-hydration revalidation occur outside the critical section
       let finalized: CloudAccount | null = null;
@@ -614,9 +639,23 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
           options?.deferSessionBinding,
         );
 
-        if (!finalized) {
-          releaseReservation();
+        if (options?.signal?.aborted) {
+          releaseReservationOnce();
           return null;
+        }
+
+        if (!finalized) {
+          releaseReservationOnce();
+          return null;
+        }
+
+        // Post-hydration revalidation: if table incarnation advanced during hydration (Probe C01), fail and reacquire
+        if (this.selectionPolicy.getTableIncarnation() !== admissionTableIncarnation) {
+          releaseReservationOnce();
+          this.logger.warn(
+            `Table incarnation advanced from ${admissionTableIncarnation} to ${this.selectionPolicy.getTableIncarnation()} during hydration; reacquiring lease`,
+          );
+          return this.acquireAttemptLease(options);
         }
 
         // Post-hydration revalidation: if candidate became cooled down or locked out, release and fail over
@@ -628,7 +667,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         const isRateLimited = this.rateLimitTracker.isRateLimited(accountId, effectiveModel);
 
         if (isCooldowned || isRateLimited) {
-          releaseReservation();
+          releaseReservationOnce();
           this.logger.warn(
             `Account ${accountId} became unavailable during hydration; failing over to next candidate`,
           );
@@ -638,16 +677,14 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
           });
         }
       } catch (err) {
-        releaseReservation();
+        releaseReservationOnce();
         throw err;
+      } finally {
+        options?.signal?.removeEventListener('abort', onAbort);
       }
 
-      let isReleased = false;
       const idempotentRelease = () => {
-        if (!isReleased) {
-          isReleased = true;
-          releaseReservation();
-        }
+        releaseReservationOnce();
       };
 
       finalized.releaseReservation = idempotentRelease;
@@ -656,11 +693,11 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         account: finalized,
         sessionKey,
         generation,
-        tableIncarnation: this.selectionPolicy.getTableIncarnation(),
+        tableIncarnation: admissionTableIncarnation,
         breakerGeneration,
         releaseReservation: idempotentRelease,
         get isReleased() {
-          return isReleased;
+          return isReservationReleased;
         },
       };
     } catch (error) {
@@ -782,12 +819,14 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     currentGeneration: number,
     targetAccountId: string,
     ownerRequestId?: string,
+    expectedIncarnation?: number,
   ): MigrationCapability | null {
     return this.selectionPolicy.startSessionMigration(
       sessionKey,
       currentGeneration,
       targetAccountId,
       ownerRequestId,
+      expectedIncarnation,
     );
   }
 
@@ -797,6 +836,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     targetAccountId: string,
     ownerRequestId?: string,
     ttlMs?: number,
+    expectedIncarnation?: number,
   ): boolean {
     const expiresAt = Date.now() + (ttlMs ?? this.stickySessionTtlMs);
     return this.selectionPolicy.confirmSessionMigration(
@@ -805,6 +845,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
       targetAccountId,
       ownerRequestId,
       expiresAt,
+      expectedIncarnation,
     );
   }
 
@@ -813,12 +854,14 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     expectedGeneration: number,
     failedAccountId: string,
     ownerRequestId?: string,
+    expectedIncarnation?: number,
   ): boolean {
     return this.selectionPolicy.failSessionMigrationCandidate(
       sessionKey,
       expectedGeneration,
       failedAccountId,
       ownerRequestId,
+      expectedIncarnation,
     );
   }
 

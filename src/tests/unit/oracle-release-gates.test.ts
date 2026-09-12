@@ -719,8 +719,10 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     const retryPolicy = new ProxyRetryPolicy(leaseService, console as any);
     const retryState = retryPolicy.createTokenRetryState();
 
-    // Account A is cooling down / excluded, so attempt 1 must select B ('acc-2')
-    retryState.attemptedAccountIds.add('acc-1');
+    // Account A is cooling down with empty attemptedAccountIds, verifying attempt-1 behavior without retry flag
+    expect(retryState.attemptedAccountIds.size).toBe(0);
+    (leaseService as any).accountCooldowns.set('acc-1', Date.now() + 60000);
+
     const selected = await retryPolicy.selectRetryToken(retryState, 'gemini-2.5-flash', sessionKey);
 
     expect(selected?.id).toBe('acc-2');
@@ -730,6 +732,7 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
       1,
       'acc-2',
       retryState.requestId,
+      leaseService.getTableIncarnation(),
     );
     expect(retryState.migrationCapability).toBeDefined();
     expect(retryState.tableIncarnation).toBe(leaseService.getTableIncarnation());
@@ -807,6 +810,124 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     );
 
     expect(decision.state).toBe('VALIDATED_RESPONSE');
+  });
+
+  // T15-F01: Reset during hydration reacquires or rejects without leaking mismatched incarnation
+  it('T15-F01: Reset during hydration captures admission incarnation and reacquires cleanly', async () => {
+    const sessionKey = 'session:hydration-incarnation-fence';
+    leaseService.bindSession(sessionKey, 'acc-1');
+
+    const originalFinalize = (leaseService as any).finalizeSelectedToken.bind(leaseService);
+    let resetDone = false;
+    vi.spyOn(leaseService as any, 'finalizeSelectedToken').mockImplementation(
+      async (...args: any[]) => {
+        if (!resetDone) {
+          resetDone = true;
+          // Table advances incarnation during hydration (Probe C01)
+          leaseService.clearSessions();
+        }
+        return originalFinalize(...args);
+      },
+    );
+
+    const lease = await leaseService.acquireAttemptLease({ sessionKey });
+    expect(lease).not.toBeNull();
+    // Verify lease returned matches the current table incarnation, not the pre-reset admission snapshot!
+    expect(lease?.tableIncarnation).toBe(leaseService.getTableIncarnation());
+  });
+
+  // T15-F01: startSessionMigration rejects caller with stale table incarnation
+  it('T15-F01: startSessionMigration strictly rejects caller with stale table incarnation', () => {
+    const sessionKey = 'session:stale-caller-migration';
+    leaseService.bindSession(sessionKey, 'acc-1');
+    const oldIncarnation = leaseService.getTableIncarnation();
+
+    // Table advances incarnation
+    leaseService.clearSessions();
+    const newIncarnation = leaseService.getTableIncarnation();
+    expect(newIncarnation).toBeGreaterThan(oldIncarnation);
+
+    // Re-bind in new table
+    leaseService.bindSession(sessionKey, 'acc-1');
+
+    // Attempt migration from old lease (incarnation 1) into new table (incarnation 2)
+    const cap = leaseService.startSessionMigration(
+      sessionKey,
+      1,
+      'acc-2',
+      'req-stale-caller',
+      oldIncarnation, // stale caller incarnation!
+    );
+
+    expect(cap).toBeNull();
+  });
+
+  // T15-F03: AbortSignal during hydration releases reservation immediately
+  it('T15-F03: AbortSignal during hydration immediately releases active reservation', async () => {
+    const abortController = new AbortController();
+    let reservationReleased = false;
+
+    const originalAcquireWorkReservation = (leaseService as any).acquireWorkReservation.bind(leaseService);
+    vi.spyOn(leaseService as any, 'acquireWorkReservation').mockImplementation((accId: string) => {
+      const rel = originalAcquireWorkReservation(accId);
+      return () => {
+        reservationReleased = true;
+        rel();
+      };
+    });
+
+    vi.spyOn(leaseService as any, 'finalizeSelectedToken').mockImplementation(async () => {
+      // Simulate slow hydration where deadline/abort fires
+      abortController.abort();
+      return null;
+    });
+
+    const lease = await leaseService.acquireAttemptLease({
+      signal: abortController.signal,
+    });
+
+    expect(lease).toBeNull();
+    expect(reservationReleased).toBe(true);
+  });
+
+  // T15-F04: Migration renewal stops upon confirmation
+  it('T15-F04: Migration renewal stops once session migration is confirmed active', () => {
+    const sessionKey = 'session:renewal-stop-test';
+    leaseService.bindSession(sessionKey, 'acc-1');
+
+    const cap = leaseService.startSessionMigration(sessionKey, 1, 'acc-2', 'req-active-test');
+    expect(cap).not.toBeNull();
+
+    // While migrating, renewal succeeds
+    const renewedWhileMigrating = leaseService.renewSessionMigration(
+      sessionKey,
+      cap!.generation,
+      'req-active-test',
+      30000,
+      cap!.tableIncarnation,
+    );
+    expect(renewedWhileMigrating).toBe(true);
+
+    // Confirm migration (transitions to active)
+    const confirmed = leaseService.confirmSessionMigration(
+      sessionKey,
+      cap!.generation,
+      'acc-2',
+      'req-active-test',
+      60000,
+      cap!.tableIncarnation,
+    );
+    expect(confirmed).toBe(true);
+
+    // Once active, renewSessionMigration correctly returns false
+    const renewedAfterConfirm = leaseService.renewSessionMigration(
+      sessionKey,
+      cap!.generation,
+      'req-active-test',
+      30000,
+      cap!.tableIncarnation,
+    );
+    expect(renewedAfterConfirm).toBe(false);
   });
 });
 
