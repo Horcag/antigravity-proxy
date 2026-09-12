@@ -65,7 +65,7 @@ describe('CaManager', () => {
       expect(fs.existsSync(agyPath)).toBe(true);
       const restoredWrapper = fs.readFileSync(agyPath, 'utf-8');
       expect(restoredWrapper).toContain('#!/usr/bin/env bash');
-      expect(restoredWrapper).toContain('AGY_CLI_DISABLE_AUTO_UPDATE="true"');
+      expect(restoredWrapper).toContain('export HTTPS_PROXY');
       expect(restoredWrapper).toContain(agyBinPath);
     } finally {
       homedirSpy.mockRestore();

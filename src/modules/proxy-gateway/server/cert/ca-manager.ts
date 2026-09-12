@@ -203,7 +203,6 @@ export https_proxy="$PROXY_URL"
 export NO_PROXY="localhost,127.0.0.1,::1"
 export no_proxy="localhost,127.0.0.1,::1"
 export SSL_CERT_FILE="$TRUST_BUNDLE"
-export AGY_CLI_DISABLE_AUTO_UPDATE="true"
 
 exec "${agyBinPath}" "$@"
 `;
