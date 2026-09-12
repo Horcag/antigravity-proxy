@@ -1,6 +1,7 @@
 import http from 'node:http';
 import http2 from 'node:http2';
 import https from 'node:https';
+import crypto from 'node:crypto';
 import { logger } from '../../../shared/logging/logger';
 import { AccountLeaseService } from './account-lease.service';
 import { CloudAccount } from '../../cloud-account/types';
@@ -78,6 +79,8 @@ export class CloudCodeFailoverGateway {
       }
     }
 
+    const sessionKey = this.extractSessionKey(req, parsedBody);
+
     // 3. Failover retry loop (ResponseCommitGate)
     const attemptedAccountIds = new Set<string>();
     const maxAttempts = 5;
@@ -88,6 +91,7 @@ export class CloudCodeFailoverGateway {
         account = await this.accountLeaseService.getNextToken({
           model: modelName,
           excludeAccountIds: Array.from(attemptedAccountIds),
+          sessionKey,
         });
       }
 
@@ -202,7 +206,11 @@ export class CloudCodeFailoverGateway {
         }
 
         // --- COMMIT POINT ---
-        // Success (200 OK): commit headers to client and stream response
+        // Success (200 OK): rebind session to successful account and stream response
+        if (sessionKey && account && this.accountLeaseService) {
+          this.accountLeaseService.bindSession(sessionKey, account.id);
+        }
+
         this.writeHeaders(res, statusCode, headers);
 
         bodyStream.pipe(res);
@@ -352,5 +360,78 @@ export class CloudCodeFailoverGateway {
       }
       upstreamReq.end();
     });
+  }
+
+  private extractSessionKey(
+    req: http.IncomingMessage | http2.Http2ServerRequest,
+    parsedBody: Record<string, unknown> | null,
+  ): string | undefined {
+    // 1. Explicit headers
+    const headers = req.headers;
+    const headerCandidate =
+      headers['x-ag-proxy-session-id'] ||
+      headers['x-session-id'] ||
+      headers['x-conversation-id'] ||
+      headers['x-cloudcode-session-id'];
+    if (typeof headerCandidate === 'string' && headerCandidate.trim()) {
+      return `cloudcode:header:${headerCandidate.trim()}`;
+    }
+
+    if (parsedBody && typeof parsedBody === 'object') {
+      // 2. Explicit body fields
+      const candidate =
+        parsedBody.sessionId ??
+        parsedBody.session_id ??
+        parsedBody.conversationId ??
+        parsedBody.conversation_id ??
+        (parsedBody.metadata as Record<string, unknown> | undefined)?.sessionId ??
+        (parsedBody.metadata as Record<string, unknown> | undefined)?.session_id ??
+        (parsedBody.metadata as Record<string, unknown> | undefined)?.conversationId ??
+        (parsedBody.metadata as Record<string, unknown> | undefined)?.conversation_id ??
+        (parsedBody.request as Record<string, unknown> | undefined)?.sessionId ??
+        (parsedBody.request as Record<string, unknown> | undefined)?.session_id ??
+        (parsedBody.request as Record<string, unknown> | undefined)?.conversationId ??
+        (parsedBody.request as Record<string, unknown> | undefined)?.conversation_id;
+
+      if (typeof candidate === 'string' && candidate.trim()) {
+        return `cloudcode:body:${candidate.trim()}`;
+      }
+
+      // 3. Multi-turn chat prefix fingerprinting: Google CloudCode contents
+      const contents =
+        (Array.isArray(parsedBody.contents) ? parsedBody.contents : null) ??
+        (Array.isArray((parsedBody.request as Record<string, unknown> | undefined)?.contents)
+          ? ((parsedBody.request as Record<string, unknown>).contents as unknown[])
+          : null);
+
+      if (contents && contents.length > 0) {
+        const firstTurn = contents[0];
+        const payload =
+          typeof firstTurn === 'object' && firstTurn !== null
+            ? JSON.stringify(firstTurn)
+            : String(firstTurn);
+        const hash = crypto.createHash('sha256').update(payload).digest('hex').slice(0, 16);
+        return `cloudcode:prefix:${hash}`;
+      }
+
+      // Anthropic / OpenAI format: messages
+      const messages =
+        (Array.isArray(parsedBody.messages) ? parsedBody.messages : null) ??
+        (Array.isArray((parsedBody.request as Record<string, unknown> | undefined)?.messages)
+          ? ((parsedBody.request as Record<string, unknown>).messages as unknown[])
+          : null);
+
+      if (messages && messages.length > 0) {
+        const firstMsg = messages[0];
+        const payload =
+          typeof firstMsg === 'object' && firstMsg !== null
+            ? JSON.stringify(firstMsg)
+            : String(firstMsg);
+        const hash = crypto.createHash('sha256').update(payload).digest('hex').slice(0, 16);
+        return `cloudcode:prefix:${hash}`;
+      }
+    }
+
+    return undefined;
   }
 }

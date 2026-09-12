@@ -54,11 +54,11 @@ export class AccountLeaseConfigPolicy {
 
   private getSchedulingMode(): AccountLeaseSelectionMode {
     const config = getServerConfig();
-    const mode = (config?.scheduling_mode ?? 'balance').toLowerCase();
+    const mode = (config?.scheduling_mode ?? 'cache-first').toLowerCase();
     if (mode === 'cache-first' || mode === 'performance-first' || mode === 'balance') {
       return mode;
     }
-    return 'balance';
+    return 'cache-first';
   }
 
   private getMaxWaitDurationMs(): number {

@@ -26,6 +26,7 @@ export interface ProxyRetryAccountLeaseService {
     model?: string;
   }): Promise<void>;
   markModelSuccess?(accountIdOrEmail: string, model: string): void;
+  bindSession?(sessionKey: string | undefined, accountId: string, ttlMs?: number): void;
 }
 
 interface ProxyRetryLogger {
@@ -92,7 +93,10 @@ export class ProxyRetryPolicy {
     );
   }
 
-  markUpstreamSuccess(accountId: string, model?: string): void {
+  markUpstreamSuccess(accountId: string, model?: string, sessionKey?: string): void {
+    if (sessionKey && this.accountLeaseService.bindSession) {
+      this.accountLeaseService.bindSession(sessionKey, accountId);
+    }
     if (!model) {
       return;
     }

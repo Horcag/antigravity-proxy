@@ -214,6 +214,136 @@ export class AccountLeaseSelectionPolicy {
     return candidates[this.currentIndex % candidates.length][0];
   }
 
+  private getActiveSessionCount(accountId: string, now: number): number {
+    let count = 0;
+    for (const binding of this.sessionBindings.values()) {
+      if (binding.accountId === accountId && binding.expiresAt > now) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  private pickBalancedEntry<T>(
+    candidates: Array<AccountLeaseSelectionEntry<T>>,
+    request: AccountLeaseSelectionRequest<T>,
+  ): AccountLeaseSelectionEntry<T> | null {
+    if (candidates.length === 0) {
+      return null;
+    }
+    if (candidates.length === 1) {
+      return candidates[0];
+    }
+
+    let minSessions = Infinity;
+    const sessionCounts = new Map<string, number>();
+    for (const [accountId] of candidates) {
+      const count = this.getActiveSessionCount(accountId, request.now);
+      sessionCounts.set(accountId, count);
+      if (count < minSessions) {
+        minSessions = count;
+      }
+    }
+
+    const leastLoaded = candidates.filter(
+      ([accountId]) => (sessionCounts.get(accountId) ?? 0) <= minSessions,
+    );
+
+    if (leastLoaded.length === 1) {
+      return leastLoaded[0];
+    }
+
+    if (request.getPerformanceScore) {
+      const scored = [...leastLoaded].sort(([leftId], [rightId]) => {
+        const leftScore = request.getPerformanceScore?.(
+          leftId,
+          this.getEffectiveModelForAccount(request, leftId),
+        ) ?? 0;
+        const rightScore = request.getPerformanceScore?.(
+          rightId,
+          this.getEffectiveModelForAccount(request, rightId),
+        ) ?? 0;
+        return rightScore - leftScore;
+      });
+      const topScore = request.getPerformanceScore(
+        scored[0][0],
+        this.getEffectiveModelForAccount(request, scored[0][0]),
+      );
+      const secondScore = scored.length > 1
+        ? request.getPerformanceScore(
+            scored[1][0],
+            this.getEffectiveModelForAccount(request, scored[1][0]),
+          )
+        : topScore;
+      if (topScore > secondScore + 0.05) {
+        return scored[0];
+      }
+    }
+
+    const picked = leastLoaded[this.currentIndex % leastLoaded.length];
+    this.currentIndex++;
+    return picked;
+  }
+
+  private peekBalancedCandidateAccountId<T>(
+    candidates: Array<AccountLeaseSelectionEntry<T>>,
+    request: AccountLeaseSelectionRequest<T>,
+  ): string | null {
+    if (candidates.length === 0) {
+      return null;
+    }
+    if (candidates.length === 1) {
+      return candidates[0][0];
+    }
+
+    let minSessions = Infinity;
+    const sessionCounts = new Map<string, number>();
+    for (const [accountId] of candidates) {
+      const count = this.getActiveSessionCount(accountId, request.now);
+      sessionCounts.set(accountId, count);
+      if (count < minSessions) {
+        minSessions = count;
+      }
+    }
+
+    const leastLoaded = candidates.filter(
+      ([accountId]) => (sessionCounts.get(accountId) ?? 0) <= minSessions,
+    );
+
+    if (leastLoaded.length === 1) {
+      return leastLoaded[0][0];
+    }
+
+    if (request.getPerformanceScore) {
+      const scored = [...leastLoaded].sort(([leftId], [rightId]) => {
+        const leftScore = request.getPerformanceScore?.(
+          leftId,
+          this.getEffectiveModelForAccount(request, leftId),
+        ) ?? 0;
+        const rightScore = request.getPerformanceScore?.(
+          rightId,
+          this.getEffectiveModelForAccount(request, rightId),
+        ) ?? 0;
+        return rightScore - leftScore;
+      });
+      const topScore = request.getPerformanceScore(
+        scored[0][0],
+        this.getEffectiveModelForAccount(request, scored[0][0]),
+      );
+      const secondScore = scored.length > 1
+        ? request.getPerformanceScore(
+            scored[1][0],
+            this.getEffectiveModelForAccount(request, scored[1][0]),
+          )
+        : topScore;
+      if (topScore > secondScore + 0.05) {
+        return scored[0][0];
+      }
+    }
+
+    return leastLoaded[this.currentIndex % leastLoaded.length][0];
+  }
+
   private selectLegacyTokenCandidate<T>(
     request: AccountLeaseSelectionRequest<T>,
   ): AccountLeaseSelectionEntry<T> | null {
@@ -249,7 +379,7 @@ export class AccountLeaseSelectionPolicy {
       return stickyToken;
     }
 
-    return this.pickRoundRobinEntry(candidateAccountPool);
+    return this.pickBalancedEntry(candidateAccountPool, request);
   }
 
   private async selectParityTokenCandidate<T>(
@@ -305,11 +435,13 @@ export class AccountLeaseSelectionPolicy {
         if (stickyAfterWait) {
           return stickyAfterWait;
         }
-        return this.pickRoundRobinEntry(refreshedAvailable);
+        return this.pickBalancedEntry(refreshedAvailable, request);
       }
     }
 
-    return this.pickRoundRobinEntry(availableTokens);
+    return request.config.schedulingMode === 'balance'
+      ? this.pickRoundRobinEntry(availableTokens)
+      : this.pickBalancedEntry(availableTokens, request);
   }
 
   private pickHighestPerformanceEntry<T>(
@@ -371,7 +503,7 @@ export class AccountLeaseSelectionPolicy {
       return stickyToken[0];
     }
 
-    return this.peekRoundRobinCandidateAccountId(candidateAccountPool);
+    return this.peekBalancedCandidateAccountId(candidateAccountPool, request);
   }
 
   private predictParityAccountCandidateId<T>(
@@ -402,7 +534,9 @@ export class AccountLeaseSelectionPolicy {
       return this.pickHighestPerformanceEntry(availableTokens, request)?.[0] ?? null;
     }
 
-    return this.peekRoundRobinCandidateAccountId(availableTokens);
+    return request.config.schedulingMode === 'balance'
+      ? this.peekRoundRobinCandidateAccountId(availableTokens)
+      : this.peekBalancedCandidateAccountId(availableTokens, request);
   }
 
   private executeShadowComparison<T>(request: AccountLeaseSelectionRequest<T>): void {

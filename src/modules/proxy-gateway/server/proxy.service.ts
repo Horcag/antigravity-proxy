@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { BadRequestException, HttpStatus, Injectable, Logger, Inject } from '@nestjs/common';
 import { isEmpty, isFunction, isNil, isNumber, isPlainObject, isString } from 'lodash-es';
 import { AccountLeaseService } from './account-lease.service';
@@ -214,8 +215,8 @@ export class ProxyService {
     };
   }
 
-  private markUpstreamSuccess(accountId: string, model: string): void {
-    this.retryPolicy.markUpstreamSuccess(accountId, model);
+  private markUpstreamSuccess(accountId: string, model: string, sessionKey?: string): void {
+    this.retryPolicy.markUpstreamSuccess(accountId, model, sessionKey);
     this.accountLeaseService.recordPerformanceSuccess?.(accountId, model);
   }
 
@@ -396,7 +397,7 @@ export class ProxyService {
             token.id,
             effectiveTargetModel,
           );
-          this.markUpstreamSuccess(token.id, effectiveTargetModel);
+          this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey);
           return this.toAnthropicChatResponse(
             transformResponse(response, signatureContext, request.model),
           );
@@ -1220,7 +1221,7 @@ export class ProxyService {
               token.id,
               effectiveTargetModel,
             );
-            this.markUpstreamSuccess(token.id, effectiveTargetModel);
+            this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey);
             const claudeResponse = transformResponse(response, signatureContext);
             const openaiResponse = this.convertClaudeToOpenAIResponse(
               claudeResponse,
@@ -1241,7 +1242,7 @@ export class ProxyService {
             token.id,
             effectiveTargetModel,
           );
-          this.markUpstreamSuccess(token.id, effectiveTargetModel);
+          this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey);
           // Transform Gemini response to OpenAI format
           const claudeResponse = transformResponse(response, signatureContext);
           return this.convertClaudeToOpenAIResponse(
@@ -3372,20 +3373,42 @@ export class ProxyService {
     const metadata = request.metadata;
     const sessionCandidate =
       metadata?.session_id ?? metadata?.sessionId ?? metadata?.user_id ?? metadata?.userId;
-    if (!isString(sessionCandidate) || isEmpty(sessionCandidate.trim())) {
-      return undefined;
+    if (isString(sessionCandidate) && !isEmpty(sessionCandidate.trim())) {
+      return `anthropic:${sessionCandidate.trim()}`;
     }
-    return `anthropic:${sessionCandidate.trim()}`;
+
+    if (Array.isArray(request.messages) && request.messages.length > 0) {
+      const firstMsg = request.messages[0];
+      const payload =
+        typeof firstMsg === 'object' && firstMsg !== null
+          ? JSON.stringify(firstMsg)
+          : String(firstMsg);
+      const hash = createHash('sha256').update(payload).digest('hex').slice(0, 16);
+      return `anthropic:prefix:${hash}`;
+    }
+
+    return undefined;
   }
 
   private extractOpenAISessionKey(request: OpenAIChatRequest): string | undefined {
     const extra = request.extra;
     const sessionCandidate =
       extra?.session_id ?? extra?.sessionId ?? extra?.user_id ?? extra?.userId;
-    if (!isString(sessionCandidate) || isEmpty(sessionCandidate.trim())) {
-      return undefined;
+    if (isString(sessionCandidate) && !isEmpty(sessionCandidate.trim())) {
+      return `openai:${sessionCandidate.trim()}`;
     }
-    return `openai:${sessionCandidate.trim()}`;
+
+    if (Array.isArray(request.messages) && request.messages.length > 0) {
+      const firstMsg = request.messages[0];
+      const payload =
+        typeof firstMsg === 'object' && firstMsg !== null
+          ? JSON.stringify(firstMsg)
+          : String(firstMsg);
+      const hash = createHash('sha256').update(payload).digest('hex').slice(0, 16);
+      return `openai:prefix:${hash}`;
+    }
+
+    return undefined;
   }
 
   private isGeminiPart(value: unknown): value is InternalGeminiPart {

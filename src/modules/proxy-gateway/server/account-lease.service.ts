@@ -104,7 +104,7 @@ export interface QuotaDiagnostics {
 @Injectable()
 export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(AccountLeaseService.name);
-  private readonly stickySessionTtlMs = 10 * 60 * 1000;
+  private readonly stickySessionTtlMs = 60 * 60 * 1000;
   private readonly rateLimitCooldownMs = 5 * 60 * 1000;
   private readonly forbiddenCooldownMs = 30 * 60 * 1000;
   private readonly quotaCatalogRefreshIntervalMs = QUOTA_REFRESH_INTERVAL_MS;
@@ -559,6 +559,14 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
 
   public resetSelectionState(): void {
     this.selectionPolicy.resetSelectionState();
+  }
+
+  public bindSession(sessionKey: string | undefined, accountId: string, ttlMs?: number): void {
+    if (!sessionKey) {
+      return;
+    }
+    const expiresAt = Date.now() + (ttlMs ?? this.stickySessionTtlMs);
+    this.selectionPolicy.bindSession(sessionKey, accountId, expiresAt);
   }
 
   private async finalizeSelectedToken(
