@@ -645,6 +645,11 @@ export class CloudCodeFailoverGateway {
             let decompressedBytes = 0;
             const decompressedChunks: Buffer[] = [];
 
+            // Bounded spool budget: allow non-streaming payloads (e.g. JSON model lists, code assist) up to 10 MiB to be fully spooled and verified
+            const MAX_SPOOL_BUDGET = 10 * 1024 * 1024;
+            const isJsonPayload = Boolean(contentType?.includes('application/json') || !contentType);
+            const inspectionBudget = isJsonPayload ? MAX_SPOOL_BUDGET : 65536;
+
             const encoding = (headers['content-encoding'] as string | undefined)?.toLowerCase().trim();
             let streamDecompressor: zlib.Gunzip | zlib.Inflate | zlib.BrotliDecompress | null = null;
 
@@ -713,7 +718,7 @@ export class CloudCodeFailoverGateway {
               }
 
               // Local inspection budget exhausted without qualifying frame:
-              if (totalRawBytes >= 65536 || decompressedBytes >= 65536) {
+              if (totalRawBytes >= inspectionBudget || decompressedBytes >= inspectionBudget) {
                 settled = true;
                 cleanup();
                 bodyStream.pause();
@@ -730,8 +735,8 @@ export class CloudCodeFailoverGateway {
               streamDecompressor.on('data', (dChunk: Buffer) => {
                 if (settled) return;
                 const buf = Buffer.isBuffer(dChunk) ? dChunk : Buffer.from(dChunk);
-                if (decompressedBytes < 65536) {
-                  const slice = buf.subarray(0, 65536 - decompressedBytes);
+                if (decompressedBytes < inspectionBudget) {
+                  const slice = buf.subarray(0, inspectionBudget - decompressedBytes);
                   decompressedChunks.push(slice);
                   decompressedBytes += slice.length;
                 }

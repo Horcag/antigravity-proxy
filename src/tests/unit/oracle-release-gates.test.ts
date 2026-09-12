@@ -781,4 +781,32 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     const rawBindingAfter = (leaseService as any).selectionPolicy.sessionBindings.get(sessionKey);
     expect(rawBindingAfter.migrationExpiresAt).toBeGreaterThan(migrationExpiresAtBefore);
   });
+
+  // T14-F02: Large valid JSON responses (>64 KiB) are fully classified as VALIDATED_RESPONSE at EOF without being cut off
+  it('T14-F02: Large valid JSON response (>64 KiB) at EOF classifies as VALIDATED_RESPONSE', () => {
+    const largeValidJson = Buffer.from(
+      JSON.stringify({
+        models: Array.from({ length: 500 }, (_, i) => ({
+          name: `model-${i}`,
+          displayName: `Model ${i} display name with long descriptive text to exceed 64 KiB easily`,
+          supportedMimeTypes: ['application/json', 'text/plain', 'image/png'],
+        })),
+      }),
+      'utf-8',
+    );
+    expect(largeValidJson.length).toBeGreaterThan(65536);
+
+    const decision = gateway.classifyProtocolFrame(
+      'application/json',
+      largeValidJson,
+      { 'content-type': 'application/json' } as any,
+      {},
+      true, // streamEnded
+      200,
+      false,
+    );
+
+    expect(decision.state).toBe('VALIDATED_RESPONSE');
+  });
 });
+
