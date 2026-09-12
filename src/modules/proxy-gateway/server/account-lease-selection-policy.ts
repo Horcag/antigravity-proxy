@@ -33,6 +33,7 @@ export function isVerifiedSessionKey(key: string | undefined): boolean {
 export interface SessionBindingEntry {
   accountId: string;
   generation: number;
+  tableIncarnation: number;
   state: SessionState;
   migratingToAccountId?: string;
   migrationOwnerRequestId?: string;
@@ -85,6 +86,7 @@ function compareCodeUnits(left: string, right: string): number {
 
 export class AccountLeaseSelectionPolicy {
   private currentIndex = 0;
+  private tableIncarnation = 1;
   private sessionBindings: Map<string, SessionBindingEntry> = new Map();
   private cacheHintBindings: Map<string, CacheHintEntry> = new Map();
   private parityRequestCount = 0;
@@ -102,6 +104,7 @@ export class AccountLeaseSelectionPolicy {
   }
 
   clearSessions(): void {
+    this.tableIncarnation++;
     this.sessionBindings.clear();
     this.cacheHintBindings.clear();
   }
@@ -222,7 +225,7 @@ export class AccountLeaseSelectionPolicy {
     }
     const current = this.sessionBindings.get(sessionKey);
     const now = Date.now();
-    if (current && current.expiresAt > now) {
+    if (current && current.expiresAt > now && current.tableIncarnation === this.tableIncarnation) {
       // If session is currently migrating, ordinary bindSession must NOT overwrite it (T10-F03)
       if (current.state === 'migrating') {
         return false;
@@ -238,6 +241,7 @@ export class AccountLeaseSelectionPolicy {
       this.sessionBindings.set(sessionKey, {
         ...current,
         accountId,
+        tableIncarnation: this.tableIncarnation,
         state: 'active',
         expiresAt,
         lastActivityAt: now,
@@ -246,13 +250,18 @@ export class AccountLeaseSelectionPolicy {
     }
 
     // New binding or expired session re-binding initialization
-    if (expectedGeneration !== undefined && expectedGeneration !== 1 && current && expectedGeneration !== current.generation) {
+    if (
+      expectedGeneration !== undefined &&
+      expectedGeneration !== 1 &&
+      (!current || current.tableIncarnation !== this.tableIncarnation || expectedGeneration !== current.generation)
+    ) {
       return false;
     }
 
     this.sessionBindings.set(sessionKey, {
       accountId,
-      generation: current ? current.generation : 1,
+      generation: current && current.tableIncarnation === this.tableIncarnation ? current.generation : 1,
+      tableIncarnation: this.tableIncarnation,
       state: 'active',
       expiresAt,
       lastActivityAt: now,
@@ -281,6 +290,9 @@ export class AccountLeaseSelectionPolicy {
     if (!current) {
       return null;
     }
+    if (current.tableIncarnation !== this.tableIncarnation) {
+      return null;
+    }
     const now = Date.now();
 
     // If currently migrating:
@@ -290,8 +302,9 @@ export class AccountLeaseSelectionPolicy {
       if (current.migrationOwnerRequestId === ownerRequestId && current.generation === currentGeneration) {
         this.sessionBindings.set(sessionKey, {
           ...current,
+          tableIncarnation: this.tableIncarnation,
           migratingToAccountId: targetAccountId,
-          migrationExpiresAt: now + 30000,
+          migrationExpiresAt: now + 60000,
           lastActivityAt: now,
         });
         return {
@@ -308,9 +321,10 @@ export class AccountLeaseSelectionPolicy {
           ...current,
           state: 'migrating',
           generation: newGen,
+          tableIncarnation: this.tableIncarnation,
           migratingToAccountId: targetAccountId,
           migrationOwnerRequestId: ownerRequestId,
-          migrationExpiresAt: now + 30000,
+          migrationExpiresAt: now + 60000,
           lastActivityAt: now,
         });
         return {
@@ -333,9 +347,10 @@ export class AccountLeaseSelectionPolicy {
       ...current,
       state: 'migrating',
       generation: newGen,
+      tableIncarnation: this.tableIncarnation,
       migratingToAccountId: targetAccountId,
       migrationOwnerRequestId: ownerRequestId,
-      migrationExpiresAt: now + 30000,
+      migrationExpiresAt: now + 60000,
       lastActivityAt: now,
     });
     return {
@@ -344,6 +359,28 @@ export class AccountLeaseSelectionPolicy {
       ownerRequestId,
       targetAccountId,
     };
+  }
+
+  renewSessionMigration(
+    sessionKey: string | undefined,
+    expectedGeneration: number,
+    ownerRequestId?: string,
+    extensionMs = 30000,
+  ): boolean {
+    if (!sessionKey || !ownerRequestId) return false;
+    const current = this.sessionBindings.get(sessionKey);
+    if (!current || current.state !== 'migrating') return false;
+    if (current.tableIncarnation !== this.tableIncarnation) return false;
+    if (current.generation !== expectedGeneration) return false;
+    if (current.migrationOwnerRequestId !== ownerRequestId) return false;
+    const now = Date.now();
+    if (current.migrationExpiresAt && now > current.migrationExpiresAt) return false;
+    this.sessionBindings.set(sessionKey, {
+      ...current,
+      migrationExpiresAt: now + extensionMs,
+      lastActivityAt: now,
+    });
+    return true;
   }
 
   failSessionMigrationCandidate(
@@ -355,6 +392,7 @@ export class AccountLeaseSelectionPolicy {
     if (!sessionKey || !failedAccountId || !ownerRequestId) return false;
     const current = this.sessionBindings.get(sessionKey);
     if (!current || current.state !== 'migrating') return false;
+    if (current.tableIncarnation !== this.tableIncarnation) return false;
     if (current.generation !== expectedGeneration) return false;
     if (current.migrationOwnerRequestId !== ownerRequestId) return false;
     if (current.migratingToAccountId === failedAccountId) {
@@ -378,6 +416,9 @@ export class AccountLeaseSelectionPolicy {
     if (!sessionKey || !targetAccountId || !ownerRequestId) return false;
     const current = this.sessionBindings.get(sessionKey);
     if (!current) {
+      return false;
+    }
+    if (current.tableIncarnation !== this.tableIncarnation) {
       return false;
     }
     const now = Date.now();
@@ -404,6 +445,7 @@ export class AccountLeaseSelectionPolicy {
     this.sessionBindings.set(sessionKey, {
       accountId: targetAccountId,
       generation: expectedGeneration,
+      tableIncarnation: this.tableIncarnation,
       state: 'active',
       migratingToAccountId: undefined,
       migrationOwnerRequestId: undefined,

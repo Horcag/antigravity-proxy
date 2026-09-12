@@ -1492,7 +1492,7 @@ legacy_user_systemd() {
     if [ "$1" = disable ] && [ "${RELEASE_TEST_LEGACY_DISABLE:-pass}" = fail ]; then
       return 1
     fi
-    return
+    return 0
   fi
   [ -n "$legacy_user" ] || die "migrate requires LEGACY_SERVICE_USER"
   uid="$(id -u "$legacy_user")"

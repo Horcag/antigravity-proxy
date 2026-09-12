@@ -215,13 +215,13 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     expect(capB).not.toBeNull();
     expect(capB?.generation).toBe(2);
     const confirmedB = leaseService.confirmOrBindSession(sessionKey, 'acc-2', 2, 'req-new');
-    expect(confirmedB).toBe(true);
+    expect(confirmedB).toEqual({ kind: 'confirmed' });
     expect(leaseService.getSessionBinding(sessionKey)?.accountId).toBe('acc-2');
     expect(leaseService.getSessionBinding(sessionKey)?.generation).toBe(2);
 
     // Old attempt on A arrives with expectedGeneration=1 and req-old
     const staleResult = leaseService.confirmOrBindSession(sessionKey, 'acc-1', 1, 'req-old');
-    expect(staleResult).toBe(false);
+    expect(staleResult).toEqual({ kind: 'rejected', reason: expect.any(String) });
     // State remains active on acc-2, generation 2
     const current = leaseService.getSessionBinding(sessionKey);
     expect(current?.accountId).toBe('acc-2');
@@ -257,7 +257,7 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
       retryState.breakerGeneration,
       retryState.requestId,
     );
-    expect(confirmed).toBe(true);
+    expect(confirmed).toEqual({ kind: 'confirmed' });
 
     const binding = leaseService.getSessionBinding(sessionKey);
     expect(binding?.accountId).toBe('acc-2');
@@ -275,11 +275,11 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
 
     // Caller passes no owner requestId
     const acceptedWithoutOwner = leaseService.confirmOrBindSession(sessionKey, 'acc-2', 2);
-    expect(acceptedWithoutOwner).toBe(false);
+    expect(acceptedWithoutOwner).toEqual({ kind: 'rejected', reason: expect.any(String) });
 
     // Caller passes wrong owner
     const acceptedWrongOwner = leaseService.confirmOrBindSession(sessionKey, 'acc-2', 2, 'impostor');
-    expect(acceptedWrongOwner).toBe(false);
+    expect(acceptedWrongOwner).toEqual({ kind: 'rejected', reason: expect.any(String) });
 
     // State remains migrating
     expect(leaseService.getSessionBinding(sessionKey)?.state).toBe('migrating');
@@ -339,7 +339,7 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
 
     // 2. In leaseService.confirmOrBindSession
     const confirmed = leaseService.confirmOrBindSession(hintKey, 'acc-2', 1, 'req-hint');
-    expect(confirmed).toBe(false);
+    expect(confirmed).toEqual({ kind: 'hint-recorded' });
     expect(leaseService.getSessionBinding(hintKey)).toBeNull();
     expect((leaseService as any).selectionPolicy.getCacheHint(hintKey)).toBe('acc-2');
   });
@@ -356,10 +356,12 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     socket.destroy = vi.fn();
 
     ingress.handleConnect(
-      { headers: { host: 'daily-cloudcode-pa.googleapis.com:443junk' } } as any,
+      {
+        url: 'daily-cloudcode-pa.googleapis.com:443junk',
+        headers: { host: 'daily-cloudcode-pa.googleapis.com:443junk' },
+      } as any,
       socket,
       Buffer.alloc(0),
-      'daily-cloudcode-pa.googleapis.com:443junk',
     );
 
     expect(socket.write).toHaveBeenCalledWith('HTTP/1.1 400 Bad Request\r\n\r\n');
@@ -431,5 +433,240 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     expect(attemptCount).toBe(2);
     // Ensure final response committed was from acc-2
     expect(res.writeHead).toHaveBeenCalledWith(200, expect.objectContaining({ 'content-type': 'application/json' }));
+  });
+
+  // T13-F02: Migration is initiated on account change on attempt 1
+  it('T13-F02: Session migration is initiated on attempt 1 when account differs from bound account', () => {
+    const sessionKey = 'session:t13-f02-test';
+    leaseService.bindSession(sessionKey, 'acc-1', 60000);
+    const initialBinding = leaseService.getSessionBinding(sessionKey);
+    expect(initialBinding?.accountId).toBe('acc-1');
+
+    // On attempt 1, scheduler picked acc-2 because acc-1 was unavailable
+    const selectedAccount = { id: 'acc-2' };
+    const needsMigration = Boolean(
+      sessionKey &&
+      selectedAccount &&
+      initialBinding &&
+      initialBinding.accountId !== selectedAccount.id,
+    );
+    expect(needsMigration).toBe(true);
+
+    const migrationCap = leaseService.startSessionMigration(
+      sessionKey,
+      initialBinding!.generation,
+      selectedAccount.id,
+      'req-attempt-1',
+    );
+    expect(migrationCap).not.toBeNull();
+    expect(migrationCap?.generation).toBe(2);
+    expect(migrationCap?.targetAccountId).toBe('acc-2');
+
+    // Now confirm on attempt 1 succeeds with acc-2
+    const commitResult = leaseService.confirmOrBindSession(
+      sessionKey,
+      'acc-2',
+      migrationCap!.generation,
+      'req-attempt-1',
+    );
+    expect(commitResult).toEqual({ kind: 'confirmed' });
+    expect(leaseService.getSessionBinding(sessionKey)?.accountId).toBe('acc-2');
+  });
+
+  // T13-F03: 80KB JSON on HTTP 200 is validated without cycling accounts
+  it('T13-F03: 80KB JSON on HTTP 200 is classified as VALIDATED_RESPONSE without cycling accounts', async () => {
+    let attempts = 0;
+    const largeJson = JSON.stringify({
+      responseBytes: 80052,
+      data: 'x'.repeat(80000),
+    });
+    const largeBuf = Buffer.from(largeJson, 'utf-8');
+
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async () => {
+      attempts++;
+      // Split 80KB buffer into 4 chunks to simulate ordinary chunked delivery
+      const chunkSize = 20000;
+      const chunks = [
+        largeBuf.subarray(0, chunkSize),
+        largeBuf.subarray(chunkSize, chunkSize * 2),
+        largeBuf.subarray(chunkSize * 2, chunkSize * 3),
+        largeBuf.subarray(chunkSize * 3),
+      ];
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'application/json', 'content-length': String(largeBuf.length) },
+        bodyStream: createMockStream(chunks),
+        bufferedBody: largeBuf,
+      };
+    });
+
+    const req = createMockRequest({
+      headers: { host: 'daily-cloudcode-pa.googleapis.com', 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt: 'big' }),
+    });
+    const res = createMockResponse();
+
+    await gateway.handleRequest(req, res);
+
+    expect(attempts).toBe(1);
+    expect(res.writeHead).toHaveBeenCalledWith(200, expect.anything());
+  });
+
+  // T13-F03: Locally detected malformed responses on HTTP 200 synthesize 502 Bad Gateway
+  it('T13-F03: Truncated JSON at EOF with HTTP 200 synthesizes 502 Bad Gateway instead of forwarding 200', async () => {
+    const malformedBuf = Buffer.from('{"error":', 'utf-8');
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async () => {
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'application/json' },
+        bodyStream: createMockStream([malformedBuf]),
+        bufferedBody: malformedBuf,
+      };
+    });
+
+    const req = createMockRequest({
+      headers: { host: 'daily-cloudcode-pa.googleapis.com', 'content-type': 'application/json' },
+      body: JSON.stringify({ prompt: 'test' }),
+    });
+    const res = createMockResponse();
+
+    await gateway.handleRequest(req, res);
+
+    expect(res.writeHead).toHaveBeenCalledWith(
+      502,
+      expect.objectContaining({ 'content-type': 'application/json; charset=utf-8' }),
+    );
+  });
+
+  // T13-F04: Incremental gzip stream with sync flush produces complete event before stream ends
+  it('T13-F04: classifyProtocolFrame handles gzip streamed chunk and enforces maxOutputLength', () => {
+    // 1. Sync flushed gzip chunk
+    const sseEvent = 'data: {"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}\n\n';
+    const compressedChunk = zlib.gzipSync(Buffer.from(sseEvent, 'utf-8'));
+    const decision = gateway.classifyProtocolFrame(
+      'text/event-stream',
+      compressedChunk,
+      { 'content-encoding': 'gzip' },
+      undefined,
+      false,
+    );
+    expect(decision.state).toBe('VALIDATED_RESPONSE');
+
+    // 2. Exceeding maxOutputLength triggers bounded rejection rather than memory explosion
+    const hugeBuffer = Buffer.alloc(100000, 'a');
+    const bombChunk = zlib.gzipSync(hugeBuffer);
+    const bombDecision = gateway.classifyProtocolFrame(
+      'application/json',
+      bombChunk,
+      { 'content-encoding': 'gzip' },
+      undefined,
+      true,
+    );
+    expect(bombDecision.state).toBe('VALIDATED_ERROR');
+    expect(bombDecision.category).toBe('unsupported-encoding');
+  });
+
+  // T13-F05: gRPC and gRPC-Web framing interpretation
+  it('T13-F05: gRPC-Web trailers frame 0x80 status 8 is classified as quota error', () => {
+    // Probe C06: gRPC-Web trailers frame (flag 0x80) with grpc-status: 8
+    const trailerBody = 'grpc-status: 8\r\ngrpc-message: Resource exhausted\r\n';
+    const trailerBuf = Buffer.from(trailerBody, 'utf-8');
+    const frame = Buffer.alloc(5 + trailerBuf.length);
+    frame.writeUInt8(0x80, 0); // Trailers flag
+    frame.writeUInt32BE(trailerBuf.length, 1);
+    trailerBuf.copy(frame, 5);
+
+    const decision = gateway.classifyProtocolFrame(
+      'application/grpc-web+proto',
+      frame,
+      undefined,
+      undefined,
+      false,
+    );
+    expect(decision.state).toBe('VALIDATED_ERROR');
+    expect(decision.isQuota).toBe(true);
+    expect(decision.category).toBe('account-quota');
+  });
+
+  it('T13-F05: Native gRPC frame with invalid compressed flag 0x7f is classified as error', () => {
+    // Probe C07: Native gRPC frame with invalid compressed flag 0x7f
+    const frame = Buffer.alloc(10);
+    frame.writeUInt8(0x7f, 0); // Invalid flag
+    frame.writeUInt32BE(5, 1);
+
+    const decision = gateway.classifyProtocolFrame(
+      'application/grpc',
+      frame,
+      undefined,
+      undefined,
+      false,
+    );
+    expect(decision.state).toBe('VALIDATED_ERROR');
+    expect(decision.isLocalValidationError).toBe(true);
+  });
+
+  it('T13-F05: Empty successful gRPC response with terminal status 0 is VALIDATED_RESPONSE', () => {
+    // Probe C08: Empty gRPC stream at EOF with terminal status 0
+    const decision = gateway.classifyProtocolFrame(
+      'application/grpc',
+      Buffer.alloc(0),
+      { 'grpc-status': '0' },
+      undefined,
+      true,
+    );
+    expect(decision.state).toBe('VALIDATED_RESPONSE');
+  });
+
+  // T13-F06: Native successful hint requests populate the cache hint store
+  it('T13-F06: Native successful hint requests populate the cache hint store', async () => {
+    const hintKey = 'hint:prefix:session-locality-native';
+    const bodyBuf = Buffer.from('{"candidates":[{"content":{"parts":[{"text":"Success"}]}}]}');
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async () => {
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'application/json' },
+        bodyStream: createMockStream([bodyBuf]),
+        bufferedBody: bodyBuf,
+      };
+    });
+
+    const req = createMockRequest({
+      headers: {
+        host: 'daily-cloudcode-pa.googleapis.com',
+        'content-type': 'application/json',
+        'x-session-id': hintKey,
+      },
+      body: JSON.stringify({ prompt: 'test' }),
+    });
+    const res = createMockResponse();
+
+    await gateway.handleRequest(req, res);
+
+    // Verify soft hint store was populated
+    expect((leaseService as any).selectionPolicy.getCacheHint(hintKey)).toBe('acc-1');
+    // Verify no hard session binding was created
+    expect(leaseService.getSessionBinding(hintKey)).toBeNull();
+  });
+
+  // T13-F01: Confirmation rejection is propagated as AffinityCommitResult rejected
+  it('T13-F01: Confirmation rejection is strictly propagated as AffinityCommitResult rejected', () => {
+    vi.spyOn(leaseService, 'confirmOrBindSession').mockReturnValue({
+      kind: 'rejected',
+      reason: 'Binding rejected in test',
+    });
+
+    const retryPolicy = new ProxyRetryPolicy(leaseService, console as any);
+    const commitResult = retryPolicy.markUpstreamSuccess(
+      'acc-1',
+      'gemini-2.5-flash',
+      'session:rejected-test',
+      1,
+      1,
+      'req-test',
+    );
+    expect(commitResult).toEqual({
+      kind: 'rejected',
+      reason: 'Binding rejected in test',
+    });
   });
 });

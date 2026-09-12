@@ -48,6 +48,12 @@ export interface AttemptLease {
   readonly isReleased: boolean;
 }
 
+export type AffinityCommitResult =
+  | { kind: 'confirmed' }
+  | { kind: 'hint-recorded' }
+  | { kind: 'not-applicable' }
+  | { kind: 'rejected'; reason: string };
+
 export class Mutex {
   private queue = Promise.resolve();
   acquire(): Promise<() => void> {
@@ -758,6 +764,10 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     return this.selectionPolicy.getSessionBinding(sessionKey);
   }
 
+  public recordCacheHint(hintKey: string, accountId: string, ttlMs?: number): void {
+    this.selectionPolicy.recordCacheHint(hintKey, accountId, ttlMs);
+  }
+
   public startSessionMigration(
     sessionKey: string | undefined,
     currentGeneration: number,
@@ -803,22 +813,37 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
+  public renewSessionMigration(
+    sessionKey: string | undefined,
+    expectedGeneration: number,
+    ownerRequestId?: string,
+    extensionMs?: number,
+  ): boolean {
+    return this.selectionPolicy.renewSessionMigration(
+      sessionKey,
+      expectedGeneration,
+      ownerRequestId,
+      extensionMs,
+    );
+  }
+
   public confirmOrBindSession(
     sessionKey: string | undefined,
     accountId: string,
     expectedGeneration?: number,
     ownerRequestId?: string,
     ttlMs?: number,
-  ): boolean {
-    if (!sessionKey || !accountId) return false;
+  ): AffinityCommitResult {
+    if (!sessionKey || !accountId) return { kind: 'not-applicable' };
 
     // Gate 9 & T12-F04: Hint isolation. Unverified session keys (e.g. hint:prefix:...)
     // must NEVER mutate hard session bindings or trigger migration.
     if (!isVerifiedSessionKey(sessionKey)) {
       if (isHintSessionKey(sessionKey)) {
         this.selectionPolicy.recordCacheHint(sessionKey, accountId, ttlMs);
+        return { kind: 'hint-recorded' };
       }
-      return false;
+      return { kind: 'not-applicable' };
     }
 
     const current = this.selectionPolicy.getSessionBinding(sessionKey);
@@ -828,42 +853,60 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     if (current && current.state === 'migrating') {
       // Must supply ownerRequestId and expectedGeneration! Never inherit owner from current state!
       if (!ownerRequestId || expectedGeneration === undefined) {
-        return false;
+        return {
+          kind: 'rejected',
+          reason: 'Cannot confirm migration without ownerRequestId and expectedGeneration',
+        };
       }
-      return this.selectionPolicy.confirmSessionMigration(
+      const success = this.selectionPolicy.confirmSessionMigration(
         sessionKey,
         expectedGeneration,
         accountId,
         ownerRequestId,
         expiresAt,
       );
+      return success
+        ? { kind: 'confirmed' }
+        : { kind: 'rejected', reason: 'confirmSessionMigration rejected (mismatched owner, generation, or expired)' };
     }
 
     // Gate 3 & T12-F02 3.1: Attempting a different account when active on another without active migration
     if (current && current.accountId !== accountId) {
-      return false;
+      return {
+        kind: 'rejected',
+        reason: `Session ${sessionKey} is active on account ${current.accountId}, cannot bind to ${accountId} without migration`,
+      };
     }
 
     // Refresh existing active binding on same account
     if (current && current.accountId === accountId) {
       if (expectedGeneration !== undefined && expectedGeneration !== current.generation) {
-        return false;
+        return {
+          kind: 'rejected',
+          reason: `Expected generation ${expectedGeneration} does not match current generation ${current.generation}`,
+        };
       }
-      return this.selectionPolicy.bindSession(
+      const success = this.selectionPolicy.bindSession(
         sessionKey,
         accountId,
         expiresAt,
         expectedGeneration ?? current.generation,
       );
+      return success
+        ? { kind: 'confirmed' }
+        : { kind: 'rejected', reason: 'bindSession rejected for active session' };
     }
 
     // Initial binding for new/expired session
-    return this.selectionPolicy.bindSession(
+    const success = this.selectionPolicy.bindSession(
       sessionKey,
       accountId,
       expiresAt,
       expectedGeneration,
     );
+    return success
+      ? { kind: 'confirmed' }
+      : { kind: 'rejected', reason: 'Initial bindSession rejected (stale generation or incarnation)' };
   }
 
   public acquireWorkReservation(accountId: string): () => void {

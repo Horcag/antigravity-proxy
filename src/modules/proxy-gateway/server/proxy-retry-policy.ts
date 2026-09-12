@@ -9,6 +9,9 @@ import {
   type MigrationCapability,
   isVerifiedSessionKey,
 } from './account-lease-selection-policy';
+import { type AffinityCommitResult } from './account-lease.service';
+
+export { type AffinityCommitResult };
 
 export interface ProxyTokenRetryState {
   attemptedAccountIds: Set<string>;
@@ -57,7 +60,7 @@ export interface ProxyRetryAccountLeaseService {
     expectedGeneration?: number,
     ownerRequestId?: string,
     ttlMs?: number,
-  ): boolean;
+  ): AffinityCommitResult | boolean;
   startSessionMigration?(
     sessionKey: string | undefined,
     currentGeneration: number,
@@ -204,28 +207,36 @@ export class ProxyRetryPolicy {
     expectedGeneration?: number,
     expectedBreakerGeneration?: number,
     ownerRequestId?: string,
-  ): boolean {
-    let sessionConfirmed = true;
+  ): AffinityCommitResult {
+    let commitResult: AffinityCommitResult = { kind: 'not-applicable' };
     if (sessionKey) {
       if (typeof this.accountLeaseService.confirmOrBindSession === 'function') {
-        sessionConfirmed = this.accountLeaseService.confirmOrBindSession(
+        const res = this.accountLeaseService.confirmOrBindSession(
           sessionKey,
           accountId,
           expectedGeneration,
           ownerRequestId,
         );
+        commitResult =
+          typeof res === 'boolean'
+            ? res
+              ? { kind: 'confirmed' }
+              : { kind: 'rejected', reason: 'confirmOrBindSession returned false' }
+            : res;
       } else if (this.accountLeaseService.bindSession) {
         if (expectedGeneration !== undefined) {
-          sessionConfirmed =
+          const bound =
             this.accountLeaseService.bindSession(sessionKey, accountId, undefined, expectedGeneration) !==
             false;
+          commitResult = bound ? { kind: 'confirmed' } : { kind: 'rejected', reason: 'bindSession returned false' };
         } else {
-          sessionConfirmed = this.accountLeaseService.bindSession(sessionKey, accountId) !== false;
+          const bound = this.accountLeaseService.bindSession(sessionKey, accountId) !== false;
+          commitResult = bound ? { kind: 'confirmed' } : { kind: 'rejected', reason: 'bindSession returned false' };
         }
       }
     }
     if (!model) {
-      return sessionConfirmed;
+      return commitResult;
     }
 
     if (expectedBreakerGeneration !== undefined) {
@@ -239,7 +250,7 @@ export class ProxyRetryPolicy {
     if (expectedBreakerGeneration === undefined || currentBreaker === expectedBreakerGeneration) {
       proxyModelAvailabilityStore.clearModel(accountId, model);
     }
-    return sessionConfirmed;
+    return commitResult;
   }
 
   async applyUpstreamPenalty(

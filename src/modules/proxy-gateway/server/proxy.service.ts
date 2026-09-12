@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
-import { BadRequestException, HttpStatus, Injectable, Logger, Inject } from '@nestjs/common';
+import { BadRequestException, HttpException, HttpStatus, Injectable, Logger, Inject } from '@nestjs/common';
 import { isEmpty, isFunction, isNil, isNumber, isPlainObject, isString } from 'lodash-es';
-import { AccountLeaseService } from './account-lease.service';
+import { AccountLeaseService, type AffinityCommitResult } from './account-lease.service';
 import { GeminiClient, unwrapInternalGeminiResponse } from './clients/gemini.client';
 import { UpstreamRequestError } from './clients/upstream-error';
 import { AccountPoolUnavailableException, OpenAIProtocolException } from './openai-protocol-error';
@@ -67,7 +67,7 @@ interface StreamIdleTimer {
 }
 
 interface StreamHealthLifecycle {
-  markUsableOutput: () => void;
+  markUsableOutput: () => boolean;
   recordFailure: (error: unknown) => void;
   cleanup?: () => void;
 }
@@ -208,10 +208,9 @@ export class ProxyService {
     return {
       markUsableOutput: () => {
         if (hasMarkedSuccess) {
-          return;
+          return true;
         }
-        hasMarkedSuccess = true;
-        this.retryPolicy.markUpstreamSuccess(
+        const commitResult = this.retryPolicy.markUpstreamSuccess(
           accountId,
           model,
           sessionKey,
@@ -219,11 +218,16 @@ export class ProxyService {
           expectedBreakerGeneration,
           ownerRequestId,
         );
+        if (commitResult.kind === 'rejected') {
+          return false;
+        }
+        hasMarkedSuccess = true;
         this.accountLeaseService.recordPerformanceSuccess?.(
           accountId,
           model,
           performance.now() - startedAt,
         );
+        return true;
       },
       recordFailure: (error: unknown) => {
         cleanup();
@@ -245,12 +249,12 @@ export class ProxyService {
     model: string,
     sessionKey?: string,
     retryState?: ProxyTokenRetryState,
-  ): boolean {
+  ): AffinityCommitResult {
     retryState?.activeReservation?.();
     if (retryState) {
       retryState.activeReservation = undefined;
     }
-    const confirmed = this.retryPolicy.markUpstreamSuccess(
+    const commitResult = this.retryPolicy.markUpstreamSuccess(
       accountId,
       model,
       sessionKey,
@@ -259,7 +263,7 @@ export class ProxyService {
       retryState?.requestId,
     );
     this.accountLeaseService.recordPerformanceSuccess?.(accountId, model);
-    return confirmed;
+    return commitResult;
   }
 
   private async executeUpstreamAttempt<T>(
@@ -450,7 +454,13 @@ export class ProxyService {
             token.id,
             effectiveTargetModel,
           );
-          this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
+          const commitResult = this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
+          if (commitResult.kind === 'rejected') {
+            throw new HttpException(
+              `Session affinity confirmation rejected: ${commitResult.reason}`,
+              HttpStatus.CONFLICT,
+            );
+          }
           return this.toAnthropicChatResponse(
             transformResponse(response, signatureContext, request.model),
           );
@@ -628,8 +638,11 @@ export class ProxyService {
           if (hasUsableCandidate) {
             const startMsg = state.emitMessageStart(json);
             if (startMsg) {
+              if (!streamHealth.markUsableOutput()) {
+                failStream(new Error('Session affinity confirmation rejected'), true);
+                return;
+              }
               hasUsableEvent = true;
-              streamHealth.markUsableOutput();
               subscriber.next(startMsg);
             }
 
@@ -966,8 +979,11 @@ export class ProxyService {
           return;
         }
         if (validation.hasUsableOutput) {
+          if (!streamHealth.markUsableOutput()) {
+            failStream(new Error('Session affinity confirmation rejected'));
+            return;
+          }
           receivedUsableOutput = true;
-          streamHealth.markUsableOutput();
         }
         subscriber.next(frame);
       };
@@ -1312,7 +1328,13 @@ export class ProxyService {
               token.id,
               effectiveTargetModel,
             );
-            this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
+            const commitResult = this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
+            if (commitResult.kind === 'rejected') {
+              throw new HttpException(
+                `Session affinity confirmation rejected: ${commitResult.reason}`,
+                HttpStatus.CONFLICT,
+              );
+            }
             const claudeResponse = transformResponse(response, signatureContext);
             const openaiResponse = this.convertClaudeToOpenAIResponse(
               claudeResponse,
@@ -1333,7 +1355,13 @@ export class ProxyService {
             token.id,
             effectiveTargetModel,
           );
-          this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
+          const commitResult = this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
+          if (commitResult.kind === 'rejected') {
+            throw new HttpException(
+              `Session affinity confirmation rejected: ${commitResult.reason}`,
+              HttpStatus.CONFLICT,
+            );
+          }
           // Transform Gemini response to OpenAI format
           const claudeResponse = transformResponse(response, signatureContext);
           return this.convertClaudeToOpenAIResponse(
@@ -1975,7 +2003,10 @@ export class ProxyService {
         if (!terminate()) {
           return;
         }
-        streamHealth?.markUsableOutput();
+        if (streamHealth && !streamHealth.markUsableOutput()) {
+          subscriber.error(new Error('Session affinity confirmation rejected'));
+          return;
+        }
         for (const event of mapper.complete(finishReason)) {
           subscriber.next(event);
         }
@@ -2069,8 +2100,11 @@ export class ProxyService {
               if (normalizedPart) {
                 const events = mapper.processPart(normalizedPart);
                 if (events.length > 0) {
+                  if (streamHealth && !streamHealth.markUsableOutput()) {
+                    fail('Session affinity confirmation rejected', 'affinity_rejected');
+                    return;
+                  }
                   receivedUsableOutput = true;
-                  streamHealth?.markUsableOutput();
                 }
                 for (const event of events) {
                   subscriber.next(event);
@@ -2082,8 +2116,11 @@ export class ProxyService {
           if (grounding) {
             const events = mapper.processGrounding(grounding);
             if (events.length > 0) {
+              if (streamHealth && !streamHealth.markUsableOutput()) {
+                fail('Session affinity confirmation rejected', 'affinity_rejected');
+                return;
+              }
               receivedUsableOutput = true;
-              streamHealth?.markUsableOutput();
             }
             for (const event of events) {
               subscriber.next(event);
@@ -2423,8 +2460,11 @@ export class ProxyService {
 
       const pushChoice = (choice: Record<string, unknown>, countsAsUsable = true): void => {
         if (countsAsUsable) {
+          if (streamHealth && !streamHealth.markUsableOutput()) {
+            failStream(new Error('Session affinity confirmation rejected'));
+            return;
+          }
           hasEmittedChunk = true;
-          streamHealth?.markUsableOutput();
         }
         subscriber.next(
           `data: ${JSON.stringify(this.buildOpenAIStreamChunk(identity, streamOptions, [choice]))}\n\n`,

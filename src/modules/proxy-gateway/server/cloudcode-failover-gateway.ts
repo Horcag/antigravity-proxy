@@ -17,11 +17,21 @@ import {
 
 export { isVerifiedSessionKey, isHintSessionKey };
 
+export type ProtocolFailureCategory =
+  | 'inspection-limit'
+  | 'unsupported-encoding'
+  | 'malformed-upstream-message'
+  | 'deadline-exceeded'
+  | 'account-quota'
+  | 'upstream-transient';
+
 export interface ProtocolFrameDecision {
   state: 'NEED_MORE_DATA' | 'VALIDATED_RESPONSE' | 'VALIDATED_ERROR';
   isQuota?: boolean;
   isTransient?: boolean;
   errorText?: string;
+  category?: ProtocolFailureCategory;
+  isLocalValidationError?: boolean;
 }
 
 export interface CloudCodeGatewayOptions {
@@ -222,9 +232,39 @@ export class CloudCodeFailoverGateway {
     // 3. Failover retry loop (ResponseCommitGate)
     const attemptedAccountIds = new Set<string>();
     const maxAttempts = 5;
+    const requestStartTime = Date.now();
+    const LOGICAL_REQUEST_DEADLINE_MS = 120000;
+    const deadlineAt = requestStartTime + LOGICAL_REQUEST_DEADLINE_MS;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (clientAborted || res.destroyed) {
+        return;
+      }
+
+      const remainingTimeMs = deadlineAt - Date.now();
+      if (remainingTimeMs <= 0) {
+        logger.warn(
+          `[CloudCodeGateway] Logical request deadline exceeded (${LOGICAL_REQUEST_DEADLINE_MS}ms) before attempt ${attempt}`,
+        );
+        if (!responseCommitted && !res.headersSent && !res.writableEnded) {
+          responseCommitted = true;
+          const errorBody = Buffer.from(
+            JSON.stringify({
+              error: {
+                code: 504,
+                status: 'DEADLINE_EXCEEDED',
+                message: 'Gateway Timeout: Overall request deadline exceeded',
+                category: 'deadline-exceeded',
+              },
+            }),
+            'utf-8',
+          );
+          this.writeHeaders(res, 504, {
+            'content-type': 'application/json; charset=utf-8',
+            'content-length': String(errorBody.length),
+          });
+          res.end(errorBody);
+        }
         return;
       }
 
@@ -300,8 +340,16 @@ export class CloudCodeFailoverGateway {
       let attemptGeneration = lease?.generation ?? initialBinding?.generation ?? 1;
       let migrationCapability: MigrationCapability | null = null;
 
+      const needsMigration = Boolean(
+        sessionKey &&
+        isVerifiedSessionKey(sessionKey) &&
+        account &&
+        initialBinding &&
+        initialBinding.accountId !== account.id,
+      );
+
       if (
-        attempt > 1 &&
+        (attempt > 1 || needsMigration) &&
         sessionKey &&
         isVerifiedSessionKey(sessionKey) &&
         account &&
@@ -422,6 +470,7 @@ export class CloudCodeFailoverGateway {
           (upReq) => {
             currentUpstreamReq = upReq;
           },
+          deadlineAt,
         );
 
         const { statusCode, headers, bodyStream, bufferedBody } = upstreamResult;
@@ -549,7 +598,34 @@ export class CloudCodeFailoverGateway {
           (resolve, reject) => {
             let settled = false;
             const chunks: Buffer[] = [];
-            let totalBytes = 0;
+            let totalRawBytes = 0;
+            let decompressedBytes = 0;
+            const decompressedChunks: Buffer[] = [];
+
+            const encoding = (headers['content-encoding'] as string | undefined)?.toLowerCase().trim();
+            let streamDecompressor: zlib.Gunzip | zlib.Inflate | zlib.BrotliDecompress | null = null;
+
+            if (encoding === 'gzip' || encoding === 'x-gzip') {
+              streamDecompressor = zlib.createGunzip();
+            } else if (encoding === 'deflate') {
+              streamDecompressor = zlib.createInflate();
+            } else if (encoding === 'br') {
+              streamDecompressor = zlib.createBrotliDecompress();
+            }
+
+            if (streamDecompressor) {
+              streamDecompressor.on('data', (dChunk: Buffer) => {
+                if (decompressedBytes < 65536) {
+                  const slice = dChunk.subarray(0, 65536 - decompressedBytes);
+                  decompressedChunks.push(slice);
+                  decompressedBytes += slice.length;
+                }
+              });
+              streamDecompressor.on('error', () => {
+                // Ignore stream decompressor error during incremental inspection
+              });
+            }
+
             const cleanup = () => {
               bodyStream.removeListener('data', onData);
               bodyStream.removeListener('end', onEnd);
@@ -557,40 +633,80 @@ export class CloudCodeFailoverGateway {
               bodyStream.removeListener('error', onError);
               req.removeListener?.('close', onClientClose);
               res.removeListener?.('close', onClientClose);
+              if (streamDecompressor) {
+                streamDecompressor.removeAllListeners();
+              }
             };
+
             const onData = (chunk: Buffer) => {
               if (settled) return;
               const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
               chunks.push(buf);
-              totalBytes += buf.length;
-              const combined = Buffer.concat(chunks);
+              totalRawBytes += buf.length;
+
+              if (streamDecompressor) {
+                try {
+                  streamDecompressor.write(buf);
+                } catch {
+                  // Ignore write errors
+                }
+              }
+
+              const inspectionBuffer = streamDecompressor
+                ? (decompressedChunks.length > 0 ? Buffer.concat(decompressedChunks) : null)
+                : Buffer.concat(chunks);
+
               const decision = this.classifyProtocolFrame(
                 contentType,
-                combined,
+                inspectionBuffer,
                 headers,
                 bodyStream.trailers,
+                false,
+                statusCode,
               );
-              if (decision.state !== 'NEED_MORE_DATA' || totalBytes >= 65536) {
+
+              const isHealthyLargeResponse =
+                statusCode >= 200 &&
+                statusCode < 300 &&
+                decision.state === 'NEED_MORE_DATA' &&
+                (totalRawBytes >= 65536 || decompressedBytes >= 65536) &&
+                inspectionBuffer !== null &&
+                !inspectionBuffer.toString('utf-8').slice(0, 4096).includes('"error"');
+
+              if (decision.state !== 'NEED_MORE_DATA' || isHealthyLargeResponse) {
                 settled = true;
                 cleanup();
                 bodyStream.pause();
-                resolve({ buffer: combined, decision });
+                const finalDecision = isHealthyLargeResponse
+                  ? ({ state: 'VALIDATED_RESPONSE' as const })
+                  : decision;
+                resolve({ buffer: Buffer.concat(chunks), decision: finalDecision });
               }
             };
+
             const onEnd = () => {
               if (settled) return;
               settled = true;
               cleanup();
-              const combined = chunks.length > 0 ? Buffer.concat(chunks) : null;
+              if (streamDecompressor) {
+                try {
+                  streamDecompressor.end();
+                } catch {}
+              }
+              const inspectionBuffer = streamDecompressor
+                ? (decompressedChunks.length > 0 ? Buffer.concat(decompressedChunks) : null)
+                : (chunks.length > 0 ? Buffer.concat(chunks) : null);
               const decision = this.classifyProtocolFrame(
                 contentType,
-                combined,
+                inspectionBuffer,
                 headers,
                 bodyStream.trailers,
                 true,
+                statusCode,
               );
-              resolve({ buffer: combined, decision });
+              resolve({ buffer: chunks.length > 0 ? Buffer.concat(chunks) : null, decision });
             };
+
             const onClose = () => {
               if (settled) return;
               settled = true;
@@ -598,29 +714,40 @@ export class CloudCodeFailoverGateway {
               if (!bodyStream.readableEnded) {
                 reject(new Error('Upstream stream closed prematurely before response completion'));
               } else {
-                const combined = chunks.length > 0 ? Buffer.concat(chunks) : null;
+                if (streamDecompressor) {
+                  try {
+                    streamDecompressor.end();
+                  } catch {}
+                }
+                const inspectionBuffer = streamDecompressor
+                  ? (decompressedChunks.length > 0 ? Buffer.concat(decompressedChunks) : null)
+                  : (chunks.length > 0 ? Buffer.concat(chunks) : null);
                 const decision = this.classifyProtocolFrame(
                   contentType,
-                  combined,
+                  inspectionBuffer,
                   headers,
                   bodyStream.trailers,
                   true,
+                  statusCode,
                 );
-                resolve({ buffer: combined, decision });
+                resolve({ buffer: chunks.length > 0 ? Buffer.concat(chunks) : null, decision });
               }
             };
+
             const onError = (err: unknown) => {
               if (settled) return;
               settled = true;
               cleanup();
               reject(err);
             };
+
             const onClientClose = () => {
               if (settled) return;
               settled = true;
               cleanup();
               resolve({ buffer: null, decision: { state: 'VALIDATED_ERROR', isTransient: true } });
             };
+
             bodyStream.on('data', onData);
             bodyStream.once('end', onEnd);
             bodyStream.once('close', onClose);
@@ -685,7 +812,30 @@ export class CloudCodeFailoverGateway {
               continue;
             }
 
-            // Non-retriable protocol error: commit to client
+            // Locally detected protocol violation or validation error on HTTP 2xx:
+            // Synthesize 502 Bad Gateway rather than forwarding malformed data under HTTP 200 (Probe C10 / T13-F03)
+            if (frameDecision.isLocalValidationError || (statusCode >= 200 && statusCode < 300)) {
+              responseCommitted = true;
+              const errorBody = Buffer.from(
+                JSON.stringify({
+                  error: {
+                    code: 502,
+                    status: 'BAD_GATEWAY',
+                    message: `Bad Gateway: ${frameDecision.errorText || 'Upstream response validation failed'}`,
+                    category: frameDecision.category || 'malformed-upstream-message',
+                  },
+                }),
+                'utf-8',
+              );
+              this.writeHeaders(res, 502, {
+                'content-type': 'application/json; charset=utf-8',
+                'content-length': String(errorBody.length),
+              });
+              res.end(errorBody);
+              return;
+            }
+
+            // Authentic non-retriable provider error: commit to client with original status
             responseCommitted = true;
             this.writeHeaders(res, statusCode, { ...headers, ...bodyStream.trailers });
             if (firstChunk && firstChunk.length > 0) {
@@ -697,63 +847,79 @@ export class CloudCodeFailoverGateway {
           }
 
           case 'NEED_MORE_DATA': {
-            // Buffer threshold exceeded (64KiB) without complete frame, or stream closed with incomplete data
-            logger.warn(
-              `[CloudCodeGateway] Protocol frame incomplete or exceeded threshold (NEED_MORE_DATA) for account ${
-                account?.email || 'unknown'
-              }. Failing candidate and rotating to next account...`,
-            );
+            // Buffer threshold exceeded (64KiB) without qualifying frame:
+            // A local inspection limit is not an account failure and should not rotate accounts (T13-F03 / Probe C09)
             cleanupActiveAttempt();
             bodyStream.destroy();
-            if (
-              sessionKey &&
-              isVerifiedSessionKey(sessionKey) &&
-              account &&
-              typeof this.accountLeaseService?.failSessionMigrationCandidate === 'function'
-            ) {
-              this.accountLeaseService.failSessionMigrationCandidate(
-                sessionKey,
-                attemptGeneration,
-                account.id,
-                requestId,
-              );
-            }
-            continue;
+            logger.warn(
+              `[CloudCodeGateway] Protocol frame inspection limit exceeded (NEED_MORE_DATA) for account ${
+                account?.email || 'unknown'
+              }`,
+            );
+            responseCommitted = true;
+            const errorBody = Buffer.from(
+              JSON.stringify({
+                error: {
+                  code: 502,
+                  status: 'BAD_GATEWAY',
+                  message: 'Bad Gateway: Protocol frame inspection limit exceeded without valid structure',
+                  category: 'inspection-limit',
+                },
+              }),
+              'utf-8',
+            );
+            this.writeHeaders(res, 502, {
+              'content-type': 'application/json; charset=utf-8',
+              'content-length': String(errorBody.length),
+            });
+            res.end(errorBody);
+            return;
           }
 
           case 'VALIDATED_RESPONSE': {
             // --- COMMIT POINT ---
-            // Verify session binding or migration confirmation BEFORE committing response (Probe C22)
-            if (sessionKey && account && isVerifiedSessionKey(sessionKey)) {
-              if (typeof this.accountLeaseService?.confirmOrBindSession === 'function') {
-                const confirmed = this.accountLeaseService.confirmOrBindSession(
-                  sessionKey,
-                  account.id,
-                  attemptGeneration,
-                  requestId,
-                );
-                if (confirmed === false) {
-                  logger.warn(
-                    `[CloudCodeGateway] Session confirmation rejected for session ${sessionKey} (lost race or mismatched owner); suppressing output`,
-                  );
-                  cleanupActiveAttempt();
-                  bodyStream.destroy();
-                  continue;
+            // T13-F06: Populating hint store on native success
+            if (sessionKey && account) {
+              if (isHintSessionKey(sessionKey)) {
+                if (typeof this.accountLeaseService?.recordCacheHint === 'function') {
+                  this.accountLeaseService.recordCacheHint(sessionKey, account.id);
                 }
-              } else if (typeof this.accountLeaseService?.bindSession === 'function') {
-                const bound = this.accountLeaseService.bindSession(
-                  sessionKey,
-                  account.id,
-                  undefined,
-                  attemptGeneration,
-                );
-                if (bound === false) {
-                  logger.warn(
-                    `[CloudCodeGateway] Session binding rejected for session ${sessionKey} (lost race); suppressing output`,
+              } else if (isVerifiedSessionKey(sessionKey)) {
+                if (typeof this.accountLeaseService?.confirmOrBindSession === 'function') {
+                  const commitResult = this.accountLeaseService.confirmOrBindSession(
+                    sessionKey,
+                    account.id,
+                    attemptGeneration,
+                    requestId,
                   );
-                  cleanupActiveAttempt();
-                  bodyStream.destroy();
-                  continue;
+                  const isRejected =
+                    (typeof commitResult === 'boolean' && !commitResult) ||
+                    (typeof commitResult === 'object' &&
+                      commitResult !== null &&
+                      commitResult.kind === 'rejected');
+                  if (isRejected) {
+                    logger.warn(
+                      `[CloudCodeGateway] Session confirmation rejected for session ${sessionKey} (${(commitResult as any)?.reason ?? 'rejected'}); suppressing output`,
+                    );
+                    cleanupActiveAttempt();
+                    bodyStream.destroy();
+                    continue;
+                  }
+                } else if (typeof this.accountLeaseService?.bindSession === 'function') {
+                  const bound = this.accountLeaseService.bindSession(
+                    sessionKey,
+                    account.id,
+                    undefined,
+                    attemptGeneration,
+                  );
+                  if (bound === false) {
+                    logger.warn(
+                      `[CloudCodeGateway] Session binding rejected for session ${sessionKey} (lost race); suppressing output`,
+                    );
+                    cleanupActiveAttempt();
+                    bodyStream.destroy();
+                    continue;
+                  }
                 }
               }
             }
@@ -938,6 +1104,7 @@ export class CloudCodeFailoverGateway {
     headers?: http.IncomingHttpHeaders,
     trailers?: NodeJS.Dict<string | string[]>,
     streamEnded?: boolean,
+    statusCode?: number,
   ): ProtocolFrameDecision {
     const grpcStatus = trailers?.['grpc-status'] ?? headers?.['grpc-status'];
     if (grpcStatus !== undefined && String(grpcStatus) !== '0') {
@@ -948,51 +1115,148 @@ export class CloudCodeFailoverGateway {
         state: 'VALIDATED_ERROR',
         isQuota,
         isTransient,
+        category: isQuota ? 'account-quota' : isTransient ? 'upstream-transient' : undefined,
         errorText: `gRPC status ${code}: ${trailers?.['grpc-message'] ?? headers?.['grpc-message'] ?? ''}`,
       };
     }
 
-    // Binary gRPC framing validation (5-byte header: 1 byte compressed flag + 4 bytes length)
-    if (contentType?.includes('application/grpc')) {
-      if (!buffer || buffer.length < 5) {
+    // Binary gRPC and gRPC-Web framing validation (5-byte header: 1 byte compressed flag + 4 bytes length)
+    if (contentType?.includes('application/grpc') || contentType?.includes('application/grpc-web')) {
+      if (!buffer || buffer.length === 0) {
+        if (streamEnded) {
+          const terminalStatus = trailers?.['grpc-status'] ?? headers?.['grpc-status'];
+          if (terminalStatus !== undefined && String(terminalStatus) === '0') {
+            return { state: 'VALIDATED_RESPONSE' };
+          }
+          return {
+            state: 'VALIDATED_ERROR',
+            category: 'malformed-upstream-message',
+            isLocalValidationError: true,
+            errorText: 'Empty gRPC stream at EOF without grpc-status: 0',
+          };
+        }
+        return { state: 'NEED_MORE_DATA' };
+      }
+
+      if (buffer.length < 5) {
         return streamEnded
-          ? { state: 'VALIDATED_ERROR', errorText: 'Truncated gRPC frame header at EOF' }
+          ? {
+              state: 'VALIDATED_ERROR',
+              category: 'malformed-upstream-message',
+              isLocalValidationError: true,
+              errorText: 'Truncated gRPC frame header at EOF',
+            }
           : { state: 'NEED_MORE_DATA' };
       }
+
+      const flag = buffer.readUInt8(0);
       const msgLen = buffer.readUInt32BE(1);
+
+      // gRPC-Web trailers frame (flag 0x80)
+      if ((flag & 0x80) !== 0) {
+        if (buffer.length < 5 + msgLen) {
+          return streamEnded
+            ? {
+                state: 'VALIDATED_ERROR',
+                category: 'malformed-upstream-message',
+                isLocalValidationError: true,
+                errorText: 'Truncated gRPC-Web trailers frame at EOF',
+              }
+            : { state: 'NEED_MORE_DATA' };
+        }
+        const trailerText = buffer.subarray(5, 5 + msgLen).toString('utf-8');
+        const lines = trailerText.split(/\r?\n/);
+        let frameGrpcStatus: string | undefined;
+        let frameGrpcMessage: string | undefined;
+        for (const line of lines) {
+          const colonIdx = line.indexOf(':');
+          if (colonIdx > 0) {
+            const key = line.slice(0, colonIdx).trim().toLowerCase();
+            const val = line.slice(colonIdx + 1).trim();
+            if (key === 'grpc-status') frameGrpcStatus = val;
+            if (key === 'grpc-message') frameGrpcMessage = val;
+          }
+        }
+        if (frameGrpcStatus !== undefined && frameGrpcStatus !== '0') {
+          const code = frameGrpcStatus;
+          const isQuota = code === '8';
+          const isTransient = code === '14';
+          return {
+            state: 'VALIDATED_ERROR',
+            isQuota,
+            isTransient,
+            category: isQuota ? 'account-quota' : isTransient ? 'upstream-transient' : undefined,
+            errorText: `gRPC-Web trailer status ${code}: ${frameGrpcMessage || ''}`,
+          };
+        }
+        return { state: 'VALIDATED_RESPONSE' };
+      }
+
+      // Ordinary data frame: validate flag (0 = uncompressed, 1 = compressed)
+      if (flag !== 0 && flag !== 1) {
+        return {
+          state: 'VALIDATED_ERROR',
+          category: 'malformed-upstream-message',
+          isLocalValidationError: true,
+          errorText: `Invalid gRPC frame compressed flag: 0x${flag.toString(16)}`,
+        };
+      }
+
       if (buffer.length < 5 + msgLen) {
         return streamEnded
-          ? { state: 'VALIDATED_ERROR', errorText: 'Truncated gRPC message body at EOF' }
+          ? {
+              state: 'VALIDATED_ERROR',
+              category: 'malformed-upstream-message',
+              isLocalValidationError: true,
+              errorText: 'Truncated gRPC message body at EOF',
+            }
           : { state: 'NEED_MORE_DATA' };
       }
+
       return { state: 'VALIDATED_RESPONSE' };
     }
 
-    // Decompress payload if content-encoding is present (e.g. gzip, deflate, br)
+    // Decompress payload if content-encoding is present (e.g. gzip, deflate, br) with bounded output
     let effectiveBuffer = buffer;
     const encoding = headers?.['content-encoding'];
     if (buffer && buffer.length > 0 && typeof encoding === 'string') {
       const enc = encoding.toLowerCase().trim();
+      const decompressOptions = { maxOutputLength: 65536 };
       if (enc === 'gzip' || enc === 'x-gzip') {
         try {
-          effectiveBuffer = zlib.gunzipSync(buffer);
+          effectiveBuffer = zlib.gunzipSync(buffer, decompressOptions);
         } catch {
           if (!streamEnded) return { state: 'NEED_MORE_DATA' };
-          return { state: 'VALIDATED_ERROR', errorText: 'Failed to decompress gzip response body' };
+          return {
+            state: 'VALIDATED_ERROR',
+            category: 'unsupported-encoding',
+            isLocalValidationError: true,
+            errorText: 'Failed to decompress gzip response body (or exceeded maxOutputLength)',
+          };
         }
       } else if (enc === 'deflate') {
         try {
-          effectiveBuffer = zlib.inflateSync(buffer);
+          effectiveBuffer = zlib.inflateSync(buffer, decompressOptions);
         } catch {
           if (!streamEnded) return { state: 'NEED_MORE_DATA' };
-          return { state: 'VALIDATED_ERROR', errorText: 'Failed to decompress deflate response body' };
+          return {
+            state: 'VALIDATED_ERROR',
+            category: 'unsupported-encoding',
+            isLocalValidationError: true,
+            errorText: 'Failed to decompress deflate response body (or exceeded maxOutputLength)',
+          };
         }
       } else if (enc === 'br') {
         try {
-          effectiveBuffer = zlib.brotliDecompressSync(buffer);
+          effectiveBuffer = zlib.brotliDecompressSync(buffer, decompressOptions);
         } catch {
           if (!streamEnded) return { state: 'NEED_MORE_DATA' };
-          return { state: 'VALIDATED_ERROR', errorText: 'Failed to decompress brotli response body' };
+          return {
+            state: 'VALIDATED_ERROR',
+            category: 'unsupported-encoding',
+            isLocalValidationError: true,
+            errorText: 'Failed to decompress brotli response body (or exceeded maxOutputLength)',
+          };
         }
       }
     }
@@ -1000,7 +1264,12 @@ export class CloudCodeFailoverGateway {
     if (!effectiveBuffer || effectiveBuffer.length === 0) {
       if (streamEnded) {
         if (contentType?.includes('application/json')) {
-          return { state: 'VALIDATED_ERROR', errorText: 'Empty JSON response body at EOF' };
+          return {
+            state: 'VALIDATED_ERROR',
+            category: 'malformed-upstream-message',
+            isLocalValidationError: true,
+            errorText: 'Empty JSON response body at EOF',
+          };
         }
         return { state: 'VALIDATED_RESPONSE' };
       }
@@ -1014,7 +1283,12 @@ export class CloudCodeFailoverGateway {
       // SSE Framing: An event must end with a blank line (\n\n or \r\n\r\n)
       if (!text.includes('\n\n') && !text.includes('\r\n\r\n')) {
         return streamEnded
-          ? { state: 'VALIDATED_ERROR', errorText: 'Truncated SSE event at EOF' }
+          ? {
+              state: 'VALIDATED_ERROR',
+              category: 'malformed-upstream-message',
+              isLocalValidationError: true,
+              errorText: 'Truncated SSE event at EOF',
+            }
           : { state: 'NEED_MORE_DATA' };
       }
 
@@ -1027,7 +1301,12 @@ export class CloudCodeFailoverGateway {
 
       if (completeEvents.length === 0) {
         return streamEnded
-          ? { state: 'VALIDATED_ERROR', errorText: 'No complete SSE events at EOF' }
+          ? {
+              state: 'VALIDATED_ERROR',
+              category: 'malformed-upstream-message',
+              isLocalValidationError: true,
+              errorText: 'No complete SSE events at EOF',
+            }
           : { state: 'NEED_MORE_DATA' };
       }
 
@@ -1069,35 +1348,38 @@ export class CloudCodeFailoverGateway {
                 msg.includes('quota') ||
                 msg.includes('resource_exhausted') ||
                 msg.includes('rate limit');
+              const isTransient = code === 503 || msg.includes('unavailable');
               return {
                 state: 'VALIDATED_ERROR',
                 isQuota,
-                isTransient: code === 503 || msg.includes('unavailable'),
+                isTransient,
+                category: isQuota ? 'account-quota' : isTransient ? 'upstream-transient' : undefined,
                 errorText: JSON.stringify(err),
               };
-            }
-            if (
-              parsed.candidates ||
-              parsed.choices ||
-              parsed.functionCall ||
-              (parsed as any).parts ||
-              (parsed as any).content
-            ) {
-              return { state: 'VALIDATED_RESPONSE' };
             }
             return { state: 'VALIDATED_RESPONSE' };
           }
         } catch {
           // Incomplete JSON inside data event
           if (streamEnded) {
-            return { state: 'VALIDATED_ERROR', errorText: 'Malformed JSON inside SSE data event at EOF' };
+            return {
+              state: 'VALIDATED_ERROR',
+              category: 'malformed-upstream-message',
+              isLocalValidationError: true,
+              errorText: 'Malformed JSON inside SSE data event at EOF',
+            };
           }
           return { state: 'NEED_MORE_DATA' };
         }
       }
 
       return streamEnded
-        ? { state: 'VALIDATED_ERROR', errorText: 'Incomplete SSE stream at EOF' }
+        ? {
+            state: 'VALIDATED_ERROR',
+            category: 'malformed-upstream-message',
+            isLocalValidationError: true,
+            errorText: 'Incomplete SSE stream at EOF',
+          }
         : { state: 'NEED_MORE_DATA' };
     }
 
@@ -1109,6 +1391,8 @@ export class CloudCodeFailoverGateway {
     if (isExplicitJson && !trimmed.startsWith('{') && !trimmed.startsWith('[')) {
       return {
         state: 'VALIDATED_ERROR',
+        category: 'malformed-upstream-message',
+        isLocalValidationError: true,
         errorText: `Invalid JSON response body for application/json: ${trimmed.slice(0, 100)}`,
       };
     }
@@ -1127,21 +1411,14 @@ export class CloudCodeFailoverGateway {
               msg.includes('quota') ||
               msg.includes('resource_exhausted') ||
               msg.includes('rate limit');
+            const isTransient = code === 503 || msg.includes('unavailable');
             return {
               state: 'VALIDATED_ERROR',
               isQuota,
-              isTransient: code === 503 || msg.includes('unavailable'),
+              isTransient,
+              category: isQuota ? 'account-quota' : isTransient ? 'upstream-transient' : undefined,
               errorText: JSON.stringify(err),
             };
-          }
-          if (
-            parsed.candidates ||
-            parsed.choices ||
-            parsed.functionCall ||
-            (parsed as any).parts ||
-            (parsed as any).content
-          ) {
-            return { state: 'VALIDATED_RESPONSE' };
           }
           return { state: 'VALIDATED_RESPONSE' };
         }
@@ -1150,6 +1427,8 @@ export class CloudCodeFailoverGateway {
         if (streamEnded) {
           return {
             state: 'VALIDATED_ERROR',
+            category: 'malformed-upstream-message',
+            isLocalValidationError: true,
             errorText: `Truncated JSON response body at EOF: ${trimmed.slice(0, 100)}`,
           };
         }
@@ -1171,6 +1450,7 @@ export class CloudCodeFailoverGateway {
     payload: Buffer,
     upstreamHost: string,
     onReqCreated?: (req: http.ClientRequest) => void,
+    deadlineAt?: number,
   ): Promise<{
     statusCode: number;
     headers: http.IncomingHttpHeaders;
@@ -1178,13 +1458,27 @@ export class CloudCodeFailoverGateway {
     bufferedBody?: Buffer;
   }> {
     return new Promise((resolve, reject) => {
+      const now = Date.now();
+      const remainingDeadlineMs = deadlineAt ? Math.max(500, deadlineAt - now) : 60000;
+      const attemptTimeoutMs = Math.min(60000, remainingDeadlineMs);
+
       const options: https.RequestOptions = {
         hostname: upstreamHost,
         port: 443,
         path: url,
         method,
         headers,
-        timeout: 60000,
+        timeout: 60000, // Inactivity timeout on socket
+      };
+
+      let settled = false;
+      let deadlineTimer: NodeJS.Timeout | null = null;
+
+      const cleanupCall = () => {
+        if (deadlineTimer) {
+          clearTimeout(deadlineTimer);
+          deadlineTimer = null;
+        }
       };
 
       const upstreamReq = https.request(options, (upstreamRes) => {
@@ -1194,25 +1488,59 @@ export class CloudCodeFailoverGateway {
         if (statusCode >= 400) {
           const chunks: Buffer[] = [];
           let totalBytes = 0;
+          let bodyTruncated = false;
           const MAX_ERROR_BODY_BYTES = 1024 * 1024;
           upstreamRes.on('data', (c) => {
             const buf = Buffer.isBuffer(c) ? c : Buffer.from(c);
             totalBytes += buf.length;
             if (totalBytes <= MAX_ERROR_BODY_BYTES) {
               chunks.push(buf);
+            } else {
+              bodyTruncated = true;
             }
           });
           upstreamRes.on('end', () => {
+            if (settled) return;
+            settled = true;
+            cleanupCall();
+
+            let finalBody = Buffer.concat(chunks);
+            const resHeaders = { ...upstreamRes.headers };
+            if (bodyTruncated) {
+              delete resHeaders['content-encoding'];
+              finalBody = Buffer.from(
+                JSON.stringify({
+                  error: {
+                    code: statusCode,
+                    message: 'Upstream error response exceeded 1 MiB budget and was truncated.',
+                  },
+                }),
+                'utf-8',
+              );
+              resHeaders['content-type'] = 'application/json; charset=utf-8';
+              resHeaders['content-length'] = String(finalBody.length);
+            } else if (resHeaders['content-length'] !== undefined) {
+              resHeaders['content-length'] = String(finalBody.length);
+            }
+
             resolve({
               statusCode,
-              headers: upstreamRes.headers,
+              headers: resHeaders,
               bodyStream: upstreamRes,
-              bufferedBody: Buffer.concat(chunks),
+              bufferedBody: finalBody,
             });
           });
-          upstreamRes.on('error', reject);
+          upstreamRes.on('error', (err) => {
+            if (settled) return;
+            settled = true;
+            cleanupCall();
+            reject(err);
+          });
         } else {
           // Success status: stream directly
+          if (settled) return;
+          settled = true;
+          cleanupCall();
           resolve({
             statusCode,
             headers: upstreamRes.headers,
@@ -1222,10 +1550,26 @@ export class CloudCodeFailoverGateway {
       });
 
       onReqCreated?.(upstreamReq);
+
+      // Inactivity timeout
       upstreamReq.on('timeout', () => {
-        upstreamReq.destroy(new Error('Upstream request timed out after 60s'));
+        upstreamReq.destroy(new Error('Upstream socket inactivity timeout after 60s'));
       });
-      upstreamReq.on('error', reject);
+
+      // Overall attempt absolute deadline timer
+      deadlineTimer = setTimeout(() => {
+        if (settled) return;
+        upstreamReq.destroy(
+          new Error(`Upstream attempt deadline exceeded after ${attemptTimeoutMs}ms`),
+        );
+      }, attemptTimeoutMs);
+
+      upstreamReq.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        cleanupCall();
+        reject(err);
+      });
 
       if (payload.length > 0) {
         upstreamReq.write(payload);
@@ -1248,7 +1592,10 @@ export class CloudCodeFailoverGateway {
       headers['session-id'] ||
       headers['conversation-id'];
     if (typeof headerCandidate === 'string' && headerCandidate.trim()) {
-      return `session:${headerCandidate.trim()}`;
+      const trimmed = headerCandidate.trim();
+      return trimmed.startsWith('hint:') || trimmed.startsWith('session:')
+        ? trimmed
+        : `session:${trimmed}`;
     }
 
     if (parsedBody && typeof parsedBody === 'object') {
@@ -1268,7 +1615,10 @@ export class CloudCodeFailoverGateway {
         (parsedBody.request as Record<string, unknown> | undefined)?.conversation_id;
 
       if (typeof candidate === 'string' && candidate.trim()) {
-        return `session:${candidate.trim()}`;
+        const trimmed = candidate.trim();
+        return trimmed.startsWith('hint:') || trimmed.startsWith('session:')
+          ? trimmed
+          : `session:${trimmed}`;
       }
 
       // 3. Multi-turn chat prefix fingerprinting: Google CloudCode contents
