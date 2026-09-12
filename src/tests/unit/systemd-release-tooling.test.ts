@@ -1,6 +1,6 @@
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -1353,18 +1353,13 @@ describe('systemd release tooling', { timeout: 60_000 }, () => {
     if (options.systemctlActiveState !== undefined) {
       writeFileSync(join(stateDir, 'systemctl-active-state'), options.systemctlActiveState);
     }
-    if (options.systemctlNotEnabled) {
-      writeFileSync(join(stateDir, 'systemctl-not-enabled'), '1');
-    }
-    if (options.systemctlNotActive) {
-      writeFileSync(join(stateDir, 'systemctl-not-active'), '1');
-    }
-    if (options.ssPid !== undefined) {
-      writeFileSync(join(stateDir, 'ss-pid'), options.ssPid);
-    }
-    if (options.ssDropListener) {
-      writeFileSync(join(stateDir, 'ss-drop-listener'), '1');
-    }
+    if (options.systemctlNotEnabled) writeFileSync(join(stateDir, 'systemctl-not-enabled'), '1');
+    if (options.systemctlNotActive) writeFileSync(join(stateDir, 'systemctl-not-active'), '1');
+    if (options.ssPid !== undefined) writeFileSync(join(stateDir, 'ss-pid'), options.ssPid);
+    if (options.ssDropListener) writeFileSync(join(stateDir, 'ss-drop-listener'), '1');
+    const caDir = join(root, 'var/lib/antigravity-proxy/certs');
+    mkdirSync(caDir, { recursive: true });
+    writeFileSync(join(caDir, 'ca.crt'), '-----BEGIN CERTIFICATE-----\nMOCK\n-----END CERTIFICATE-----\n');
 
     writeFileSync(
       join(binDir, 'curl'),
@@ -1426,6 +1421,11 @@ if [[ "$url" == *"/admin/status" ]]; then
   fi
 
   printf '401'
+  exit 0
+fi
+
+if [[ "$url" == *"cloudcode-pa.googleapis.com"* ]]; then
+  [ -f "$state_dir/connect-fail" ] && exit 56
   exit 0
 fi
 

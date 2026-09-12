@@ -54,18 +54,6 @@ function getGitFileContent(repoRoot: string, gitRef: string, filePath: string): 
   }
 }
 
-function getCommitSha(repoRoot: string, ref: string): string | null {
-  try {
-    return execFileSync('git', ['rev-parse', '--verify', ref], {
-      cwd: repoRoot,
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-  } catch {
-    return null;
-  }
-}
-
 export function verifyBaselineIntegrity(
   repoRoot: string,
   candidateBaseline: Record<string, number>,
@@ -76,38 +64,31 @@ export function verifyBaselineIntegrity(
 
   let trustedJson: string | null = options?.trustedBaselineJson ?? null;
   let resolvedRef: string | null = options?.trustedRef ?? null;
-  const headSha = getCommitSha(repoRoot, 'HEAD');
 
   if (!trustedJson) {
-    const candidateRefs = [
-      options?.trustedRef,
-      process.env.QUALITY_TRUSTED_REF,
-      process.env.GITHUB_BASE_REF ? `origin/${process.env.GITHUB_BASE_REF}` : null,
-      process.env.GITHUB_EVENT_BEFORE && process.env.GITHUB_EVENT_BEFORE !== '0000000000000000000000000000000000000000'
-        ? process.env.GITHUB_EVENT_BEFORE
-        : null,
-      'origin/main',
-      'main',
-      'HEAD~1',
-    ].filter(Boolean) as string[];
+    const explicitRef = options?.trustedRef || process.env.QUALITY_TRUSTED_REF;
+    if (explicitRef) {
+      trustedJson = getGitFileContent(repoRoot, explicitRef, gitPath);
+      if (!trustedJson) {
+        throw new PolicyConfigurationError(
+          `Explicit trusted reference [${explicitRef}] is not accessible or does not contain baseline file: ${gitPath}`,
+        );
+      }
+      resolvedRef = explicitRef;
+    } else {
+      const defaultRefs = [
+        process.env.GITHUB_BASE_REF ? `origin/${process.env.GITHUB_BASE_REF}` : null,
+        'HEAD',
+        'origin/main',
+        'main',
+      ].filter(Boolean) as string[];
 
-    for (const ref of candidateRefs) {
-      const refSha = getCommitSha(repoRoot, ref);
-      // If ref resolves to the current HEAD, it is NOT an independent ancestor: check parent ref~1
-      if (refSha && headSha && refSha === headSha) {
-        const parentRef = `${ref}~1`;
-        trustedJson = getGitFileContent(repoRoot, parentRef, gitPath);
+      for (const ref of defaultRefs) {
+        trustedJson = getGitFileContent(repoRoot, ref, gitPath);
         if (trustedJson) {
-          resolvedRef = parentRef;
+          resolvedRef = ref;
           break;
         }
-        continue;
-      }
-
-      trustedJson = getGitFileContent(repoRoot, ref, gitPath);
-      if (trustedJson) {
-        resolvedRef = ref;
-        break;
       }
     }
   }

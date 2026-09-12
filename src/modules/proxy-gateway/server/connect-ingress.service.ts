@@ -282,8 +282,8 @@ export class ConnectIngressService {
       logger.debug(`[ConnectIngress] Client socket error: ${err.message}`);
     });
 
-    // 1. Verify local peer trust model (CONNECT restricted to loopback)
-    if (clientSocket.remoteAddress && !isLocalPeer(clientSocket.remoteAddress) && process.env.AG_PROXY_ALLOW_REMOTE_CONNECT !== 'true') {
+    // 1. Verify local peer trust model (CONNECT strictly restricted to loopback)
+    if (!isLocalPeer(clientSocket.remoteAddress)) {
       logger.warn(`[ConnectIngress] Non-local peer rejected for CONNECT: ${clientSocket.remoteAddress}`);
       clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       clientSocket.destroy();

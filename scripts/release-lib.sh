@@ -1318,13 +1318,12 @@ smoke_check() {
   [ "$service_user" = "$user_name" ] || { printf 'Systemd service user %s does not match expected user %s\n' "$service_user" "$user_name" >&2; return 1; }
 
   local ca_cert_file="/usr/local/share/antigravity-proxy/ca.crt"
-  [ -s "$ca_cert_file" ] || ca_cert_file="$(root_path "$state_dir")/certs/ca.crt"
-  if [ -s "$ca_cert_file" ]; then
-    local connect_probe_exit=0
-    curl -q --silent --max-time "$request_timeout" --proxy "http://$host:$port" --cacert "$ca_cert_file" --output /dev/null "https://cloudcode-pa.googleapis.com/v1/health" 2>/dev/null || connect_probe_exit=$?
-    if [ "$connect_probe_exit" -eq 60 ] || [ "$connect_probe_exit" -eq 35 ]; then
-      printf 'CONNECT TLS probe failed certificate or handshake verification (curl exit %s)\n' "$connect_probe_exit" >&2; return 1
-    fi
+  [ -s "$ca_cert_file" ] || ca_cert_file="$(root_path "$data_dir")/certs/ca.crt"
+  [ -s "$ca_cert_file" ] || { printf 'Expected CA certificate file is missing or empty: %s\n' "$ca_cert_file" >&2; return 1; }
+  local connect_probe_exit=0
+  curl -q --silent --max-time "$request_timeout" --proxy "http://$host:$port" --noproxy '' --cacert "$ca_cert_file" --output /dev/null "https://cloudcode-pa.googleapis.com" 2>/dev/null || connect_probe_exit=$?
+  if [ "$connect_probe_exit" -ne 0 ]; then
+    printf 'CONNECT TLS probe failed (curl exit %s)\n' "$connect_probe_exit" >&2; return 1
   fi
 
   return 0

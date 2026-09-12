@@ -6,7 +6,7 @@ import {
   ProductionOwnerGate,
   SplitBrainPreventedException,
 } from '../../modules/cloud-account/persistence/production-owner-gate';
-import { ConnectIngressService } from '../../modules/proxy-gateway/server/connect-ingress.service';
+import { ConnectIngressService, isLocalPeer } from '../../modules/proxy-gateway/server/connect-ingress.service';
 import { AdminController } from '../../admin/admin.controller';
 import { extractCommentsFromContent } from '../../../scripts/quality/check-debt-baseline';
 import { countPhysicalLines } from '../../../scripts/quality/file-size-policy';
@@ -180,6 +180,21 @@ describe('Oracle Turn 4 Hardening Suite', () => {
       expect(comments[0].type).toBe('line');
       expect(comments[1].type).toBe('block');
     });
+
+    it('accurately parses Oracle T6-F05 template string and directive counterexamples', () => {
+      const code1 = 'export const tag = `${1}`;\n// @ts-expect-error: deliberate negative type test\nexport const value: number = "not a number";';
+      const comments1 = extractCommentsFromContent(code1);
+      expect(comments1).toHaveLength(1);
+      expect(comments1[0].text).toBe('// @ts-expect-error: deliberate negative type test');
+
+      const code2 = 'export const value = `${1} // eslint-disable`;';
+      const comments2 = extractCommentsFromContent(code2);
+      expect(comments2).toHaveLength(0);
+
+      const code3 = 'const x = `${/* inside */ 42}`; const el = <div>{/* in jsx */ 1}</div>; const re = /abc\\//i; // after regex';
+      const comments3 = extractCommentsFromContent(code3);
+      expect(comments3).toHaveLength(3);
+    });
   });
 
   describe('T4-F03: File Size Line Counting', () => {
@@ -229,6 +244,33 @@ describe('Oracle Turn 4 Hardening Suite', () => {
           trustedRef: 'origin/main',
         });
       }).toThrow(/Failed to parse trusted baseline from git reference/);
+    });
+
+    it('throws immediately when explicit trusted reference does not exist without fallback (T6-F02)', () => {
+      expect(() => {
+        verifyBaselineIntegrity(process.cwd(), {}, 'quality/file-size-baseline.json', {
+          trustedRef: 'non-existent-candidate-ref-xyz',
+        });
+      }).toThrow(/Explicit trusted reference \[non-existent-candidate-ref-xyz\] is not accessible/);
+    });
+  });
+
+  describe('T6-F03: Strict Local Peer Trust Model', () => {
+    it('rejects undefined remoteAddress fail-closed', () => {
+      expect(isLocalPeer(undefined)).toBe(false);
+    });
+
+    it('rejects non-loopback addresses', () => {
+      expect(isLocalPeer('10.0.0.1')).toBe(false);
+      expect(isLocalPeer('192.168.1.1')).toBe(false);
+      expect(isLocalPeer('1.1.1.1')).toBe(false);
+    });
+
+    it('accepts loopback addresses', () => {
+      expect(isLocalPeer('127.0.0.1')).toBe(true);
+      expect(isLocalPeer('127.0.0.2')).toBe(true);
+      expect(isLocalPeer('::1')).toBe(true);
+      expect(isLocalPeer('::ffff:127.0.0.1')).toBe(true);
     });
   });
 });

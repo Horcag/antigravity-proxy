@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import ts from 'typescript';
+import * as tsParser from '@typescript-eslint/parser';
 
 const projectRoot = process.cwd();
 const eslintConfigPath = path.join(projectRoot, 'eslint.config.mjs');
@@ -67,21 +67,25 @@ export interface ExtractedComment {
   line: number;
 }
 
-export function extractCommentsFromContent(content: string): ExtractedComment[] {
-  const comments: ExtractedComment[] = [];
-  const scanner = ts.createScanner(ts.ScriptTarget.Latest, false, ts.LanguageVariant.Standard, content);
-  let token = scanner.scan();
-  while (token !== ts.SyntaxKind.EndOfFileToken) {
-    if (token === ts.SyntaxKind.SingleLineCommentTrivia || token === ts.SyntaxKind.MultiLineCommentTrivia) {
-      const text = scanner.getTokenText();
-      const type = token === ts.SyntaxKind.SingleLineCommentTrivia ? 'line' : 'block';
-      const offset = scanner.getTokenPos();
-      const line = content.slice(0, offset).split(/\r?\n/).length;
-      comments.push({ type, text, line });
-    }
-    token = scanner.scan();
+export function extractCommentsFromContent(content: string, filePath?: string): ExtractedComment[] {
+  try {
+    const ast = tsParser.parse(content, {
+      comment: true,
+      tokens: true,
+      loc: true,
+      range: true,
+      jsx: true,
+      filePath: filePath || 'temp.tsx',
+    });
+
+    return (ast.comments || []).map((c) => ({
+      type: c.type === 'Line' ? 'line' : 'block',
+      text: c.type === 'Line' ? `//${c.value}` : `/*${c.value}*/`,
+      line: c.loc.start.line,
+    }));
+  } catch {
+    return [];
   }
-  return comments;
 }
 
 export interface DebtViolation {
@@ -107,7 +111,7 @@ export function findDebtViolations(): DebtViolation[] {
       }
 
       const content = fs.readFileSync(filePath, 'utf8');
-      const comments = extractCommentsFromContent(content);
+      const comments = extractCommentsFromContent(content, filePath);
 
       for (const comment of comments) {
         // 1. Forbid inline ESLint configuration comments (e.g. /* eslint "rule": "off" */ or /* eslint-env */)

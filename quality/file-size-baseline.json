@@ -8,7 +8,7 @@
   },
   "files": {
     "scripts/probe-models.ts": 827,
-    "scripts/release-lib.sh": 1552,
+    "scripts/release-lib.sh": 1551,
     "src/modules/cloud-account/services/GoogleAPIService.ts": 1071,
     "src/modules/config/ipc/manager.ts": 944,
     "src/modules/proxy-gateway/antigravity/ClaudeRequestMapper.ts": 952,
@@ -30,7 +30,7 @@
     "src/tests/unit/google-api-service.test.ts": 594,
     "src/tests/unit/model-catalog-truth.test.ts": 606,
     "src/tests/unit/native-gemini-compat.test.ts": 994,
-    "src/tests/unit/oracle-release-gates.test.ts": 1399,
+    "src/tests/unit/oracle-release-gates.test.ts": 1397,
     "src/tests/unit/probe-models.test.ts": 682,
     "src/tests/unit/proxy-service-account-failover.test.ts": 510,
     "src/tests/unit/proxy-stream-health-lifecycle.test.ts": 739,

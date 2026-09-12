@@ -358,9 +358,7 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
   // Gate 10: Malformed CONNECT authority -> Rejected before either interception or tunneling
   it('Gate 10: Malformed CONNECT authority daily-cloudcode-pa.googleapis.com:443junk returns 400 Bad Request', () => {
     const ingress = new ConnectIngressService();
-    const socket = new EventEmitter() as any;
-    socket.write = vi.fn().mockReturnValue(true);
-    socket.destroy = vi.fn();
+    const socket = Object.assign(new EventEmitter(), { remoteAddress: '127.0.0.1', write: vi.fn().mockReturnValue(true), destroy: vi.fn() }) as any;
 
     (ingress as any).handleConnect(
       {
