@@ -401,7 +401,12 @@ rollback_migration_publication() {
     kind="${migration_published_kinds[$index]}"
     case "$kind" in
       file|link)
-        if ! quarantine_owned_path "$path" "$expected_identity" "$kind" "migration rollback $kind" "migration-publication-$kind"; then
+        local q_status=0
+        quarantine_owned_path "$path" "$expected_identity" "$kind" "migration rollback $kind" "migration-publication-$kind" || q_status=$?
+        if [ "$q_status" -ne 0 ]; then
+          if [ "$q_status" -eq 2 ]; then
+            continue
+          fi
           printf '%s\n' "Refusing to remove substituted migration rollback entry: $path" >&2
           rollback_failed=1
           continue
@@ -417,7 +422,12 @@ rollback_migration_publication() {
           rollback_failed=1
           continue
         fi
-        if ! quarantine_owned_path "$path" "$expected_identity" directory "migration release directory" migration-release-directory; then
+        local q_dir_status=0
+        quarantine_owned_path "$path" "$expected_identity" directory "migration release directory" migration-release-directory || q_dir_status=$?
+        if [ "$q_dir_status" -ne 0 ]; then
+          if [ "$q_dir_status" -eq 2 ]; then
+            continue
+          fi
           printf '%s\n' "Refusing to remove substituted migration rollback entry: $path" >&2
           rollback_failed=1
           continue
@@ -709,7 +719,12 @@ restore_migration_release_topology() {
     path="${migration_link_paths[$index]}"
     expected_identity="${migration_link_identities[$index]}"
     prior_id="${migration_link_previous_ids[$index]}"
-    if ! quarantine_owned_path "$path" "$expected_identity" link "migration release link" migration-release-link; then
+    local q_link_status=0
+    quarantine_owned_path "$path" "$expected_identity" link "migration release link" migration-release-link || q_link_status=$?
+    if [ "$q_link_status" -ne 0 ]; then
+      if [ "$q_link_status" -eq 2 ]; then
+        continue
+      fi
       printf '%s\n' "Refusing to restore substituted migration release link: $path" >&2
       rollback_failed=1
       continue

@@ -11,6 +11,7 @@ export type SessionState = 'active' | 'migrating';
 export interface MigrationCapability {
   sessionKey: string;
   generation: number;
+  tableIncarnation: number;
   ownerRequestId: string;
   targetAccountId: string;
 }
@@ -101,6 +102,10 @@ export class AccountLeaseSelectionPolicy {
 
   isNoGoBlocked(): boolean {
     return this.noGoBlocked;
+  }
+
+  getTableIncarnation(): number {
+    return this.tableIncarnation;
   }
 
   clearSessions(): void {
@@ -212,6 +217,7 @@ export class AccountLeaseSelectionPolicy {
     accountId: string,
     expiresAt: number,
     expectedGeneration?: number,
+    expectedIncarnation?: number,
   ): boolean {
     if (!sessionKey || !accountId) {
       return false;
@@ -221,6 +227,10 @@ export class AccountLeaseSelectionPolicy {
       if (isHintSessionKey(sessionKey)) {
         this.recordCacheHint(sessionKey, accountId, Math.max(0, expiresAt - Date.now()));
       }
+      return false;
+    }
+    // Strict incarnation fencing: if expectedIncarnation is provided, it must match current tableIncarnation!
+    if (expectedIncarnation !== undefined && expectedIncarnation !== this.tableIncarnation) {
       return false;
     }
     const current = this.sessionBindings.get(sessionKey);
@@ -310,6 +320,7 @@ export class AccountLeaseSelectionPolicy {
         return {
           sessionKey,
           generation: current.generation,
+          tableIncarnation: this.tableIncarnation,
           ownerRequestId,
           targetAccountId,
         };
@@ -330,6 +341,7 @@ export class AccountLeaseSelectionPolicy {
         return {
           sessionKey,
           generation: newGen,
+          tableIncarnation: this.tableIncarnation,
           ownerRequestId,
           targetAccountId,
         };
@@ -356,6 +368,7 @@ export class AccountLeaseSelectionPolicy {
     return {
       sessionKey,
       generation: newGen,
+      tableIncarnation: this.tableIncarnation,
       ownerRequestId,
       targetAccountId,
     };
@@ -366,8 +379,10 @@ export class AccountLeaseSelectionPolicy {
     expectedGeneration: number,
     ownerRequestId?: string,
     extensionMs = 30000,
+    expectedIncarnation?: number,
   ): boolean {
     if (!sessionKey || !ownerRequestId) return false;
+    if (expectedIncarnation !== undefined && expectedIncarnation !== this.tableIncarnation) return false;
     const current = this.sessionBindings.get(sessionKey);
     if (!current || current.state !== 'migrating') return false;
     if (current.tableIncarnation !== this.tableIncarnation) return false;
@@ -412,8 +427,10 @@ export class AccountLeaseSelectionPolicy {
     targetAccountId: string,
     ownerRequestId?: string,
     expiresAt?: number,
+    expectedIncarnation?: number,
   ): boolean {
     if (!sessionKey || !targetAccountId || !ownerRequestId) return false;
+    if (expectedIncarnation !== undefined && expectedIncarnation !== this.tableIncarnation) return false;
     const current = this.sessionBindings.get(sessionKey);
     if (!current) {
       return false;

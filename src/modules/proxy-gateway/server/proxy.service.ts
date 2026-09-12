@@ -192,12 +192,35 @@ export class ProxyService {
     sessionGeneration?: number,
     expectedBreakerGeneration?: number,
     ownerRequestId?: string,
+    tableIncarnation?: number,
   ): StreamHealthLifecycle {
     let hasMarkedSuccess = false;
     let hasRecordedFailure = false;
     let hasCleanedUp = false;
+    let renewalTimer: NodeJS.Timeout | null = null;
+
+    if (sessionKey && sessionGeneration !== undefined && ownerRequestId) {
+      renewalTimer = setInterval(() => {
+        try {
+          this.accountLeaseService.renewSessionMigration?.(
+            sessionKey,
+            sessionGeneration,
+            ownerRequestId,
+            30000,
+            tableIncarnation,
+          );
+        } catch {
+          // ignore renewal errors during active streaming
+        }
+      }, 15000);
+      renewalTimer.unref?.();
+    }
 
     const cleanup = (): void => {
+      if (renewalTimer) {
+        clearInterval(renewalTimer);
+        renewalTimer = null;
+      }
       if (hasCleanedUp) {
         return;
       }
@@ -217,6 +240,7 @@ export class ProxyService {
           sessionGeneration,
           expectedBreakerGeneration,
           ownerRequestId,
+          tableIncarnation,
         );
         if (commitResult.kind === 'rejected') {
           return false;
@@ -261,6 +285,7 @@ export class ProxyService {
       retryState?.sessionGeneration,
       retryState?.breakerGeneration,
       retryState?.requestId,
+      retryState?.tableIncarnation,
     );
     this.accountLeaseService.recordPerformanceSuccess?.(accountId, model);
     return commitResult;
@@ -436,6 +461,7 @@ export class ProxyService {
             retryState.sessionGeneration,
             retryState.breakerGeneration,
             retryState.requestId,
+            retryState.tableIncarnation,
           );
           retryState.activeReservation = undefined;
           return this.processAnthropicInternalStream(
@@ -509,6 +535,7 @@ export class ProxyService {
                 retryState.sessionGeneration,
                 retryState.breakerGeneration,
                 retryState.requestId,
+                retryState.tableIncarnation,
               );
               retryState.activeReservation = undefined;
               return this.processAnthropicInternalStream(
@@ -527,7 +554,13 @@ export class ProxyService {
                 token.id,
                 'gemini-3-flash',
               );
-              this.markUpstreamSuccess(token.id, 'gemini-3-flash', undefined, retryState);
+              const commitResult = this.markUpstreamSuccess(token.id, 'gemini-3-flash', sessionKey, retryState);
+              if (commitResult.kind === 'rejected') {
+                throw new HttpException(
+                  `Session affinity confirmation rejected: ${commitResult.reason}`,
+                  HttpStatus.CONFLICT,
+                );
+              }
               const transformed = this.toAnthropicChatResponse(
                 transformResponse(response, downgradedSignatureContext, request.model),
               );
@@ -799,7 +832,13 @@ export class ProxyService {
           effectiveTargetModel,
         );
 
-        this.markUpstreamSuccess(token.id, effectiveTargetModel, undefined, retryState);
+        const commitResult = this.markUpstreamSuccess(token.id, effectiveTargetModel, undefined, retryState);
+        if (commitResult.kind === 'rejected') {
+          throw new HttpException(
+            `Session affinity confirmation rejected: ${commitResult.reason}`,
+            HttpStatus.CONFLICT,
+          );
+        }
         return this.normalizeGeminiGenerateResponse(response);
       } catch (err) {
         if (err instanceof BadRequestException) {
@@ -1301,6 +1340,7 @@ export class ProxyService {
               retryState.sessionGeneration,
               retryState.breakerGeneration,
               retryState.requestId,
+              retryState.tableIncarnation,
             );
             retryState.activeReservation = undefined;
             return this.createOpenAIProtocolStream(

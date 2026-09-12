@@ -18,6 +18,7 @@ export interface ProxyTokenRetryState {
   requestId: string;
   activeReservation?: () => void;
   sessionGeneration?: number;
+  tableIncarnation?: number;
   breakerGeneration?: number;
   migrationCapability?: MigrationCapability;
 }
@@ -48,18 +49,27 @@ export interface ProxyRetryAccountLeaseService {
     account: CloudAccount;
     sessionKey?: string;
     generation: number;
+    tableIncarnation: number;
     breakerGeneration: number;
     releaseReservation: () => void;
   } | null>;
   getBreakerGeneration?(accountId: string): number;
+  getTableIncarnation?(): number;
   markModelSuccess?(accountIdOrEmail: string, model: string, expectedBreakerGeneration?: number): void;
-  bindSession?(sessionKey: string | undefined, accountId: string, ttlMs?: number, expectedGeneration?: number): boolean | void;
+  bindSession?(
+    sessionKey: string | undefined,
+    accountId: string,
+    ttlMs?: number,
+    expectedGeneration?: number,
+    expectedIncarnation?: number,
+  ): boolean | void;
   confirmOrBindSession?(
     sessionKey: string | undefined,
     accountId: string,
     expectedGeneration?: number,
     ownerRequestId?: string,
     ttlMs?: number,
+    expectedIncarnation?: number,
   ): AffinityCommitResult | boolean;
   startSessionMigration?(
     sessionKey: string | undefined,
@@ -67,13 +77,20 @@ export interface ProxyRetryAccountLeaseService {
     targetAccountId: string,
     ownerRequestId?: string,
   ): MigrationCapability | null;
+  renewSessionMigration?(
+    sessionKey: string | undefined,
+    expectedGeneration: number,
+    ownerRequestId?: string,
+    extensionMs?: number,
+    expectedIncarnation?: number,
+  ): boolean;
   failSessionMigrationCandidate?(
     sessionKey: string | undefined,
     expectedGeneration: number,
     failedAccountId: string,
     ownerRequestId?: string,
   ): boolean;
-  getSessionBinding?(sessionKey: string | undefined): { generation: number } | null;
+  getSessionBinding?(sessionKey: string | undefined): { accountId?: string; generation: number } | null;
 }
 
 interface ProxyRetryLogger {
@@ -110,6 +127,11 @@ export class ProxyRetryPolicy {
 
     const isRetryAttempt = retryState.attemptedAccountIds.size > 0;
 
+    const initialBinding =
+      sessionKey && typeof this.accountLeaseService.getSessionBinding === 'function'
+        ? this.accountLeaseService.getSessionBinding(sessionKey)
+        : null;
+
     let selectedAccount: CloudAccount | null = null;
 
     if (this.accountLeaseService.acquireAttemptLease) {
@@ -125,6 +147,7 @@ export class ProxyRetryPolicy {
       retryState.attemptedAccountIds.add(lease.account.id);
       retryState.activeReservation = lease.releaseReservation;
       retryState.sessionGeneration = lease.generation;
+      retryState.tableIncarnation = lease.tableIncarnation;
       retryState.breakerGeneration = lease.breakerGeneration;
       selectedAccount = lease.account;
     } else {
@@ -144,23 +167,34 @@ export class ProxyRetryPolicy {
         retryState.sessionGeneration =
           this.accountLeaseService.getSessionBinding(sessionKey)?.generation ?? 1;
       }
+      if (this.accountLeaseService.getTableIncarnation) {
+        retryState.tableIncarnation = this.accountLeaseService.getTableIncarnation();
+      }
       if (this.accountLeaseService.getBreakerGeneration) {
         retryState.breakerGeneration = this.accountLeaseService.getBreakerGeneration(token.id);
       }
       selectedAccount = token;
     }
 
-    // Gate 4: If this is a retry attempt on a verified session, initiate versioned migration to the candidate account
+    const needsMigration = Boolean(
+      sessionKey &&
+      isVerifiedSessionKey(sessionKey) &&
+      selectedAccount &&
+      initialBinding &&
+      initialBinding.accountId !== selectedAccount.id,
+    );
+
+    // Gate 4: If this is a retry attempt or account changed on a verified session, initiate versioned migration to the candidate account
     if (
       selectedAccount &&
       sessionKey &&
       isVerifiedSessionKey(sessionKey) &&
-      isRetryAttempt &&
+      (isRetryAttempt || needsMigration) &&
       typeof this.accountLeaseService.startSessionMigration === 'function'
     ) {
       const currentGen =
         retryState.sessionGeneration ??
-        this.accountLeaseService.getSessionBinding?.(sessionKey)?.generation ??
+        initialBinding?.generation ??
         1;
       const migrationCap = this.accountLeaseService.startSessionMigration(
         sessionKey,
@@ -170,6 +204,7 @@ export class ProxyRetryPolicy {
       );
       if (migrationCap) {
         retryState.sessionGeneration = migrationCap.generation;
+        retryState.tableIncarnation = migrationCap.tableIncarnation;
         retryState.migrationCapability = migrationCap;
       }
     }
@@ -207,6 +242,7 @@ export class ProxyRetryPolicy {
     expectedGeneration?: number,
     expectedBreakerGeneration?: number,
     ownerRequestId?: string,
+    expectedIncarnation?: number,
   ): AffinityCommitResult {
     let commitResult: AffinityCommitResult = { kind: 'not-applicable' };
     if (sessionKey) {
@@ -216,6 +252,8 @@ export class ProxyRetryPolicy {
           accountId,
           expectedGeneration,
           ownerRequestId,
+          undefined,
+          expectedIncarnation,
         );
         commitResult =
           typeof res === 'boolean'
@@ -226,8 +264,13 @@ export class ProxyRetryPolicy {
       } else if (this.accountLeaseService.bindSession) {
         if (expectedGeneration !== undefined) {
           const bound =
-            this.accountLeaseService.bindSession(sessionKey, accountId, undefined, expectedGeneration) !==
-            false;
+            this.accountLeaseService.bindSession(
+              sessionKey,
+              accountId,
+              undefined,
+              expectedGeneration,
+              expectedIncarnation,
+            ) !== false;
           commitResult = bound ? { kind: 'confirmed' } : { kind: 'rejected', reason: 'bindSession returned false' };
         } else {
           const bound = this.accountLeaseService.bindSession(sessionKey, accountId) !== false;

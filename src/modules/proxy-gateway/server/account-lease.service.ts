@@ -43,6 +43,7 @@ export interface AttemptLease {
   account: CloudAccount;
   sessionKey?: string;
   generation: number;
+  tableIncarnation: number;
   breakerGeneration: number;
   releaseReservation: () => void;
   readonly isReleased: boolean;
@@ -655,6 +656,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         account: finalized,
         sessionKey,
         generation,
+        tableIncarnation: this.selectionPolicy.getTableIncarnation(),
         breakerGeneration,
         releaseReservation: idempotentRelease,
         get isReleased() {
@@ -746,6 +748,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     accountId: string,
     ttlMs?: number,
     expectedGeneration?: number,
+    expectedIncarnation?: number,
   ): boolean {
     if (!sessionKey || !accountId) {
       return false;
@@ -757,7 +760,13 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
       return false;
     }
     const expiresAt = Date.now() + (ttlMs ?? this.stickySessionTtlMs);
-    return this.selectionPolicy.bindSession(sessionKey, accountId, expiresAt, expectedGeneration);
+    return this.selectionPolicy.bindSession(
+      sessionKey,
+      accountId,
+      expiresAt,
+      expectedGeneration,
+      expectedIncarnation,
+    );
   }
 
   public getSessionBinding(sessionKey: string | undefined): SessionBindingEntry | null {
@@ -818,13 +827,23 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     expectedGeneration: number,
     ownerRequestId?: string,
     extensionMs?: number,
+    expectedIncarnation?: number,
   ): boolean {
     return this.selectionPolicy.renewSessionMigration(
       sessionKey,
       expectedGeneration,
       ownerRequestId,
       extensionMs,
+      expectedIncarnation,
     );
+  }
+
+  public getTableIncarnation(): number {
+    return this.selectionPolicy.getTableIncarnation();
+  }
+
+  public clearSessions(): void {
+    this.selectionPolicy.clearSessions();
   }
 
   public confirmOrBindSession(
@@ -833,6 +852,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     expectedGeneration?: number,
     ownerRequestId?: string,
     ttlMs?: number,
+    expectedIncarnation?: number,
   ): AffinityCommitResult {
     if (!sessionKey || !accountId) return { kind: 'not-applicable' };
 
@@ -844,6 +864,15 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         return { kind: 'hint-recorded' };
       }
       return { kind: 'not-applicable' };
+    }
+
+    // T14-F05: Incarnation fencing across resets
+    const currentTableIncarnation = this.selectionPolicy.getTableIncarnation();
+    if (expectedIncarnation !== undefined && expectedIncarnation !== currentTableIncarnation) {
+      return {
+        kind: 'rejected',
+        reason: `Expected table incarnation ${expectedIncarnation} does not match current table incarnation ${currentTableIncarnation} (session table was reset)`,
+      };
     }
 
     const current = this.selectionPolicy.getSessionBinding(sessionKey);
@@ -864,6 +893,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         accountId,
         ownerRequestId,
         expiresAt,
+        expectedIncarnation,
       );
       return success
         ? { kind: 'confirmed' }
@@ -891,6 +921,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         accountId,
         expiresAt,
         expectedGeneration ?? current.generation,
+        expectedIncarnation,
       );
       return success
         ? { kind: 'confirmed' }
@@ -903,6 +934,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
       accountId,
       expiresAt,
       expectedGeneration,
+      expectedIncarnation,
     );
     return success
       ? { kind: 'confirmed' }

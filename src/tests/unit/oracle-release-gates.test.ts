@@ -669,4 +669,116 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
       reason: 'Binding rejected in test',
     });
   });
+
+  // T14-F01: Streaming decompressor decodes chunked gzip response once without double decompression
+  it('T14-F01: classifyProtocolFrame handles already decoded buffer without double decompressing', () => {
+    const validJson = Buffer.from(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'hello' }] } }] }), 'utf-8');
+    const headers = {
+      'content-type': 'application/json',
+      'content-encoding': 'gzip', // original transport header remains gzip
+    };
+
+    // When isAlreadyDecoded is true, classifyProtocolFrame should NOT call gunzipSync on validJson
+    const decision = gateway.classifyProtocolFrame(
+      'application/json',
+      validJson,
+      headers as any,
+      {},
+      false,
+      200,
+      true, // isAlreadyDecoded
+    );
+
+    expect(decision.state).toBe('VALIDATED_RESPONSE');
+  });
+
+  // T14-F02: 64 KiB threshold returns NEED_MORE_DATA (inspection-limit) without falsely promoting to valid response
+  it('T14-F02: Exceeding 64 KiB inspection buffer without complete frame does not promote to VALIDATED_RESPONSE', () => {
+    const incompleteJsonPrefix = Buffer.from('{"data":"' + 'x'.repeat(70000), 'utf-8');
+    const decision = gateway.classifyProtocolFrame(
+      'application/json',
+      incompleteJsonPrefix,
+      { 'content-type': 'application/json' } as any,
+      {},
+      false,
+      200,
+      false,
+    );
+
+    // Incomplete JSON must return NEED_MORE_DATA, NEVER VALIDATED_RESPONSE
+    expect(decision.state).toBe('NEED_MORE_DATA');
+  });
+
+  // T14-F04: API retry selector initiates migration on attempt 1 when account differs from session binding
+  it('T14-F04: selectRetryToken initiates migration on attempt 1 when account differs from bound account', async () => {
+    const sessionKey = 'session:api-attempt1-migration';
+    // Bind session to account A
+    leaseService.bindSession(sessionKey, 'acc-1');
+
+    const startMigrationSpy = vi.spyOn(leaseService, 'startSessionMigration');
+    const retryPolicy = new ProxyRetryPolicy(leaseService, console as any);
+    const retryState = retryPolicy.createTokenRetryState();
+
+    // Account A is cooling down / excluded, so attempt 1 must select B ('acc-2')
+    retryState.attemptedAccountIds.add('acc-1');
+    const selected = await retryPolicy.selectRetryToken(retryState, 'gemini-2.5-flash', sessionKey);
+
+    expect(selected?.id).toBe('acc-2');
+    // Verify migration was initiated before attempt 1 dispatched to B!
+    expect(startMigrationSpy).toHaveBeenCalledWith(
+      sessionKey,
+      1,
+      'acc-2',
+      retryState.requestId,
+    );
+    expect(retryState.migrationCapability).toBeDefined();
+    expect(retryState.tableIncarnation).toBe(leaseService.getTableIncarnation());
+  });
+
+  // T14-F05: Generation-1 attempt completes after clearSessions reset is rejected
+  it('T14-F05: Old generation-1 attempt is rejected after clearSessions reset', () => {
+    const sessionKey = 'session:reset-fence-test';
+    const oldIncarnation = leaseService.getTableIncarnation();
+
+    // Simulate reset
+    leaseService.clearSessions();
+    const newIncarnation = leaseService.getTableIncarnation();
+    expect(newIncarnation).toBeGreaterThan(oldIncarnation);
+
+    // Attempt with old incarnation tries to confirm generation 1
+    const commitResult = leaseService.confirmOrBindSession(
+      sessionKey,
+      'acc-1',
+      1,
+      'req-old',
+      undefined,
+      oldIncarnation, // old incarnation from before reset!
+    );
+
+    expect(commitResult.kind).toBe('rejected');
+    expect(commitResult.reason).toContain('does not match current table incarnation');
+  });
+
+  // T14-F05: Migration lease renewal extends expiresAt with matching incarnation
+  it('T14-F05: renewSessionMigration successfully extends migration expiry', () => {
+    const sessionKey = 'session:renew-test';
+    leaseService.bindSession(sessionKey, 'acc-1');
+    const cap = leaseService.startSessionMigration(sessionKey, 1, 'acc-2', 'req-renew');
+    expect(cap).not.toBeNull();
+
+    const rawBindingBefore = (leaseService as any).selectionPolicy.sessionBindings.get(sessionKey);
+    const migrationExpiresAtBefore = rawBindingBefore.migrationExpiresAt;
+
+    const renewed = leaseService.renewSessionMigration(
+      sessionKey,
+      cap!.generation,
+      'req-renew',
+      120000,
+      cap!.tableIncarnation,
+    );
+
+    expect(renewed).toBe(true);
+    const rawBindingAfter = (leaseService as any).selectionPolicy.sessionBindings.get(sessionKey);
+    expect(rawBindingAfter.migrationExpiresAt).toBeGreaterThan(migrationExpiresAtBefore);
+  });
 });
