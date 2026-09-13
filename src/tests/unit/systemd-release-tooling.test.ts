@@ -4,7 +4,6 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-
 const repositoryRoot = process.cwd();
 const installScript = join(repositoryRoot, 'scripts/install-systemd.sh');
 const rollbackScript = join(repositoryRoot, 'scripts/rollback-systemd.sh');
@@ -213,7 +212,7 @@ describe('systemd release tooling', { timeout: 60_000 }, () => {
     const library = readFileSync(releaseRuntimeLibrary, 'utf8');
     expect(library).toContain('"$npm_binary" ci --prefix "$staging_fs" --omit=dev');
     expect(library).not.toContain('npm ci --prefix "$staging_fs" --omit=dev --ignore-scripts');
-    expect(library).toContain('release_runtime_probe');
+    expect(readFileSync(releaseLibrary, 'utf8')).toContain('release_runtime_probe');
     expect(readFileSync(probeLog, 'utf8')).toContain(`uid=${process.getuid?.()} command=`);
     expect(readFileSync(probeLog, 'utf8')).toContain('/bin/node ');
   }, 30_000);

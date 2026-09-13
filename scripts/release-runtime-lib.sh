@@ -150,7 +150,7 @@ resolve_release_runtime() {
     node_binary="$(canonical_runtime_binary "$NODE_BINARY" NODE_BINARY)"
     if runtime_owner_is_operator "$node_binary"; then
       resolve_runtime_from_node "$node_binary" operator
-    elif [ "$test_mode" = 1 ]; then
+    elif [ "$test_mode" = 1 ] || [ "$dry_run" = 1 ]; then
       resolve_runtime_from_node "$node_binary" explicit-test
     else
       resolve_runtime_from_node "$node_binary" system

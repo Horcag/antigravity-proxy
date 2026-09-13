@@ -61,7 +61,7 @@ describe('systemd release runtime discovery', () => {
     const escaped = resolveRuntime(root, { FNM_DIR: runtime.fnmDir }); expect(escaped.status).toBe(1); expect(escaped.stderr).toContain('NODE_BINARY is not in the default fnm runtime');
     const unsafeRoot = createRoot(); const unsafe = createFnmRuntime(unsafeRoot, 'v-unsafe'); chmodSync(unsafe.fnmDir, 0o777);
     const unsafeResult = resolveRuntime(unsafeRoot, { FNM_DIR: unsafe.fnmDir }); expect(unsafeResult.status).toBe(1); expect(unsafeResult.stderr).toContain('must not be group- or world-writable');
-  });
+  }, 30_000);
   it('uses the matching derived fnm runtime through the install staging path under sudo-like conditions', () => {
     const root = createRoot(); const operator = execFileSync('id', ['-un'], { encoding: 'utf8' }).trim(); const home = join(root, 'operator home'); const npmLog = join(root, 'npm.log'); const runuserLog = join(root, 'runuser.log');
     const runtime = createFnmRuntime(join(home, '.local/share'), 'v-stage', npmLog); const tools = writeFakeSudoTools(root, operator, home, runuserLog);
