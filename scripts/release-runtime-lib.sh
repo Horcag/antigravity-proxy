@@ -82,7 +82,9 @@ validate_runtime_binaries() {
   fi
   runtime_path_is_secure "$node_dir" "NODE_BINARY parent" "$owner_uid"
   runtime_path_is_secure "$node_binary" NODE_BINARY "$owner_uid"
-  runtime_path_is_secure "$npm_binary" NPM_BINARY "$owner_uid"
+  if [ "${RELEASE_REQUIRE_NPM:-0}" = 1 ]; then
+    runtime_path_is_secure "$npm_binary" NPM_BINARY "$owner_uid"
+  fi
 }
 
 resolve_runtime_from_node() {
@@ -99,17 +101,23 @@ resolve_runtime_from_node() {
     runtime_root="$(validate_runtime_root "$(dirname "$node_install_root")" "NODE_BINARY runtime root")"
     runtime_path_is_secure "$runtime_root" "NODE_BINARY runtime root" "$(id -u)"
   else
-    runtime_root="$(validate_trusted_system_runtime_root "$(dirname "$node_install_root")" "NODE_BINARY runtime root")"
+    # A conventional system runtime resolves to /usr/bin/node. Its installation
+    # root is /usr; taking another dirname would incorrectly validate `/`.
+    runtime_root="$(validate_trusted_system_runtime_root "$node_install_root" "NODE_BINARY runtime root")"
   fi
   path_is_within "$node_binary" "$runtime_root" || die "NODE_BINARY escapes its validated runtime root"
-  if [ -n "${NPM_BINARY:-}" ]; then
+  if [ "${RELEASE_REQUIRE_NPM:-0}" = 0 ]; then
+    npm_binary=''
+  elif [ -n "${NPM_BINARY:-}" ]; then
     npm_candidate="$NPM_BINARY"
     npm_binary="$(canonical_runtime_binary "$npm_candidate" NPM_BINARY)"
   else
     npm_binary="$(canonical_runtime_binary "$node_dir/npm" NPM_BINARY)"
   fi
-  path_is_within "$npm_binary" "$node_install_root" || die "NPM_BINARY must be in the same runtime installation as NODE_BINARY"
-  path_is_within "$npm_binary" "$runtime_root" || die "NPM_BINARY escapes its validated runtime root"
+  if [ "${RELEASE_REQUIRE_NPM:-0}" = 1 ]; then
+    path_is_within "$npm_binary" "$node_install_root" || die "NPM_BINARY must be in the same runtime installation as NODE_BINARY"
+    path_is_within "$npm_binary" "$runtime_root" || die "NPM_BINARY escapes its validated runtime root"
+  fi
   validate_runtime_binaries "$kind"
 }
 
@@ -128,13 +136,17 @@ resolve_operator_fnm_runtime() {
   runtime_path_is_secure "$node_version_dir" "fnm version directory" "$operator_uid"
   runtime_path_is_secure "$node_install_root" "fnm installation directory" "$operator_uid"
   runtime_root="$fnm_root"
-  if [ -n "${NPM_BINARY:-}" ]; then
+  if [ "${RELEASE_REQUIRE_NPM:-0}" = 0 ]; then
+    npm_binary=''
+  elif [ -n "${NPM_BINARY:-}" ]; then
     npm_binary="$(canonical_runtime_binary "$NPM_BINARY" NPM_BINARY)"
   else
     npm_binary="$(canonical_runtime_binary "$node_dir/npm" NPM_BINARY)"
   fi
-  path_is_within "$npm_binary" "$node_install_root" || die "NPM_BINARY must be in the same runtime installation as NODE_BINARY"
-  path_is_within "$npm_binary" "$fnm_root" || die "NPM_BINARY escapes its validated runtime root"
+  if [ "${RELEASE_REQUIRE_NPM:-0}" = 1 ]; then
+    path_is_within "$npm_binary" "$node_install_root" || die "NPM_BINARY must be in the same runtime installation as NODE_BINARY"
+    path_is_within "$npm_binary" "$fnm_root" || die "NPM_BINARY escapes its validated runtime root"
+  fi
   validate_runtime_binaries operator
 }
 
@@ -150,6 +162,8 @@ resolve_release_runtime() {
     node_binary="$(canonical_runtime_binary "$NODE_BINARY" NODE_BINARY)"
     if runtime_owner_is_operator "$node_binary"; then
       resolve_runtime_from_node "$node_binary" operator
+    elif { [[ "$node_binary" == /usr/* ]] || [[ "$node_binary" == /opt/* ]]; } && [ "$(stat -c '%u' -- "$node_binary")" = 0 ]; then
+      resolve_runtime_from_node "$node_binary" system
     elif [ "$test_mode" = 1 ] || [ "$dry_run" = 1 ]; then
       resolve_runtime_from_node "$node_binary" explicit-test
     else
@@ -162,8 +176,8 @@ resolve_release_runtime() {
     resolve_operator_fnm_runtime "$derived_fnm_dir" "operator fnm directory"
   elif node_candidate="$(command -v node || true)" && [ -n "$node_candidate" ]; then
     node_binary="$(canonical_runtime_binary "$node_candidate" NODE_BINARY)"
-    if [ "$dry_run" = 1 ]; then
-      resolve_runtime_from_node "$node_binary" explicit-test
+    if [ "$(id -u)" = 0 ]; then
+      resolve_runtime_from_node "$node_binary" system
     elif runtime_owner_is_current_user "$node_binary"; then
       resolve_runtime_from_node "$node_binary" current-user
     else

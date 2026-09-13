@@ -2,6 +2,7 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RELEASE_REQUIRE_NPM=1
 # shellcheck source=scripts/release-lib.sh
 source "$script_dir/release-lib.sh"
 release_init

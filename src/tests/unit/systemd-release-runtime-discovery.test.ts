@@ -20,13 +20,13 @@ function createFnmRuntime(root: string, version: string, npmLog = '') {
 function writeFakeSudoTools(root: string, operator: string, home: string, runuserLog: string) {
   const tools = join(root, 'tools'); mkdirSync(tools, { recursive: true });
   writeFileSync(join(tools, 'getent'), `#!/bin/sh\nprintf '%s\\n' '${operator}:x:1000:1000::${home}:/bin/sh'\n`);
-  writeFileSync(join(tools, 'runuser'), `#!/bin/sh\nprintf '%s\\n' "$*" > "${runuserLog}"\nshift 2\n[ "$1" = -- ] || exit 1\nshift\nexec "$@"\n`);
+  writeFileSync(join(tools, 'runuser'), `#!/bin/sh\nprintf '%s\\n' "$*" > "${runuserLog}"\n[ "$1" = -u ] && [ "$2" = '${operator}' ] && [ "$3" = -- ] || exit 1\nshift 3\nexec "$@"\n`);
   chmodSync(join(tools, 'getent'), 0o755); chmodSync(join(tools, 'runuser'), 0o755);
   return tools;
 }
 function resolveRuntime(root: string, extraEnv: NodeJS.ProcessEnv = {}) {
-  return spawnSync('bash', ['-c', 'source "$1"; release_init; printf "%s\\n%s\\n" "$node_binary" "$npm_binary"', 'release-runtime-test', releaseLibrary], {
-    cwd: repositoryRoot, encoding: 'utf8', env: { ...process.env, ROOT_PREFIX: root, RELEASE_ID: 'runtime-resolution', RELEASE_TEST_MODE: '1', NODE_BINARY: '', NPM_BINARY: '', PATH: '/usr/bin:/bin', RELEASE_OPERATOR: execFileSync('id', ['-un'], { encoding: 'utf8' }).trim(), ...extraEnv },
+  return spawnSync('bash', ['-c', 'set -euo pipefail; source "$1"; release_init; printf "%s\\n%s\\n" "$node_binary" "$npm_binary"', 'release-runtime-test', releaseLibrary], {
+    cwd: repositoryRoot, encoding: 'utf8', env: { ...process.env, ROOT_PREFIX: root, RELEASE_ID: 'runtime-resolution', RELEASE_TEST_MODE: '1', RELEASE_REQUIRE_NPM: '1', NODE_BINARY: '', NPM_BINARY: '', PATH: '/usr/bin:/bin', RELEASE_OPERATOR: execFileSync('id', ['-un'], { encoding: 'utf8' }).trim(), ...extraEnv },
   });
 }
 afterEach(() => { for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -34,23 +34,33 @@ afterEach(() => { for (const root of temporaryRoots.splice(0)) rmSync(root, { re
 describe('systemd release runtime discovery', () => {
   it('discovers a matching operator-owned fnm runtime when sudo-like PATH has no node or npm', () => {
     const root = createRoot(); const runtime = createFnmRuntime(root, 'v-test'); const result = resolveRuntime(root, { FNM_DIR: runtime.fnmDir });
-    expect(result.status).toBe(0); expect(result.stdout.trim().split('\n')).toEqual([join(runtime.binDir, 'node'), join(runtime.binDir, 'npm')]);
+    expect(result.status).toBe(0); expect(result.stderr).toBe(''); expect(result.stdout.trim().split('\n')).toEqual([join(runtime.binDir, 'node'), join(runtime.binDir, 'npm')]);
   });
   it('prefers the operator home fnm runtime over a sudo secure-path system Node when FNM_DIR is absent', () => {
     const root = createRoot(); const operator = execFileSync('id', ['-un'], { encoding: 'utf8' }).trim(); const home = join(root, 'operator home');
     const runtime = createFnmRuntime(join(home, '.local/share'), 'v-derived'); const tools = writeFakeSudoTools(root, operator, home, join(root, 'runuser.log'));
     const result = resolveRuntime(root, { FNM_DIR: '', RELEASE_OPERATOR: '', SUDO_USER: operator, PATH: `${tools}:/usr/bin:/bin` });
-    expect(result.status).toBe(0); expect(result.stdout.trim().split('\n')).toEqual([join(runtime.binDir, 'node'), join(runtime.binDir, 'npm')]);
+    expect(result.status).toBe(0); expect(result.stderr).toBe(''); expect(result.stdout.trim().split('\n')).toEqual([join(runtime.binDir, 'node'), join(runtime.binDir, 'npm')]);
   });
   it('falls back to a root-owned trusted system Node when no operator fnm runtime exists', () => {
     const root = createRoot(); const tools = join(root, 'trusted-system-tools'); mkdirSync(tools); symlinkSync('/usr/bin/bash', join(tools, 'node'));
     const result = resolveRuntime(root, { FNM_DIR: '', NPM_BINARY: '/usr/bin/bash', RELEASE_OPERATOR: '', SUDO_USER: '', PATH: `${tools}:/usr/bin:/bin` });
-    expect(result.status).toBe(0); expect(result.stdout.trim().split('\n')).toEqual(['/usr/bin/bash', '/usr/bin/bash']);
+    expect(result.status, result.stderr).toBe(0); expect(result.stderr).toBe(''); expect(result.stdout.trim().split('\n')).toEqual(['/usr/bin/bash', '/usr/bin/bash']);
+  });
+  it('classifies a root-owned trusted Node as system runtime under sudo root semantics', () => {
+    const root = createRoot(); const tools = join(root, 'root-tools'); mkdirSync(tools);
+    symlinkSync('/usr/bin/bash', join(tools, 'node')); writeFileSync(join(tools, 'id'), '#!/bin/sh\nprintf "0\\n"\n'); chmodSync(join(tools, 'id'), 0o755);
+    const result = resolveRuntime(root, { FNM_DIR: '', RELEASE_OPERATOR: '', SUDO_USER: '', PATH: `${tools}:/usr/bin:/bin`, NPM_BINARY: '/usr/bin/bash' });
+    expect(result.status, result.stderr).toBe(0); expect(result.stderr).toBe(''); expect(result.stdout.trim().split('\n')).toEqual(['/usr/bin/bash', '/usr/bin/bash']);
+  });
+  it('accepts an explicit trusted system Node during dry-run', () => {
+    const root = createRoot(); const result = resolveRuntime(root, { DRY_RUN: '1', NODE_BINARY: '/usr/bin/bash', NPM_BINARY: '/usr/bin/bash' });
+    expect(result.status, result.stderr).toBe(0); expect(result.stderr).toBe(''); expect(result.stdout.trim().split('\n')).toEqual(['/usr/bin/bash', '/usr/bin/bash']);
   });
   it('prefers explicit matching Node and npm overrides over fnm discovery', () => {
     const root = createRoot(); const fnmRuntime = createFnmRuntime(root, 'v-fnm'); const explicitRuntime = createFnmRuntime(root, 'v-explicit');
     const result = resolveRuntime(root, { FNM_DIR: fnmRuntime.fnmDir, NODE_BINARY: join(explicitRuntime.binDir, 'node'), NPM_BINARY: join(explicitRuntime.binDir, 'npm') });
-    expect(result.status).toBe(0); expect(result.stdout.trim().split('\n')).toEqual([join(explicitRuntime.binDir, 'node'), join(explicitRuntime.binDir, 'npm')]);
+    expect(result.status).toBe(0); expect(result.stderr).toBe(''); expect(result.stdout.trim().split('\n')).toEqual([join(explicitRuntime.binDir, 'node'), join(explicitRuntime.binDir, 'npm')]);
   });
   it('rejects missing, mismatched, escaping, and unsafe operator runtime binaries', () => {
     const missingRoot = createRoot(); const missing = resolveRuntime(missingRoot, { FNM_DIR: createFnmRuntime(missingRoot, 'v-missing').fnmDir, NPM_BINARY: join(missingRoot, 'missing-npm') });
