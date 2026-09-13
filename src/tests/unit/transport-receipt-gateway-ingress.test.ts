@@ -160,6 +160,51 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
     ingress.close();
   });
 
+  it('transfers a non-retriable 418 writeHead failure to ingress with the same receipt owner', async () => {
+    const ingress = new ConnectIngressService();
+    const server = new EventEmitter() as any;
+    server.on = vi.fn(EventEmitter.prototype.on.bind(server));
+    ingress.attach(server);
+    const leases: any = { getNextToken: vi.fn().mockResolvedValue({ id: 'account', provider: 'google' }) };
+    const gateway = new CloudCodeFailoverGateway(leases);
+    (ingress as any).failoverGateway = gateway;
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockResolvedValue({
+      statusCode: 418, headers: { 'content-type': 'application/json' }, bufferedBody: Buffer.from('{"error":"teapot"}'), bodyStream: new PassThrough(),
+    });
+    const res = response();
+    res.writeHead.mockImplementationOnce(() => { throw new Error('418 headers failed'); }).mockImplementation(() => { res.headersSent = true; });
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    (ingress as any).h2Server.listeners('request')[0](request('daily-cloudcode-pa.googleapis.com'), res);
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(res.writeHead).toHaveBeenNthCalledWith(1, 418, expect.anything());
+    expect(res.writeHead).toHaveBeenNthCalledWith(2, 502, expect.anything());
+    res.emit('finish');
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({ classification: 'internal_error', result: 'committed', downstreamCommitCount: 1 });
+    ingress.close();
+  });
+
+  it.each(['write', 'end'])('rejects and destroys a validated streaming response when downstream %s throws', async (operation) => {
+    const leases: any = { getNextToken: vi.fn().mockResolvedValue({ id: 'account', provider: 'google' }) };
+    const gateway = new CloudCodeFailoverGateway(leases);
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async () => {
+      const bodyStream = new PassThrough();
+      queueMicrotask(() => bodyStream.end(Buffer.from('{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}')));
+      return { statusCode: 200, headers: { 'content-type': 'application/json' }, bodyStream };
+    });
+    const res = response();
+    res[operation].mockImplementation(() => { throw new Error(`downstream ${operation} failed`); });
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+
+    await gateway.handleRequest(request('daily-cloudcode-pa.googleapis.com'), res);
+
+    expect(res.destroy).toHaveBeenCalledTimes(1);
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({ classification: 'internal_error', result: 'rejected', downstreamCommitCount: 0 });
+  });
+
   it.each([
     ['affinity owner expiry', (leases: any) => {
       const controller = new AbortController();
