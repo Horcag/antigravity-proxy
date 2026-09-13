@@ -196,5 +196,8 @@ stage_release_dependencies_as_operator() {
   operator_home="$(getent passwd "$release_operator" | cut -d: -f6)"
   case "$operator_home" in /*) ;; *) die "RELEASE_OPERATOR home directory is invalid" ;; esac
   [ "$test_mode" = 1 ] || chown "$release_operator:$(id -gn "$release_operator")" "$staging_fs"
-  runuser -u "$release_operator" -- env HOME="$operator_home" PATH="$node_runtime_bin:/usr/local/bin:/usr/bin:/bin" npm_config_cache="$staging_fs/.npm-cache" "$npm_binary" ci --prefix "$staging_fs" --omit=dev
+  runuser -u "$release_operator" -- env \
+    HOME="$operator_home" PATH="$node_runtime_bin:/usr/local/bin:/usr/bin:/bin" \
+    npm_config_cache="$staging_fs/.npm-cache" \
+    "$npm_binary" ci --prefix "$staging_fs" --omit=dev
 }

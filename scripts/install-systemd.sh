@@ -131,7 +131,11 @@ if [ "$mode" = migrate ]; then
   stage_legacy_migration_set
   publish_staged_migration_set
 else
-  write_environment_if_missing
+  if [ "${REQUIRE_EXISTING_ENV:-0}" = 1 ]; then
+    require_regular_file "$(root_path "$env_file")" "existing production environment"
+  else
+    write_environment_if_missing
+  fi
 fi
 validate_environment_contract
 if [ "$mode" = migrate ]; then
@@ -141,7 +145,7 @@ write_unit "$candidate_staging_fs"
 if [ "$mode" = migrate ]; then
   migration_checkpoint unit-write
 fi
-write_import_helper
+if [ "${SKIP_IMPORT_HELPER:-0}" != 1 ]; then write_import_helper; fi
 commit_candidate_release
 
 if [ "$mode" = migrate ]; then

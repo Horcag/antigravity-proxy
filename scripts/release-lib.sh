@@ -2,8 +2,7 @@
 # Shared primitives for the systemd release scripts. This file is sourced, not executed.
 # shellcheck source=scripts/release-runtime-lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/release-runtime-lib.sh"
-
-
+source "$(dirname "${BASH_SOURCE[0]}")/release-prebuilt-lib.sh"
 release_init() {
   project_dir="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
   root_prefix="${ROOT_PREFIX:-}"
@@ -19,7 +18,7 @@ release_init() {
   release_id="${RELEASE_ID:-$(date -u +%Y%m%d%H%M%S)-$(git -C "$project_dir" rev-parse --short HEAD)}"
   bundle_node="${BUNDLE_NODE:-1}"
   test_mode="${RELEASE_TEST_MODE:-0}"
-  dry_run="${DRY_RUN:-0}"
+  dry_run="${DRY_RUN:-0}"; prebuilt_release_archive="${PREBUILT_RELEASE_ARCHIVE:-}"
   release_lock_file="${RELEASE_LOCK_FILE:-/run/lock/antigravity-proxy-release.lock}"
   candidate_staging_fs=''
   candidate_staging_identity=''
@@ -592,7 +591,7 @@ create_release() {
   staging_fs="$(root_path "$releases_dir")/.staging-${release_id}.$$"
   [ ! -e "$release_fs" ] || die "Release already exists: $release_dir"
   [ ! -e "$staging_fs" ] || die "Staging path already exists: $staging_fs"
-  [ -d "$project_dir/dist" ] || die "Missing build output: $project_dir/dist (run npm run build first)"
+  [ -n "$prebuilt_release_archive" ] || [ -d "$project_dir/dist" ] || die "Missing build output: $project_dir/dist (run npm run build first)"
 
   if [ "$dry_run" = 1 ]; then
     printf 'Would create immutable release %s\n' "$release_dir"
@@ -602,6 +601,7 @@ create_release() {
   mkdir -m 0755 "$staging_fs"
   candidate_staging_fs="$staging_fs"
   candidate_staging_identity="$(publication_identity "$staging_fs")"
+  if [ -n "$prebuilt_release_archive" ]; then stage_prebuilt_release; return; fi
   cp -a "$project_dir/dist" "$staging_fs/dist"
   install -m 0644 "$project_dir/package.json" "$staging_fs/package.json"
   install -m 0644 "$project_dir/package-lock.json" "$staging_fs/package-lock.json"
