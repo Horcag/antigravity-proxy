@@ -122,7 +122,7 @@ export class CacheAffinityCoordinator {
 
   async acquire(
     sessionKey: string | undefined,
-    options: { signal?: AbortSignal } = {},
+    options: { signal?: AbortSignal; ownerTimeoutMs?: number } = {},
   ): Promise<AffinityPlacementLease> {
     if (!this.isVerifiedHardSession(sessionKey)) {
       return { kind: 'rejected', reason: 'unverified-session' };
@@ -153,7 +153,7 @@ export class CacheAffinityCoordinator {
         cancellation.abort();
         complete('aborted');
       };
-      const ownerTimeout = setTimeout(cancelOwner, this.ownerTimeoutMs);
+      const ownerTimeout = setTimeout(cancelOwner, options.ownerTimeoutMs ?? this.ownerTimeoutMs);
       ownerTimeout.unref?.();
       this.owners.set(sessionKey, created);
       options.signal?.addEventListener('abort', cancelOwner, { once: true });

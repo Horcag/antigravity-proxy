@@ -82,6 +82,7 @@ export interface GetNextTokenOptions {
   requestId?: string;
   /** Internal re-entry after a placement owner has settled. */
   skipAffinityCoordination?: boolean;
+  affinityOwnerTimeoutMs?: number;
 }
 type TokenData = AccountLeaseTokenData;
 type TokenEntry = [string, TokenData];
@@ -151,7 +152,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   private readonly tokenCache: AccountLeaseTokenCache;
   private readonly selectionPolicy = new AccountLeaseSelectionPolicy();
   private readonly selectionMutex = new Mutex();
-  private readonly affinityCoordinator = new CacheAffinityCoordinator({ ownerTimeoutMs: 90_000 });
+  private readonly affinityCoordinator = new CacheAffinityCoordinator({ ownerTimeoutMs: 125_000 });
   private readonly hydrationPolicy: AccountLeaseHydrationPolicy;
   private readonly fulfillmentPolicy: AccountLeaseFulfillmentPolicy;
   private readonly modelPolicy: AccountLeaseModelPolicy;
@@ -497,7 +498,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         (!stickyForWait || options?.migrationAuthorization),
       );
       if (needsPlacementCoordination) {
-        const placement = await this.affinityCoordinator.acquire(sessionKey, { signal: options?.signal });
+        const placement = await this.affinityCoordinator.acquire(sessionKey, { signal: options?.signal, ownerTimeoutMs: options?.affinityOwnerTimeoutMs });
         if (placement.kind === 'rejected') return null;
         if (placement.kind === 'follower') {
           return placement.outcome === 'committed'
@@ -771,16 +772,12 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     model: string | undefined,
     excludedAccountIds: ReadonlySet<string>,
   ): Promise<TokenEntry[]> {
-    let modelCapableAccountPool = this.selectModelCapableAccounts(
-      Array.from(this.tokens.entries()),
-      model,
-    );
+    const usable = (entries: TokenEntry[]) => entries.filter(([accountId, token]) => token.status !== 'expired' &&
+      (this.accountCooldowns.get(accountId) ?? 0) <= Date.now() && !this.rateLimitTracker.isRateLimited(accountId, model));
+    let modelCapableAccountPool = this.selectModelCapableAccounts(usable(Array.from(this.tokens.entries())), model);
     if (model && modelCapableAccountPool.length === 0) {
       await this.refreshQuotaCatalog({ force: true, model });
-      modelCapableAccountPool = this.selectModelCapableAccounts(
-        Array.from(this.tokens.entries()),
-        model,
-      );
+      modelCapableAccountPool = this.selectModelCapableAccounts(usable(Array.from(this.tokens.entries())), model);
     }
     if (modelCapableAccountPool.length === 0) {
       this.logger.warn(`No account advertises requested model: ${model ?? 'unknown'}`);
@@ -790,7 +787,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
       ? modelCapableAccountPool.filter(([accountId]) =>
           this.modelPolicy.isModelRequestableForAccount(accountId, model),
         )
-      : modelCapableAccountPool).filter(([, token]) => token.status !== 'expired');
+      : modelCapableAccountPool);
     if (requestableAccountPool.length === 0) {
       this.logger.warn(`All compatible account/model pairs are temporarily unavailable: ${model}`);
       return [];
@@ -892,7 +889,8 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   }
   public authorizeBoundSessionMigration(sessionKey: string | undefined, model: string | undefined, ownerRequestId: string | undefined): MigrationAuthorization | undefined {
     return authorizeBoundSessionMigration(this.tokens, this.getSessionBinding(sessionKey), sessionKey, model, ownerRequestId,
-      (accountId, requestedModel) => this.modelPolicy.isModelRequestableForAccount(accountId, requestedModel));
+      (accountId, requestedModel) => this.modelPolicy.isModelRequestableForAccount(accountId, requestedModel),
+      (accountId) => (this.accountCooldowns.get(accountId) ?? 0) > Date.now() || this.rateLimitTracker.isRateLimited(accountId, model));
   }
   public clearSessions(): void {
     this.selectionPolicy.clearSessions();

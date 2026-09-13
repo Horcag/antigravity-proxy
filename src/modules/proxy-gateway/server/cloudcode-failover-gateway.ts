@@ -543,27 +543,13 @@ export class CloudCodeFailoverGateway {
         if (statusCode >= 400) {
           cleanupActiveAttempt();
           const errorText = bufferedBody ? bufferedBody.toString('utf-8') : '';
-          const isRateLimited =
-            statusCode === 429 ||
-            (statusCode === 403 && this.isQuotaErrorText(errorText));
+          const isRateLimited = statusCode === 429 || (statusCode === 403 && this.isQuotaErrorText(errorText));
+          const isAuthenticationFailure = statusCode === 401 || (statusCode === 403 && !isRateLimited);
+          const isModelIncompatible = Boolean(modelName) && (statusCode === 400 || statusCode === 404) && /model.*(?:not found|unsupported|unavailable|invalid)|(?:not found|unsupported model)/i.test(errorText);
           if (isRateLimited) {
             const isQuota = this.isQuotaErrorText(errorText);
-            logger.warn(
-              `[CloudCodeGateway] Upstream returned ${statusCode} (attempt ${attempt}/${maxAttempts}). Rotating to next account...`,
-            );
-            if (
-              sessionKey &&
-              isVerifiedSessionKey(sessionKey) &&
-              account &&
-              typeof this.accountLeaseService?.failSessionMigrationCandidate === 'function'
-            ) {
-              this.accountLeaseService.failSessionMigrationCandidate(
-                sessionKey,
-                attemptGeneration,
-                account.id,
-                requestId,
-              );
-            }
+            logger.warn(`[CloudCodeGateway] Upstream returned ${statusCode} (attempt ${attempt}/${maxAttempts}). Rotating to next account...`);
+            if (sessionKey && isVerifiedSessionKey(sessionKey) && account && typeof this.accountLeaseService?.failSessionMigrationCandidate === 'function') this.accountLeaseService.failSessionMigrationCandidate(sessionKey, attemptGeneration, account.id, requestId);
             issueMigrationAuthorization(isQuota ? 'quota-exhausted' : 'account-cooldown');
             if (this.accountLeaseService && account) {
               await this.accountLeaseService.markFromUpstreamError({
@@ -575,6 +561,12 @@ export class CloudCodeFailoverGateway {
                 reason: isQuota ? RateLimitReason.QuotaExhausted : RateLimitReason.RateLimitExceeded,
               });
             }
+            continue;
+          }
+          if (isAuthenticationFailure || isModelIncompatible) {
+            if (sessionKey && isVerifiedSessionKey(sessionKey) && account) this.accountLeaseService?.failSessionMigrationCandidate?.(sessionKey, attemptGeneration, account.id, requestId);
+            issueMigrationAuthorization(isAuthenticationFailure ? 'authentication-failure' : 'model-incompatible');
+            if (isAuthenticationFailure && account) this.accountLeaseService?.markAsForbidden?.(account.id);
             continue;
           }
           responseCommitted = true;

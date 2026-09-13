@@ -12,11 +12,13 @@ export function authorizeBoundSessionMigration(
   model: string | undefined,
   ownerRequestId: string | undefined,
   isModelRequestable: (accountId: string, model: string) => boolean,
+  isTemporarilyUnavailable: (accountId: string) => boolean,
 ): MigrationAuthorization | undefined {
   if (!binding) return undefined;
   const token = tokens.get(binding.accountId);
   const reason = !token ? 'account-deleted'
     : token.status === 'expired' ? 'account-disabled'
       : model && !isModelRequestable(binding.accountId, model) ? 'model-incompatible' : undefined;
-  return reason ? createMigrationAuthorization(reason, sessionKey, binding, ownerRequestId) ?? undefined : undefined;
+  const authorizedReason = reason ?? (isTemporarilyUnavailable(binding.accountId) ? 'account-cooldown' : undefined);
+  return authorizedReason ? createMigrationAuthorization(authorizedReason, sessionKey, binding, ownerRequestId) ?? undefined : undefined;
 }
