@@ -4,7 +4,8 @@ import http2 from 'node:http2';
 import net from 'node:net';
 import { logger } from '../../../shared/logging/logger';
 import { CaManager } from './cert/ca-manager';
-import { CloudCodeFailoverGateway } from './cloudcode-failover-gateway';
+import { CloudCodeFailoverGateway, GatewayReceiptTransferError } from './cloudcode-failover-gateway';
+import { AnonymousTransportReceiptOwner } from './anonymous-transport-receipt';
 import { AccountLeaseService } from './account-lease.service';
 
 export interface ParsedConnectAuthority {
@@ -228,12 +229,22 @@ export class ConnectIngressService {
         },
       },
       (req, res) => {
-        this.failoverGateway.handleRequest(req, res).catch((err) => {
+        this.failoverGateway.handleRequest(req, res).catch((err: unknown) => {
           logger.error('[ConnectIngress] Error processing request in transparent gateway', err);
+          const receiptOwner = err instanceof GatewayReceiptTransferError
+            ? err.receiptOwner
+            : new AnonymousTransportReceiptOwner(crypto.randomUUID());
+          receiptOwner.observeResponse(res);
           if (!res.headersSent) {
-            res.writeHead(502, { 'content-type': 'application/json' });
-            res.end(JSON.stringify({ error: { code: 502, message: String(err) } }));
+            try {
+              receiptOwner.expectDownstreamCommit('internal_error');
+              res.writeHead(502, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ error: { code: 502, message: 'Gateway internal error' } }));
+            } catch {
+              receiptOwner.reject('internal_error');
+            }
           }
+          receiptOwner.emit();
         });
       },
     );

@@ -14,9 +14,8 @@ import {
   isVerifiedSessionKey,
   isHintSessionKey,
 } from './account-lease-selection-policy';
-
+import { AnonymousTransportReceiptOwner } from './anonymous-transport-receipt';
 export { isVerifiedSessionKey, isHintSessionKey };
-
 export type ProtocolFailureCategory =
   | 'inspection-limit'
   | 'unsupported-encoding'
@@ -24,7 +23,6 @@ export type ProtocolFailureCategory =
   | 'deadline-exceeded'
   | 'account-quota'
   | 'upstream-transient';
-
 export interface ProtocolFrameDecision {
   state: 'NEED_MORE_DATA' | 'VALIDATED_RESPONSE' | 'VALIDATED_ERROR';
   isQuota?: boolean;
@@ -33,12 +31,11 @@ export interface ProtocolFrameDecision {
   category?: ProtocolFailureCategory;
   isLocalValidationError?: boolean;
 }
-
 export interface CloudCodeGatewayOptions {
   accountLeaseService?: AccountLeaseService;
   upstreamHost?: string;
 }
-
+export class GatewayReceiptTransferError extends Error { constructor(readonly receiptOwner: AnonymousTransportReceiptOwner) { super('Gateway receipt ownership transferred to ingress'); } }
 export function extractCanonicalUserTurnText(turn: unknown): string | null {
   if (!turn || typeof turn !== 'object') return null;
   const anyTurn = turn as any;
@@ -76,21 +73,21 @@ export function extractCanonicalUserTurnText(turn: unknown): string | null {
   }
   return null;
 }
-
 export class CloudCodeFailoverGateway {
   private defaultUpstreamHost: string;
-
   constructor(
     private readonly accountLeaseService?: AccountLeaseService,
     options: CloudCodeGatewayOptions = {},
   ) {
     this.defaultUpstreamHost = options.upstreamHost || 'daily-cloudcode-pa.googleapis.com';
   }
-
   async handleRequest(
     req: http.IncomingMessage | http2.Http2ServerRequest,
     res: http.ServerResponse | http2.Http2ServerResponse,
   ): Promise<void> {
+    const receiptOwner = new AnonymousTransportReceiptOwner(crypto.randomUUID()); receiptOwner.observeResponse(res);
+    let receiptTransferred = false;
+    try {
     const rawUrl = req.url || '/';
     let urlPath = rawUrl;
     if (urlPath.startsWith('http://') || urlPath.startsWith('https://')) {
@@ -101,15 +98,12 @@ export class CloudCodeFailoverGateway {
         // preserve urlPath
       }
     }
-
     const method = req.method || 'POST';
-
     // Determine upstream target host strictly from :authority or host header
     const rawAuthority =
       (req.headers[':authority'] as string) ||
       (req.headers['host'] as string) ||
       this.defaultUpstreamHost;
-
     const parsedAuthority = parseTargetAuthority(rawAuthority);
     if (!parsedAuthority) {
       logger.warn(`[CloudCodeGateway] Destination authority not allowed for interception: ${rawAuthority}`);
@@ -117,7 +111,7 @@ export class CloudCodeFailoverGateway {
       if (typeof anyRes.writeHead === 'function') {
         anyRes.writeHead(403, { 'content-type': 'application/json' });
       }
-      res.end(
+      receiptOwner.expectDownstreamCommit('invalid_authority'); res.end(
         JSON.stringify({
           error: {
             code: 403,
@@ -127,9 +121,7 @@ export class CloudCodeFailoverGateway {
       );
       return;
     }
-
     const targetHost = parsedAuthority.hostname;
-
     const requestAbortController = new AbortController();
 
     const LOGICAL_REQUEST_DEADLINE_MS = 120000;
@@ -151,6 +143,7 @@ export class CloudCodeFailoverGateway {
     let currentUpstreamReq: http.ClientRequest | undefined;
     let currentUpstreamRes: http.IncomingMessage | undefined;
     let responseCommitted = false;
+    let deadlineWriteFailure: GatewayReceiptTransferError | null = null;
 
     const cleanupActiveAttempt = () => {
       if (activeStopCandidateRenewal) {
@@ -192,11 +185,16 @@ export class CloudCodeFailoverGateway {
           }),
           'utf-8',
         );
-        this.writeHeaders(res, 504, {
-          'content-type': 'application/json; charset=utf-8',
-          'content-length': String(errorBody.length),
-        });
-        res.end(errorBody);
+        try {
+          receiptOwner.expectDownstreamCommit('deadline_exceeded'); this.writeHeaders(res, 504, {
+            'content-type': 'application/json; charset=utf-8',
+            'content-length': String(errorBody.length),
+          });
+          res.end(errorBody);
+        } catch {
+          receiptOwner.reject('deadline_exceeded');
+          deadlineWriteFailure = new GatewayReceiptTransferError(receiptOwner);
+        }
       } else {
         abortAll();
         if (!res.writableFinished) {
@@ -209,17 +207,17 @@ export class CloudCodeFailoverGateway {
     logicalDeadlineTimer.unref?.();
 
     req.once?.('aborted', () => {
-      abortAll();
+      receiptOwner.reject('client_aborted'); abortAll();
     });
     req.once?.('close', () => {
       if (!req.complete && (!responseCommitted || !res.writableEnded)) {
-        abortAll();
+        receiptOwner.reject('client_aborted'); abortAll();
       }
     });
     res.once?.('close', () => {
       clearLogicalDeadline();
       if (!res.writableEnded) {
-        abortAll();
+        receiptOwner.reject('client_aborted'); abortAll();
       }
     });
     res.once?.('finish', () => {
@@ -236,7 +234,7 @@ export class CloudCodeFailoverGateway {
       totalBodyBytes += buf.length;
       if (totalBodyBytes > MAX_REQUEST_BODY_BYTES) {
         if (!res.headersSent) {
-          this.writeHeaders(res, 413, { 'content-type': 'application/json' });
+          receiptOwner.expectDownstreamCommit('request_too_large'); this.writeHeaders(res, 413, { 'content-type': 'application/json' });
           res.end(
             JSON.stringify({
               error: {
@@ -313,7 +311,7 @@ export class CloudCodeFailoverGateway {
             }),
             'utf-8',
           );
-          this.writeHeaders(res, 504, {
+          receiptOwner.expectDownstreamCommit('deadline_exceeded'); this.writeHeaders(res, 504, {
             'content-type': 'application/json; charset=utf-8',
             'content-length': String(errorBody.length),
           });
@@ -364,7 +362,7 @@ export class CloudCodeFailoverGateway {
         );
         if (!responseCommitted && !res.writableEnded) {
           responseCommitted = true;
-          this.writeHeaders(res, 503, { 'content-type': 'application/json' });
+          receiptOwner.expectDownstreamCommit('unavailable'); this.writeHeaders(res, 503, { 'content-type': 'application/json' });
           res.end(
             JSON.stringify({
               error: {
@@ -598,7 +596,7 @@ export class CloudCodeFailoverGateway {
 
           // Non-retriable error: commit to client
           responseCommitted = true;
-          this.writeHeaders(res, statusCode, headers);
+          receiptOwner.expectDownstreamCommit(statusCode === 413 ? 'request_too_large' : 'bad_gateway'); this.writeHeaders(res, statusCode, headers);
           if (bufferedBody && bufferedBody.length > 0) {
             res.end(bufferedBody);
           } else {
@@ -654,7 +652,7 @@ export class CloudCodeFailoverGateway {
           }
 
           responseCommitted = true;
-          this.writeHeaders(res, statusCode, headers);
+          receiptOwner.expectDownstreamCommit('bad_gateway'); this.writeHeaders(res, statusCode, headers);
           res.end();
           return;
         }
@@ -953,7 +951,7 @@ export class CloudCodeFailoverGateway {
             // Synthesize 502 Bad Gateway rather than forwarding malformed data under HTTP 200 (Probe C10 / T13-F03)
             if (frameDecision.isLocalValidationError || (statusCode >= 200 && statusCode < 300)) {
               responseCommitted = true;
-              const errorBody = Buffer.from(
+              receiptOwner.expectDownstreamCommit('bad_gateway'); const errorBody = Buffer.from(
                 JSON.stringify({
                   error: {
                     code: 502,
@@ -974,7 +972,7 @@ export class CloudCodeFailoverGateway {
 
             // Authentic non-retriable provider error: commit to client with original status
             responseCommitted = true;
-            this.writeHeaders(res, statusCode, { ...headers, ...bodyStream.trailers });
+            receiptOwner.expectDownstreamCommit('bad_gateway'); this.writeHeaders(res, statusCode, { ...headers, ...bodyStream.trailers });
             if (firstChunk && firstChunk.length > 0) {
               res.end(firstChunk);
             } else {
@@ -992,7 +990,7 @@ export class CloudCodeFailoverGateway {
               `[CloudCodeGateway] Protocol frame inspection limit exceeded (NEED_MORE_DATA) (attempt ${attempt}/${maxAttempts})`,
             );
             responseCommitted = true;
-            const errorBody = Buffer.from(
+            receiptOwner.expectDownstreamCommit('bad_gateway'); const errorBody = Buffer.from(
               JSON.stringify({
                 error: {
                   code: 502,
@@ -1080,7 +1078,7 @@ export class CloudCodeFailoverGateway {
             }
 
             responseCommitted = true;
-            stopCandidateRenewal();
+            receiptOwner.expectDownstreamCommit('validated_response'); stopCandidateRenewal();
             this.writeHeaders(res, statusCode, headers);
             break;
           }
@@ -1176,6 +1174,7 @@ export class CloudCodeFailoverGateway {
         return;
       } catch {
         cleanupActiveAttempt();
+        if (deadlineWriteFailure) throw deadlineWriteFailure;
         if (responseCommitted) {
           return;
         }
@@ -1186,7 +1185,7 @@ export class CloudCodeFailoverGateway {
           responseCommitted = true;
           const anyRes = res as any;
           if (!anyRes.headersSent) {
-            this.writeHeaders(res, 502, { 'content-type': 'application/json' });
+            receiptOwner.expectDownstreamCommit('bad_gateway'); this.writeHeaders(res, 502, { 'content-type': 'application/json' });
             res.end(
               JSON.stringify({
                 error: {
@@ -1204,7 +1203,7 @@ export class CloudCodeFailoverGateway {
     // All accounts exhausted
     const anyRes = res as any;
     if (!anyRes.headersSent) {
-      this.writeHeaders(res, 429, { 'content-type': 'application/json' });
+      receiptOwner.expectDownstreamCommit('rate_limited'); this.writeHeaders(res, 429, { 'content-type': 'application/json' });
       res.end(
         JSON.stringify({
           error: {
@@ -1215,6 +1214,7 @@ export class CloudCodeFailoverGateway {
         }),
       );
     }
+    } catch { receiptTransferred = true; throw new GatewayReceiptTransferError(receiptOwner); } finally { if (!receiptTransferred) receiptOwner.emit(); }
   }
 
   private writeHeaders(
