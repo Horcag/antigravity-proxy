@@ -41,6 +41,7 @@ export class ProxyRetryPolicy {
       attemptedAccountIds: new Set<string>(),
       requestId: crypto.randomUUID(),
       signal,
+      upstreamSignal: signal,
       status: 'active',
     };
     if (signal) {
@@ -174,15 +175,13 @@ export class ProxyRetryPolicy {
         }
         return null;
       }
-      if (!lease) {
-        return null;
-      }
+      if (!lease) return null;
       retryState.attemptedAccountIds.add(lease.account.id);
       retryState.activeReservation = lease.releaseReservation;
       retryState.sessionGeneration = lease.generation;
       retryState.tableIncarnation = lease.tableIncarnation;
       retryState.breakerGeneration = lease.breakerGeneration; retryState.completeAffinityPlacement = lease.completeAffinityPlacement;
-      if (lease.affinityAbortSignal) { const onAffinityAbort = () => this.cancelTokenRetryState(retryState); lease.affinityAbortSignal.addEventListener('abort', onAffinityAbort, { once: true }); if (lease.affinityAbortSignal.aborted) onAffinityAbort(); }
+      if (lease.affinityAbortSignal) { retryState.upstreamSignal = retryState.signal ? AbortSignal.any([retryState.signal, lease.affinityAbortSignal]) : lease.affinityAbortSignal; const onAffinityAbort = () => this.cancelTokenRetryState(retryState); lease.affinityAbortSignal.addEventListener('abort', onAffinityAbort, { once: true }); if (lease.affinityAbortSignal.aborted) onAffinityAbort(); }
       selectedAccount = lease.account;
     } else {
       const token = await this.accountLeaseService.getNextToken({

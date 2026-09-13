@@ -138,12 +138,11 @@ export class GeminiClient {
     'https://daily-cloudcode-pa.googleapis.com/v1internal',
     'https://cloudcode-pa.googleapis.com/v1internal',
   ];
-
   async streamGenerate(
     model: string,
     content: GeminiRequest,
     accessToken: string,
-    upstreamProxyUrl?: string,
+    upstreamProxyUrl?: string, signal?: AbortSignal,
   ): Promise<NodeJS.ReadableStream> {
     const url = `${this.baseUrl}/models/${model}:streamGenerateContent?alt=sse`;
     const axiosProxy = this.resolveUpstreamAxiosProxy(upstreamProxyUrl);
@@ -156,7 +155,7 @@ export class GeminiClient {
         },
         responseType: 'stream',
         timeout: 60000,
-        proxy: axiosProxy,
+        proxy: axiosProxy, signal,
       });
       return response.data;
     } catch (error) {
@@ -173,7 +172,7 @@ export class GeminiClient {
     model: string,
     content: GeminiRequest,
     accessToken: string,
-    upstreamProxyUrl?: string,
+    upstreamProxyUrl?: string, signal?: AbortSignal,
   ): Promise<GeminiResponse> {
     const url = `${this.baseUrl}/models/${model}:generateContent`;
     const axiosProxy = this.resolveUpstreamAxiosProxy(upstreamProxyUrl);
@@ -185,7 +184,7 @@ export class GeminiClient {
           'Content-Type': 'application/json',
         },
         timeout: 60000, // 60s timeout
-        proxy: axiosProxy,
+        proxy: axiosProxy, signal,
       });
       return response.data;
     } catch (error) {
@@ -205,7 +204,7 @@ export class GeminiClient {
     accessToken: string,
     upstreamProxyUrl?: string,
     extraHeaders?: Record<string, string>,
-    accountKeyOrOptions?: string | { accountKey?: string; accountId?: string },
+    accountKeyOrOptions?: string | { accountKey?: string; accountId?: string }, signal?: AbortSignal,
   ): Promise<NodeJS.ReadableStream> {
     const response = await this.executeRequestWithEndpointFailover<NodeJS.ReadableStream>(
       ':streamGenerateContent?alt=sse',
@@ -217,7 +216,7 @@ export class GeminiClient {
       },
       'stream-generate',
       extraHeaders,
-      accountKeyOrOptions,
+      accountKeyOrOptions, signal,
     );
 
     return response.data;
@@ -228,7 +227,7 @@ export class GeminiClient {
     accessToken: string,
     upstreamProxyUrl?: string,
     extraHeaders?: Record<string, string>,
-    accountKeyOrOptions?: string | { accountKey?: string; accountId?: string },
+    accountKeyOrOptions?: string | { accountKey?: string; accountId?: string }, signal?: AbortSignal,
   ): Promise<GeminiResponse> {
     const response = await this.executeRequestWithEndpointFailover<
       GeminiResponse | { response: GeminiResponse }
@@ -240,7 +239,7 @@ export class GeminiClient {
       {},
       'generate-content',
       extraHeaders,
-      accountKeyOrOptions,
+      accountKeyOrOptions, signal,
     );
     return unwrapInternalGeminiResponse(response.data);
   }
@@ -334,7 +333,7 @@ export class GeminiClient {
     config: AxiosRequestConfig,
     operation: string,
     extraHeaders?: Record<string, string>,
-    accountKeyOrOptions?: string | { accountKey?: string; accountId?: string },
+    accountKeyOrOptions?: string | { accountKey?: string; accountId?: string }, signal?: AbortSignal,
   ): Promise<AxiosResponse<T>> {
     const safeProject = body.project?.trim();
     const safeAccount = this.resolveAccountKey(accountKeyOrOptions);
@@ -379,6 +378,7 @@ export class GeminiClient {
             timeout,
             proxy: axiosProxy,
             ...config,
+            signal: signal ?? config.signal,
           });
 
           this.preferredInternalBaseUrl = baseUrl;

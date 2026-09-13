@@ -439,7 +439,7 @@ export class ProxyService {
                 token.token.access_token,
                 token.token.upstream_proxy_url,
                 extraHeaders,
-                token.id,
+                token.id, retryState.upstreamSignal,
               ),
             );
             const streamHealth = this.createStreamHealthLifecycle(
@@ -470,7 +470,7 @@ export class ProxyService {
               token.token.upstream_proxy_url,
               extraHeaders,
               token.id,
-              effectiveTargetModel,
+              effectiveTargetModel, retryState.upstreamSignal,
             );
             const commitResult = this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
             if (commitResult.kind === 'rejected') {
@@ -517,7 +517,7 @@ export class ProxyService {
                     token.token.access_token,
                     token.token.upstream_proxy_url,
                     extraHeaders,
-                    token.id,
+                    token.id, retryState.upstreamSignal,
                   ),
                 );
                 const streamHealth = this.createStreamHealthLifecycle(
@@ -548,7 +548,7 @@ export class ProxyService {
                   token.token.upstream_proxy_url,
                   extraHeaders,
                   token.id,
-                  'gemini-3-flash',
+                  'gemini-3-flash', retryState.upstreamSignal,
                 );
                 const commitResult = this.markUpstreamSuccess(token.id, 'gemini-3-flash', sessionKey, retryState);
                 if (commitResult.kind === 'rejected') {
@@ -837,7 +837,7 @@ export class ProxyService {
             token.token.upstream_proxy_url,
             extraHeaders,
             token.id,
-            effectiveTargetModel,
+            effectiveTargetModel, retryState.upstreamSignal,
           );
 
           const commitResult = this.markUpstreamSuccess(token.id, effectiveTargetModel, undefined, retryState);
@@ -943,7 +943,7 @@ export class ProxyService {
               token.token.access_token,
               token.token.upstream_proxy_url,
               extraHeaders,
-              token.id,
+              token.id, retryState.upstreamSignal,
             ),
           );
           const streamHealth = this.createStreamHealthLifecycle(
@@ -1358,7 +1358,7 @@ export class ProxyService {
                   token.token.access_token,
                   token.token.upstream_proxy_url,
                   extraHeaders,
-                  token.id,
+                  token.id, retryState.upstreamSignal,
                 ),
               );
               const streamHealth = this.createStreamHealthLifecycle(
@@ -1398,7 +1398,7 @@ export class ProxyService {
                 token.token.upstream_proxy_url,
                 extraHeaders,
                 token.id,
-                effectiveTargetModel,
+                effectiveTargetModel, retryState.upstreamSignal,
               );
               const commitResult = this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
               if (commitResult.kind === 'rejected') {
@@ -1426,7 +1426,7 @@ export class ProxyService {
               token.token.upstream_proxy_url,
               extraHeaders,
               token.id,
-              effectiveTargetModel,
+              effectiveTargetModel, retryState.upstreamSignal,
             );
             const commitResult = this.markUpstreamSuccess(token.id, effectiveTargetModel, sessionKey, retryState);
             if (commitResult.kind === 'rejected') {
@@ -1472,14 +1472,14 @@ export class ProxyService {
     upstreamProxyUrl: string | undefined,
     extraHeaders: Record<string, string> | undefined,
     accountId: string,
-    effectiveModel: string,
+    effectiveModel: string, signal?: AbortSignal,
   ): Promise<UpstreamAttempt<GeminiResponse>> {
     const direct = await this.executeUpstreamAttempt(accountId, effectiveModel, () => this.geminiClient.generateInternal(
       body,
       accessToken,
       upstreamProxyUrl,
       extraHeaders,
-      accountId,
+      accountId, signal,
     ));
     if (this.hasUsableGeminiCandidate(direct.result)) {
       return direct;
@@ -1497,7 +1497,7 @@ export class ProxyService {
         accessToken,
         upstreamProxyUrl,
         extraHeaders,
-        accountId,
+        accountId, signal,
       );
       return this.collectGeminiStreamAsResponse(stream);
     });

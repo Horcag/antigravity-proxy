@@ -19,6 +19,8 @@ export interface ProxyTokenRetryState {
   sessionKey?: string;
   migrationRenewalTimer?: NodeJS.Timeout;
   signal?: AbortSignal;
+  /** Cancels the actual upstream transport when a placement owner expires. */
+  upstreamSignal?: AbortSignal;
   status: ProxyRetryLifecycleState;
   removeAbortListener?: () => void;
 }
