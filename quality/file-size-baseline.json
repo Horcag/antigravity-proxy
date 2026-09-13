@@ -16,7 +16,7 @@
     "src/modules/proxy-gateway/antigravity/OpenAIResponsesStreamingMapper.ts": 518,
     "src/modules/proxy-gateway/server/account-lease-model-policy.ts": 638,
     "src/modules/proxy-gateway/server/account-lease-selection-policy.ts": 960,
-    "src/modules/proxy-gateway/server/account-lease.service.ts": 1082,
+    "src/modules/proxy-gateway/server/account-lease.service.ts": 1079,
     "src/modules/proxy-gateway/server/clients/gemini.client.ts": 590,
     "src/modules/proxy-gateway/server/cloudcode-failover-gateway.ts": 1766,
     "src/modules/proxy-gateway/server/native-gemini-request.ts": 506,

@@ -524,11 +524,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         }
       }
       let candidateAccountPool = await this.buildCurrentCandidatePool(model, excludedAccountIds);
-      const migrationAuthorized = authorizesMigration(
-        options?.migrationAuthorization,
-        sessionKey,
-        stickyForWait,
-      );
+      const migrationAuthorized = authorizesMigration(options?.migrationAuthorization, sessionKey, stickyForWait, options?.requestId);
       if (stickyForWait && options?.deferSessionBinding && !migrationAuthorized) {
         candidateAccountPool = candidateAccountPool.filter(([accountId]) => accountId === stickyForWait.accountId);
       }
@@ -659,8 +655,8 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
           resolve(null);
         };
         options?.signal?.addEventListener('abort', onAbort, { once: true });
-      });
-      let finalized: CloudAccount | null = null;
+        affinityAbortSignal?.addEventListener('abort', onAbort, { once: true });
+      }); let finalized: CloudAccount | null = null;
       try {
         const hydrationPromise = this.finalizeSelectedToken(
           accountId,
@@ -713,6 +709,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
       } finally {
         if (onAbort) {
           options?.signal?.removeEventListener('abort', onAbort);
+          affinityAbortSignal?.removeEventListener('abort', onAbort);
         }
       }
       const idempotentRelease = () => {

@@ -235,7 +235,7 @@ export function authorizesMigration(
   authorization: MigrationAuthorization | undefined,
   sessionKey: string | undefined,
   binding: AffinityBindingFence | null | undefined,
-  ownerRequestId?: string,
+  ownerRequestId: string | undefined,
 ): authorization is MigrationAuthorization {
   return Boolean(
     authorization &&
@@ -245,7 +245,7 @@ export function authorizesMigration(
       authorization.expectedGeneration === binding.generation &&
       binding.tableIncarnation !== undefined &&
       authorization.expectedTableIncarnation === binding.tableIncarnation &&
-      (!ownerRequestId || authorization.ownerRequestId === ownerRequestId),
+      Boolean(ownerRequestId) && authorization.ownerRequestId === ownerRequestId,
   );
 }
 

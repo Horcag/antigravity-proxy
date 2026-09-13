@@ -151,7 +151,6 @@ export class ProxyRetryPolicy {
     }
     this.releaseReservation(retryState); this.abortAffinityPlacement(retryState);
     retryState.sessionKey = sessionKey;
-    const isRetryAttempt = retryState.attemptedAccountIds.size > 0;
     const initialBinding =
       sessionKey && typeof this.accountLeaseService.getSessionBinding === 'function'
         ? this.accountLeaseService.getSessionBinding(sessionKey)
@@ -183,6 +182,7 @@ export class ProxyRetryPolicy {
       retryState.sessionGeneration = lease.generation;
       retryState.tableIncarnation = lease.tableIncarnation;
       retryState.breakerGeneration = lease.breakerGeneration; retryState.completeAffinityPlacement = lease.completeAffinityPlacement;
+      if (lease.affinityAbortSignal) { const onAffinityAbort = () => this.cancelTokenRetryState(retryState); lease.affinityAbortSignal.addEventListener('abort', onAffinityAbort, { once: true }); if (lease.affinityAbortSignal.aborted) onAffinityAbort(); }
       selectedAccount = lease.account;
     } else {
       const token = await this.accountLeaseService.getNextToken({
@@ -247,7 +247,7 @@ export class ProxyRetryPolicy {
       selectedAccount &&
       sessionKey &&
       isVerifiedSessionKey(sessionKey) &&
-      (isRetryAttempt || needsMigration) &&
+      needsMigration &&
       typeof this.accountLeaseService.startSessionMigration === 'function'
     ) {
       const currentGen =

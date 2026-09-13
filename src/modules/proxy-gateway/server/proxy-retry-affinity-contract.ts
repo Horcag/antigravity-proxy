@@ -107,6 +107,7 @@ interface RetryAttemptLease {
   breakerGeneration?: number;
   releaseReservation: () => void;
   completeAffinityPlacement?: (outcome: 'aborted' | 'committed') => void;
+  affinityAbortSignal?: AbortSignal;
 }
 
 export interface ProxyRetryLogger {
