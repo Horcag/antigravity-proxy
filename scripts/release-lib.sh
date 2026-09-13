@@ -587,7 +587,7 @@ ensure_layout() {
 }
 
 create_release() {
-  local release_fs staging_fs operator_group
+  local release_fs staging_fs
   release_fs="$(root_path "$release_dir")"
   staging_fs="$(root_path "$releases_dir")/.staging-${release_id}.$$"
   [ ! -e "$release_fs" ] || die "Release already exists: $release_dir"
@@ -608,16 +608,11 @@ create_release() {
   if [ "$test_mode" = 1 ]; then
     [ -d "$project_dir/node_modules" ] || die "Test release requires installed project dependencies"
     ln -s "$project_dir/node_modules" "$staging_fs/node_modules"
+    if [ "${RELEASE_TEST_EXERCISE_OPERATOR_NPM:-0}" = 1 ]; then
+      stage_release_dependencies_as_operator
+    fi
   else
-    [ -n "$release_operator" ] || die "Set RELEASE_OPERATOR to the non-root operator that stages production dependencies"
-    id "$release_operator" >/dev/null 2>&1 || die "RELEASE_OPERATOR does not exist: $release_operator"
-    operator_group="$(id -gn "$release_operator")"
-    chown "$release_operator:$operator_group" "$staging_fs"
-    runuser -u "$release_operator" -- env \
-      HOME="$(getent passwd "$release_operator" | cut -d: -f6)" \
-      PATH="$node_runtime_bin:/usr/local/bin:/usr/bin:/bin" \
-      npm_config_cache="$staging_fs/.npm-cache" \
-      "$npm_binary" ci --prefix "$staging_fs" --omit=dev
+    stage_release_dependencies_as_operator
   fi
   if [ "$bundle_node" = 1 ]; then
     install -D -m 0755 "$node_binary" "$staging_fs/bin/node"

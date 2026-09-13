@@ -9,6 +9,7 @@ const repositoryRoot = process.cwd();
 const installScript = join(repositoryRoot, 'scripts/install-systemd.sh');
 const rollbackScript = join(repositoryRoot, 'scripts/rollback-systemd.sh');
 const releaseLibrary = join(repositoryRoot, 'scripts/release-lib.sh');
+const releaseRuntimeLibrary = join(repositoryRoot, 'scripts/release-runtime-lib.sh');
 const temporaryRoots: string[] = [];
 const migrationStateEntries = ['accounts.db', 'accounts.db-wal', 'accounts.db-shm', '.master-key', 'config.json'];
 
@@ -209,7 +210,7 @@ describe('systemd release tooling', { timeout: 60_000 }, () => {
     expect(unit).toContain('AmbientCapabilities=');
     expect(unit).toContain('Group=antigravity-proxy');
     expect(unit).not.toContain('/usr/bin/node');
-    const library = readFileSync(releaseLibrary, 'utf8');
+    const library = readFileSync(releaseRuntimeLibrary, 'utf8');
     expect(library).toContain('"$npm_binary" ci --prefix "$staging_fs" --omit=dev');
     expect(library).not.toContain('npm ci --prefix "$staging_fs" --omit=dev --ignore-scripts');
     expect(library).toContain('release_runtime_probe');
