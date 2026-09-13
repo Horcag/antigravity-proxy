@@ -27,6 +27,39 @@ describe('anonymous transport receipt terminal matrix', () => {
     expect(info).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['close', 'error'] as const)('rejects when %s occurs before finish', (terminalEvent) => {
+    const owner = new AnonymousTransportReceiptOwner(`before-${terminalEvent}`);
+    const res = response();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    owner.observeResponse(res);
+    owner.expectDownstreamCommit('validated_response');
+
+    res.emit(terminalEvent);
+
+    expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({
+      receiptId: `before-${terminalEvent}`,
+      classification: terminalEvent === 'error' ? 'internal_error' : 'validated_response',
+      result: 'rejected',
+      downstreamCommitCount: 0,
+    });
+    res.emit('finish');
+    expect(info).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits for a response terminal event before emitting a rejected receipt', () => {
+    const owner = new AnonymousTransportReceiptOwner('rejected-before-terminal');
+    const res = response();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    owner.observeResponse(res);
+    owner.reject('internal_error');
+
+    expect(info).not.toHaveBeenCalled();
+    res.emit('finish');
+    expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({
+      result: 'rejected', downstreamCommitCount: 0, classification: 'internal_error',
+    });
+  });
+
   it.each([
     'unavailable', 'invalid_authority', 'request_too_large', 'rate_limited',
     'bad_gateway', 'deadline_exceeded', 'client_aborted', 'internal_error',
@@ -45,8 +78,8 @@ describe('anonymous transport receipt terminal matrix', () => {
     const res = response();
     owner.observeResponse(res);
     owner.expectDownstreamCommit('bad_gateway');
-    res.emit('finish');
     const info = vi.spyOn(logger, 'info').mockImplementation(() => { throw new Error('sink failure'); });
+    res.emit('finish');
     owner.emit();
     owner.emit();
     expect(info).toHaveBeenCalledTimes(1);

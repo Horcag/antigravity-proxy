@@ -29,18 +29,26 @@ export class AnonymousTransportReceiptOwner {
   private expectedCommit: ReceiptClassification | null = null;
   private committed = false;
   private emitted = false;
+  private observed = false;
 
   constructor(readonly receiptId: string) {}
 
   observeResponse(res: Response): void {
+    if (this.observed) return;
+    this.observed = true;
     res.once('finish', () => {
       if (this.expectedCommit) {
         this.classification = this.expectedCommit;
         this.committed = true;
       }
+      this.emit();
     });
     res.once('close', () => {
       if (!this.committed && this.expectedCommit) this.classification = this.expectedCommit;
+      this.emit();
+    });
+    res.once('error', () => {
+      this.emit();
     });
   }
 

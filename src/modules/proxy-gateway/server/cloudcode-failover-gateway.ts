@@ -35,7 +35,8 @@ export interface CloudCodeGatewayOptions {
   accountLeaseService?: AccountLeaseService;
   upstreamHost?: string;
 }
-export class GatewayReceiptTransferError extends Error { constructor(readonly receiptOwner: AnonymousTransportReceiptOwner) { super('Gateway receipt ownership transferred to ingress'); } }
+export class GatewayReceiptTransferError extends Error { constructor(readonly receiptOwner: AnonymousTransportReceiptOwner, readonly originalCause: unknown) { super('Gateway receipt ownership transferred to ingress', { cause: originalCause }); this.name = 'GatewayReceiptTransferError'; } }
+
 export function extractCanonicalUserTurnText(turn: unknown): string | null {
   if (!turn || typeof turn !== 'object') return null;
   const anyTurn = turn as any;
@@ -86,7 +87,6 @@ export class CloudCodeFailoverGateway {
     res: http.ServerResponse | http2.Http2ServerResponse,
   ): Promise<void> {
     const receiptOwner = new AnonymousTransportReceiptOwner(crypto.randomUUID()); receiptOwner.observeResponse(res);
-    let receiptTransferred = false;
     try {
     const rawUrl = req.url || '/';
     let urlPath = rawUrl;
@@ -143,8 +143,7 @@ export class CloudCodeFailoverGateway {
     let currentUpstreamReq: http.ClientRequest | undefined;
     let currentUpstreamRes: http.IncomingMessage | undefined;
     let responseCommitted = false;
-    let deadlineWriteFailure: GatewayReceiptTransferError | null = null;
-
+    let deadlineWriteFailure: GatewayReceiptTransferError | null = null; let exhaustedByUnavailable = false;
     const cleanupActiveAttempt = () => {
       if (activeStopCandidateRenewal) {
         activeStopCandidateRenewal();
@@ -155,7 +154,6 @@ export class CloudCodeFailoverGateway {
         activeReleaseReservation = undefined;
       }
     };
-
     const abortAll = () => {
       clientAborted = true;
       requestAbortController.abort();
@@ -191,9 +189,9 @@ export class CloudCodeFailoverGateway {
             'content-length': String(errorBody.length),
           });
           res.end(errorBody);
-        } catch {
+        } catch (err) {
           receiptOwner.reject('deadline_exceeded');
-          deadlineWriteFailure = new GatewayReceiptTransferError(receiptOwner);
+          deadlineWriteFailure = new GatewayReceiptTransferError(receiptOwner, err);
         }
       } else {
         abortAll();
@@ -645,6 +643,7 @@ export class CloudCodeFailoverGateway {
           }
 
           if (isTransient) {
+            exhaustedByUnavailable = true;
             logger.warn(
               `[CloudCodeGateway] Upstream returned transient gRPC status 14 (UNAVAILABLE) (attempt ${attempt}/${maxAttempts}). Retrying without quota penalty...`,
             );
@@ -1203,18 +1202,19 @@ export class CloudCodeFailoverGateway {
     // All accounts exhausted
     const anyRes = res as any;
     if (!anyRes.headersSent) {
-      receiptOwner.expectDownstreamCommit('rate_limited'); this.writeHeaders(res, 429, { 'content-type': 'application/json' });
+      const exhaustedClassification = exhaustedByUnavailable ? 'unavailable' : 'rate_limited';
+      receiptOwner.expectDownstreamCommit(exhaustedClassification); this.writeHeaders(res, exhaustedByUnavailable ? 503 : 429, { 'content-type': 'application/json' });
       res.end(
         JSON.stringify({
           error: {
-            code: 429,
-            message: 'All accounts in the Antigravity account pool are exhausted or rate-limited.',
-            status: 'RESOURCE_EXHAUSTED',
+            code: exhaustedByUnavailable ? 503 : 429,
+            message: exhaustedByUnavailable ? 'All upstream attempts are unavailable.' : 'All accounts in the Antigravity account pool are exhausted or rate-limited.',
+            status: exhaustedByUnavailable ? 'UNAVAILABLE' : 'RESOURCE_EXHAUSTED',
           },
         }),
       );
     }
-    } catch { receiptTransferred = true; throw new GatewayReceiptTransferError(receiptOwner); } finally { if (!receiptTransferred) receiptOwner.emit(); }
+    } catch (err) { throw new GatewayReceiptTransferError(receiptOwner, err); }
   }
 
   private writeHeaders(

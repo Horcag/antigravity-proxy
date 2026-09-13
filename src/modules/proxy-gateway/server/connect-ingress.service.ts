@@ -230,7 +230,8 @@ export class ConnectIngressService {
       },
       (req, res) => {
         this.failoverGateway.handleRequest(req, res).catch((err: unknown) => {
-          logger.error('[ConnectIngress] Error processing request in transparent gateway', err);
+          const originalCause = err instanceof GatewayReceiptTransferError ? err.originalCause : err;
+          logger.error('[ConnectIngress] Error processing request in transparent gateway', originalCause);
           const receiptOwner = err instanceof GatewayReceiptTransferError
             ? err.receiptOwner
             : new AnonymousTransportReceiptOwner(crypto.randomUUID());
@@ -244,7 +245,6 @@ export class ConnectIngressService {
               receiptOwner.reject('internal_error');
             }
           }
-          receiptOwner.emit();
         });
       },
     );
