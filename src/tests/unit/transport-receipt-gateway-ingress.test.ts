@@ -33,14 +33,15 @@ function request(host: string): any {
   return req;
 }
 
-function pendingRequest(host: string): { req: any; release: () => void } {
+function pendingRequest(host: string): { req: any; release: () => void; reject: (error: Error) => void } {
   const req = request(host);
   let releaseBody!: () => void;
+  let rejectBody!: (error: Error) => void;
   req[Symbol.asyncIterator] = async function* () {
-    await new Promise<void>((resolve) => { releaseBody = resolve; });
+    await new Promise<void>((resolve, reject) => { releaseBody = resolve; rejectBody = reject; });
     yield Buffer.from(JSON.stringify({ model: 'gemini-2.5-pro' }));
   };
-  return { req, release: () => releaseBody() };
+  return { req, release: () => releaseBody(), reject: (error) => rejectBody(error) };
 }
 
 describe('transport receipt gateway and ingress terminal ownership', () => {
@@ -151,6 +152,28 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
     expect(transferred.originalCause).toBe(originalCause);
   });
 
+  it('prioritizes the deadline write failure when buffered request iteration later rejects', async () => {
+    vi.useFakeTimers();
+    try {
+      const gateway = new CloudCodeFailoverGateway();
+      const { req, reject } = pendingRequest('daily-cloudcode-pa.googleapis.com');
+      const res = response();
+      const deadlineFailure = new Error('deadline write failed');
+      res.writeHead.mockImplementation(() => { throw deadlineFailure; });
+
+      const handling = gateway.handleRequest(req, res);
+      await vi.advanceTimersByTimeAsync(120000);
+      reject(new Error('body iterator aborted'));
+
+      await expect(handling).rejects.toMatchObject({
+        name: 'GatewayReceiptTransferError',
+        originalCause: deadlineFailure,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('emits one rejected receipt when the ingress fallback response write fails', async () => {
     const ingress = new ConnectIngressService();
     const server = new EventEmitter() as any;
@@ -198,6 +221,33 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
     expect(info).toHaveBeenCalledTimes(1);
     expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({
       receiptId: 'headers-sent-transfer', classification: 'internal_error', result: 'rejected', downstreamCommitCount: 0,
+    });
+    ingress.close();
+  });
+
+  it('terminates a headers-sent response that ended without finishing', async () => {
+    const ingress = new ConnectIngressService();
+    const server = new EventEmitter() as any;
+    server.on = vi.fn(EventEmitter.prototype.on.bind(server));
+    ingress.attach(server);
+    const owner = new AnonymousTransportReceiptOwner('headers-ended-unfinished-transfer');
+    (ingress as any).failoverGateway.handleRequest = vi.fn().mockRejectedValue(
+      new GatewayReceiptTransferError(owner, new Error('response ended before finish')),
+    );
+    const res = response();
+    res.headersSent = true;
+    res.writableEnded = true;
+    res.writableFinished = false;
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const listener = (ingress as any).h2Server.listeners('request')[0];
+
+    listener(request('daily-cloudcode-pa.googleapis.com'), res);
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(res.destroy).toHaveBeenCalledTimes(1);
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({
+      receiptId: 'headers-ended-unfinished-transfer', classification: 'internal_error', result: 'rejected', downstreamCommitCount: 0,
     });
     ingress.close();
   });

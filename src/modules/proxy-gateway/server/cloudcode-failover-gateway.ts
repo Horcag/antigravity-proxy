@@ -1214,7 +1214,7 @@ export class CloudCodeFailoverGateway {
         }),
       );
     }
-    } catch (err) { if (err instanceof GatewayReceiptTransferError) throw err; throw new GatewayReceiptTransferError(receiptOwner, err); }
+    } catch (err) { if (deadlineWriteFailure) throw deadlineWriteFailure; if (err instanceof GatewayReceiptTransferError) throw err; throw new GatewayReceiptTransferError(receiptOwner, err); }
   }
 
   private writeHeaders(

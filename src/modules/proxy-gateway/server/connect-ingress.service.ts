@@ -239,7 +239,7 @@ export class ConnectIngressService {
           const rejectAndTerminate = () => {
             receiptOwner.reject('internal_error');
             try {
-              if (!res.writableEnded && !(res as any).destroyed) {
+              if (!res.writableFinished && !(res as any).destroyed) {
                 res.destroy(new Error('Gateway internal error response could not be completed'));
               }
             } catch {
@@ -255,7 +255,7 @@ export class ConnectIngressService {
             } catch {
               rejectAndTerminate();
             }
-          } else if (!res.writableEnded) {
+          } else if (!res.writableFinished) {
             rejectAndTerminate();
           }
         });
