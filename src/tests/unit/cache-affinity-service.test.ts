@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AccountLeaseService } from '@/modules/proxy-gateway/server/account-lease.service';
 import { createMigrationAuthorization } from '@/modules/proxy-gateway/server/cache-affinity-coordinator';
+import { RateLimitReason } from '@/modules/proxy-gateway/server/rate-limit-tracker';
 
 describe('AccountLeaseService cache affinity fences', () => {
   let service: AccountLeaseService;
@@ -78,6 +79,22 @@ describe('AccountLeaseService cache affinity fences', () => {
     expect(lease?.account.id).toBe('acc-2');
     lease?.releaseReservation();
     expect(service.authorizeBoundSessionMigration(sessionKey, undefined, 'req-other')).toBeUndefined();
+  });
+
+  it('migrates from a bound account whose forwarded physical model is locked out', async () => {
+    const sessionKey = 'session:forwarded-lockout';
+    service.bindSession(sessionKey, 'acc-1');
+    const tokens = (service as any).tokens as Map<string, any>;
+    tokens.get('acc-1').model_forwarding_rules = { public: 'physical-a' };
+    tokens.get('acc-2').model_forwarding_rules = { public: 'physical-b' };
+    tokens.get('acc-1').model_quotas = { 'physical-a': 100 };
+    tokens.get('acc-2').model_quotas = { 'physical-b': 100 };
+    (service as any).rateLimitTracker.setLockoutUntilIso('acc-1', new Date(Date.now() + 60_000).toISOString(), RateLimitReason.RateLimitExceeded, 'physical-a');
+    const authorization = service.authorizeBoundSessionMigration(sessionKey, 'public', 'req-owner');
+    expect(authorization?.reason).toBe('account-cooldown');
+    const lease = await service.acquireAttemptLease({ sessionKey, model: 'public', deferSessionBinding: true, excludeAccountIds: ['acc-1'], migrationAuthorization: authorization, requestId: 'req-owner' });
+    expect(lease?.account.id).toBe('acc-2');
+    lease?.releaseReservation();
   });
 
   it('re-admits a committed migration follower on its new binding without stale admission state', async () => {

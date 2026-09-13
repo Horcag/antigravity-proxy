@@ -773,7 +773,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     excludedAccountIds: ReadonlySet<string>,
   ): Promise<TokenEntry[]> {
     const usable = (entries: TokenEntry[]) => entries.filter(([accountId, token]) => token.status !== 'expired' &&
-      (this.accountCooldowns.get(accountId) ?? 0) <= Date.now() && !this.rateLimitTracker.isRateLimited(accountId, model));
+      (this.accountCooldowns.get(accountId) ?? 0) <= Date.now() && !this.rateLimitTracker.isRateLimited(accountId, model ? this.modelPolicy.resolveDynamicModelForAccount(accountId, model, false) : undefined));
     let modelCapableAccountPool = this.selectModelCapableAccounts(usable(Array.from(this.tokens.entries())), model);
     if (model && modelCapableAccountPool.length === 0) {
       await this.refreshQuotaCatalog({ force: true, model });
@@ -890,7 +890,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   public authorizeBoundSessionMigration(sessionKey: string | undefined, model: string | undefined, ownerRequestId: string | undefined): MigrationAuthorization | undefined {
     return authorizeBoundSessionMigration(this.tokens, this.getSessionBinding(sessionKey), sessionKey, model, ownerRequestId,
       (accountId, requestedModel) => this.modelPolicy.isModelRequestableForAccount(accountId, requestedModel),
-      (accountId) => (this.accountCooldowns.get(accountId) ?? 0) > Date.now() || this.rateLimitTracker.isRateLimited(accountId, model));
+      (accountId) => (this.accountCooldowns.get(accountId) ?? 0) > Date.now() || this.rateLimitTracker.isRateLimited(accountId, model ? this.modelPolicy.resolveDynamicModelForAccount(accountId, model, false) : undefined));
   }
   public clearSessions(): void {
     this.selectionPolicy.clearSessions();

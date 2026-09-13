@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import type { Readable } from 'node:stream';
 import { logger } from '../../../shared/logging/logger';
+import { getServerConfig } from '../../../server/server-config';
 import { AccountLeaseService } from './account-lease.service';
 import { CloudAccount } from '../../cloud-account/types';
 import { RateLimitReason } from './rate-limit-tracker';
@@ -129,8 +130,7 @@ export class CloudCodeFailoverGateway {
       return;
     }
     const targetHost = parsedAuthority.hostname;
-    const requestAbortController = new AbortController();
-    const LOGICAL_REQUEST_DEADLINE_MS = 120000;
+    const requestAbortController = new AbortController(), LOGICAL_REQUEST_DEADLINE_MS = (getServerConfig()?.request_timeout ?? 120) * 1000, affinityOwnerTimeoutMs = LOGICAL_REQUEST_DEADLINE_MS + 5000;
     const deadlineAt = Date.now() + LOGICAL_REQUEST_DEADLINE_MS;
     let logicalDeadlineTimer: NodeJS.Timeout | null = null;
     const clearLogicalDeadline = () => { if (logicalDeadlineTimer) { clearTimeout(logicalDeadlineTimer); logicalDeadlineTimer = null; } };
@@ -324,7 +324,7 @@ export class CloudCodeFailoverGateway {
             sessionKey,
             deferSessionBinding: true,
             migrationAuthorization,
-            signal: requestAbortController.signal, requestId,
+            signal: requestAbortController.signal, requestId, affinityOwnerTimeoutMs,
           });
         } else {
           const acc = await this.accountLeaseService.getNextToken({
