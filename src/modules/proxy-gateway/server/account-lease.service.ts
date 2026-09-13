@@ -47,6 +47,7 @@ import {
   type AffinityPlacementOutcome,
   type MigrationAuthorization,
 } from './cache-affinity-coordinator';
+import { authorizeBoundSessionMigration } from './bound-session-migration-authorization';
 export interface AttemptLease {
   account: CloudAccount;
   sessionKey?: string;
@@ -150,7 +151,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   private readonly tokenCache: AccountLeaseTokenCache;
   private readonly selectionPolicy = new AccountLeaseSelectionPolicy();
   private readonly selectionMutex = new Mutex();
-  private readonly affinityCoordinator = new CacheAffinityCoordinator();
+  private readonly affinityCoordinator = new CacheAffinityCoordinator({ ownerTimeoutMs: 90_000 });
   private readonly hydrationPolicy: AccountLeaseHydrationPolicy;
   private readonly fulfillmentPolicy: AccountLeaseFulfillmentPolicy;
   private readonly modelPolicy: AccountLeaseModelPolicy;
@@ -785,11 +786,11 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
       this.logger.warn(`No account advertises requested model: ${model ?? 'unknown'}`);
       return [];
     }
-    const requestableAccountPool = model
+    const requestableAccountPool = (model
       ? modelCapableAccountPool.filter(([accountId]) =>
           this.modelPolicy.isModelRequestableForAccount(accountId, model),
         )
-      : modelCapableAccountPool;
+      : modelCapableAccountPool).filter(([, token]) => token.status !== 'expired');
     if (requestableAccountPool.length === 0) {
       this.logger.warn(`All compatible account/model pairs are temporarily unavailable: ${model}`);
       return [];
@@ -885,23 +886,13 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     );
   }
   public abortSessionMigration(sessionKey: string | undefined, expectedGeneration: number, ownerRequestId?: string, expectedIncarnation?: number): boolean { return this.selectionPolicy.abortSessionMigration(sessionKey, expectedGeneration, ownerRequestId, expectedIncarnation); }
-  public renewSessionMigration(
-    sessionKey: string | undefined,
-    expectedGeneration: number,
-    ownerRequestId?: string,
-    extensionMs?: number,
-    expectedIncarnation?: number,
-  ): boolean {
-    return this.selectionPolicy.renewSessionMigration(
-      sessionKey,
-      expectedGeneration,
-      ownerRequestId,
-      extensionMs,
-      expectedIncarnation,
-    );
-  }
+  public renewSessionMigration(sessionKey: string | undefined, expectedGeneration: number, ownerRequestId?: string, extensionMs?: number, expectedIncarnation?: number): boolean { return this.selectionPolicy.renewSessionMigration(sessionKey, expectedGeneration, ownerRequestId, extensionMs, expectedIncarnation); }
   public getTableIncarnation(): number {
     return this.selectionPolicy.getTableIncarnation();
+  }
+  public authorizeBoundSessionMigration(sessionKey: string | undefined, model: string | undefined, ownerRequestId: string | undefined): MigrationAuthorization | undefined {
+    return authorizeBoundSessionMigration(this.tokens, this.getSessionBinding(sessionKey), sessionKey, model, ownerRequestId,
+      (accountId, requestedModel) => this.modelPolicy.isModelRequestableForAccount(accountId, requestedModel));
   }
   public clearSessions(): void {
     this.selectionPolicy.clearSessions();

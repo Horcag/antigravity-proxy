@@ -87,6 +87,7 @@ export interface ProxyRetryAccountLeaseService {
     generation: number;
     tableIncarnation?: number;
   } | null;
+  authorizeBoundSessionMigration?(sessionKey: string | undefined, model: string | undefined, ownerRequestId: string | undefined): MigrationAuthorization | undefined;
 }
 
 interface RetryTokenOptions {

@@ -270,8 +270,7 @@ export class CloudCodeFailoverGateway {
       }
     }
     const sessionKey = this.extractSessionKey(req, parsedBody);
-    const requestId = crypto.randomUUID();
-    // 3. Failover retry loop (ResponseCommitGate)
+    const requestId = crypto.randomUUID(); // 3. Failover retry loop (ResponseCommitGate)
     const attemptedAccountIds = new Set<string>();
     const maxAttempts = 5;
     let migrationAuthorization: MigrationAuthorization | undefined;
@@ -279,6 +278,7 @@ export class CloudCodeFailoverGateway {
       const binding = this.accountLeaseService?.getSessionBinding?.(sessionKey);
       migrationAuthorization = createMigrationAuthorization(reason, sessionKey, binding, requestId) ?? undefined;
     };
+    migrationAuthorization = this.accountLeaseService?.authorizeBoundSessionMigration?.(sessionKey, modelName, requestId);
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (clientAborted || affinityOwnerExpired || res.destroyed) {
         return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;

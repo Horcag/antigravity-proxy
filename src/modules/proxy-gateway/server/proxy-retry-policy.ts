@@ -151,8 +151,8 @@ export class ProxyRetryPolicy {
     }
     this.releaseReservation(retryState); this.abortAffinityPlacement(retryState);
     retryState.sessionKey = sessionKey;
-    const initialBinding =
-      sessionKey && typeof this.accountLeaseService.getSessionBinding === 'function'
+    retryState.migrationAuthorization ??= this.accountLeaseService.authorizeBoundSessionMigration?.(sessionKey, model, retryState.requestId);
+    const initialBinding = sessionKey && typeof this.accountLeaseService.getSessionBinding === 'function'
         ? this.accountLeaseService.getSessionBinding(sessionKey)
         : null;
     let selectedAccount: CloudAccount | null = null;
