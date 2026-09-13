@@ -1,7 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
-import { CacheAffinityCoordinator } from '@/modules/proxy-gateway/server/cache-affinity-coordinator';
+import { authorizesMigration, CacheAffinityCoordinator } from '@/modules/proxy-gateway/server/cache-affinity-coordinator';
 
 describe('CacheAffinityCoordinator', () => {
+  it('requires the exact request owner for migration authorization', () => {
+    const authorization = { reason: 'account-cooldown' as const, sessionKey: 'session:owner', expectedGeneration: 1, expectedTableIncarnation: 1, ownerRequestId: 'owner-a' };
+    const binding = { generation: 1, tableIncarnation: 1 };
+    expect(authorizesMigration(authorization, authorization.sessionKey, binding, undefined)).toBe(false);
+    expect(authorizesMigration(authorization, authorization.sessionKey, binding, 'owner-b')).toBe(false);
+    expect(authorizesMigration(authorization, authorization.sessionKey, binding, 'owner-a')).toBe(true);
+  });
   it('allows one owner and wakes followers only after the owner commits', async () => {
     const coordinator = new CacheAffinityCoordinator();
     const owner = await coordinator.acquire('openai:conversation-1');
