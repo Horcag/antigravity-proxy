@@ -43,6 +43,9 @@ export interface CloudCodeGatewayOptions {
   accountLeaseService?: AccountLeaseService;
   upstreamHost?: string;
 }
+function encodeErrorBody(error: Record<string, unknown>): Buffer<ArrayBuffer> {
+  return Buffer.from(JSON.stringify({ error }), 'utf-8') as Buffer<ArrayBuffer>;
+}
 export class GatewayReceiptTransferError extends Error { constructor(readonly receiptOwner: AnonymousTransportReceiptOwner, readonly originalCause: unknown) { super('Gateway receipt ownership transferred to ingress', { cause: originalCause }); this.name = 'GatewayReceiptTransferError'; } }
 export function extractCanonicalUserTurnText(turn: unknown): string | null {
   if (!turn || typeof turn !== 'object') return null;
@@ -171,17 +174,12 @@ export class CloudCodeFailoverGateway {
       if (!responseCommitted && !res.headersSent && !res.writableEnded) {
         responseCommitted = true;
         abortAll();
-        const errorBody = Buffer.from(
-          JSON.stringify({
-            error: {
-              code: 504,
-              status: 'DEADLINE_EXCEEDED',
-              message: 'Gateway Timeout: Overall request deadline exceeded',
-              category: 'deadline-exceeded',
-            },
-          }),
-          'utf-8',
-        );
+        const errorBody = encodeErrorBody({
+          code: 504,
+          status: 'DEADLINE_EXCEEDED',
+          message: 'Gateway Timeout: Overall request deadline exceeded',
+          category: 'deadline-exceeded',
+        });
         try {
           receiptOwner.expectDownstreamCommit('deadline_exceeded'); this.writeHeaders(res, 504, {
             'content-type': 'application/json; charset=utf-8',
@@ -290,17 +288,12 @@ export class CloudCodeFailoverGateway {
         );
         if (!responseCommitted && !res.headersSent && !res.writableEnded) {
           responseCommitted = true;
-          const errorBody = Buffer.from(
-            JSON.stringify({
-              error: {
-                code: 504,
-                status: 'DEADLINE_EXCEEDED',
-                message: 'Gateway Timeout: Overall request deadline exceeded',
-                category: 'deadline-exceeded',
-              },
-            }),
-            'utf-8',
-          );
+          const errorBody = encodeErrorBody({
+            code: 504,
+            status: 'DEADLINE_EXCEEDED',
+            message: 'Gateway Timeout: Overall request deadline exceeded',
+            category: 'deadline-exceeded',
+          });
           receiptOwner.expectDownstreamCommit('deadline_exceeded'); this.writeHeaders(res, 504, {
             'content-type': 'application/json; charset=utf-8',
             'content-length': String(errorBody.length),
@@ -885,17 +878,12 @@ export class CloudCodeFailoverGateway {
             }
             if (frameDecision.isLocalValidationError || (statusCode >= 200 && statusCode < 300)) {
               responseCommitted = true;
-              receiptOwner.expectDownstreamCommit('bad_gateway'); const errorBody = Buffer.from(
-                JSON.stringify({
-                  error: {
-                    code: 502,
-                    status: 'BAD_GATEWAY',
-                    message: `Bad Gateway: ${frameDecision.errorText || 'Upstream response validation failed'}`,
-                    category: frameDecision.category || 'malformed-upstream-message',
-                  },
-                }),
-                'utf-8',
-              );
+              receiptOwner.expectDownstreamCommit('bad_gateway'); const errorBody = encodeErrorBody({
+                code: 502,
+                status: 'BAD_GATEWAY',
+                message: `Bad Gateway: ${frameDecision.errorText || 'Upstream response validation failed'}`,
+                category: frameDecision.category || 'malformed-upstream-message',
+              });
               this.writeHeaders(res, 502, {
                 'content-type': 'application/json; charset=utf-8',
                 'content-length': String(errorBody.length),
@@ -919,17 +907,12 @@ export class CloudCodeFailoverGateway {
               `[CloudCodeGateway] Protocol frame inspection limit exceeded (NEED_MORE_DATA) (attempt ${attempt}/${maxAttempts})`,
             );
             responseCommitted = true;
-            receiptOwner.expectDownstreamCommit('bad_gateway'); const errorBody = Buffer.from(
-              JSON.stringify({
-                error: {
-                  code: 502,
-                  status: 'BAD_GATEWAY',
-                  message: 'Bad Gateway: Protocol frame inspection limit exceeded without valid structure',
-                  category: 'inspection-limit',
-                },
-              }),
-              'utf-8',
-            );
+            receiptOwner.expectDownstreamCommit('bad_gateway'); const errorBody = encodeErrorBody({
+              code: 502,
+              status: 'BAD_GATEWAY',
+              message: 'Bad Gateway: Protocol frame inspection limit exceeded without valid structure',
+              category: 'inspection-limit',
+            });
             this.writeHeaders(res, 502, {
               'content-type': 'application/json; charset=utf-8',
               'content-length': String(errorBody.length),
@@ -1575,15 +1558,10 @@ export class CloudCodeFailoverGateway {
             const resHeaders = { ...upstreamRes.headers };
             if (bodyTruncated) {
               delete resHeaders['content-encoding'];
-              finalBody = Buffer.from(
-                JSON.stringify({
-                  error: {
-                    code: statusCode,
-                    message: 'Upstream error response exceeded 1 MiB budget and was truncated.',
-                  },
-                }),
-                'utf-8',
-              );
+              finalBody = encodeErrorBody({
+                code: statusCode,
+                message: 'Upstream error response exceeded 1 MiB budget and was truncated.',
+              });
               resHeaders['content-type'] = 'application/json; charset=utf-8';
               resHeaders['content-length'] = String(finalBody.length);
             } else if (resHeaders['content-length'] !== undefined) {
