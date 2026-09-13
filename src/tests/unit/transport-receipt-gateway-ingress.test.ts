@@ -205,6 +205,31 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
     expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({ classification: 'internal_error', result: 'rejected', downstreamCommitCount: 0 });
   });
 
+  it('rejects and destroys an unexpected post-header bodyStream.resume failure', async () => {
+    const leases: any = { getNextToken: vi.fn().mockResolvedValue({ id: 'account', provider: 'google' }) };
+    const gateway = new CloudCodeFailoverGateway(leases);
+    let throwOnResume = false;
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async () => {
+      const bodyStream = new PassThrough();
+      const resume = bodyStream.resume.bind(bodyStream);
+      bodyStream.resume = vi.fn(() => {
+        if (throwOnResume) throw new Error('post-header resume failed');
+        return resume();
+      }) as any;
+      queueMicrotask(() => bodyStream.write(Buffer.from('{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}')));
+      return { statusCode: 200, headers: { 'content-type': 'application/json' }, bodyStream };
+    });
+    const res = response();
+    res.writeHead.mockImplementation(() => { res.headersSent = true; throwOnResume = true; });
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+
+    await gateway.handleRequest(request('daily-cloudcode-pa.googleapis.com'), res);
+
+    expect(res.destroy).toHaveBeenCalledTimes(1);
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({ classification: 'internal_error', result: 'rejected', downstreamCommitCount: 0 });
+  });
+
   it.each([
     ['affinity owner expiry', (leases: any) => {
       const controller = new AbortController();

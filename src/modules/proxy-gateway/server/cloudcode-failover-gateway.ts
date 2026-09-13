@@ -97,8 +97,7 @@ export class CloudCodeFailoverGateway {
     res: http.ServerResponse | http2.Http2ServerResponse,
   ): Promise<void> {
     const receiptOwner = new AnonymousTransportReceiptOwner(crypto.randomUUID()); receiptOwner.observeResponse(res);
-    let responseCommitted = false;
-    let downstreamFailed = false;
+    let responseCommitted = false; let downstreamFailed = false;
     const rejectAndTerminateDownstream = (cause: unknown): void => {
       downstreamFailed = true;
       receiptOwner.reject('internal_error');
@@ -1062,7 +1061,7 @@ export class CloudCodeFailoverGateway {
         if (deadlineWriteFailure) throw deadlineWriteFailure;
         if (err instanceof GatewayReceiptTransferError) throw err;
         if (upstreamResponseSelected && !responseCommitted) throw new GatewayReceiptTransferError(receiptOwner, err);
-        if (responseCommitted) return;
+        if (responseCommitted) { destroyActiveUpstream(); rejectAndTerminateDownstream(err); return; }
         logger.warn(
           `[CloudCodeGateway] Upstream network error: operation=upstream_request reason=network_error attempt=${attempt}/${maxAttempts}`,
         );
