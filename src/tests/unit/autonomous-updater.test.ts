@@ -48,6 +48,12 @@ describe('autonomous system updater', () => {
     }
   });
 
+  it('validates health with the bundled release runtime instead of ambient PATH', () => {
+    const release = readFileSync(join(root, 'scripts/release-lib.sh'), 'utf8');
+    expect(release).toContain('run_release_probe_command "$health_node" -e');
+    expect(release).not.toContain('if ! node -e');
+  });
+
   it('rejects arguments before touching privileged state', () => {
     const result = spawnSync('bash', [join(root, 'scripts/autonomous-update-root.sh'), 'unexpected'], { encoding: 'utf8' });
     expect(result.status).toBe(1);

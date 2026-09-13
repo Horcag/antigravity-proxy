@@ -68,7 +68,7 @@ release_init() {
   require_absolute_path "$release_lock_file" RELEASE_LOCK_FILE
   validate_release_id "$release_id"
   case "$bundle_node" in 0|1) ;; *) die "BUNDLE_NODE must be 0 or 1" ;; esac
-  resolve_release_runtime
+  [ -n "$prebuilt_release_archive" ] || resolve_release_runtime
 
   releases_dir="$install_root/releases"
   current_link="$install_root/current"
@@ -1237,8 +1237,8 @@ smoke_check() {
     esac
   fi
 
-  local host port base_url admin_status listener main_pid service_user env_fs
-  env_fs="$(root_path "$env_file")"
+  local host port base_url admin_status listener main_pid service_user env_fs health_node
+  env_fs="$(root_path "$env_file")"; health_node="$(release_runtime_for "$(root_path "$current_link")")" || return 1
   [ -f "$env_fs" ] || { printf 'Environment file is missing: %s\n' "$env_fs" >&2; return 1; }
   host="$(sed -n 's/^AG_PROXY_HOST=//p' "$env_fs" | tail -n 1)"
   port="$(sed -n 's/^AG_PROXY_PORT=//p' "$env_fs" | tail -n 1)"
@@ -1271,7 +1271,7 @@ smoke_check() {
       if [ -z "$health_body" ]; then
         printf 'Health endpoint responded 200 with empty body\n' >&2; return 1
       fi
-      if ! node -e 'const r=process.argv[1]; try { const p=JSON.parse(r); process.exit(p&&p.ok===true&&p.connect_ready===true?0:1); } catch { process.exit(1); }' "$health_body"; then
+      if ! run_release_probe_command "$health_node" -e 'const r=process.argv[1]; try { const p=JSON.parse(r); process.exit(p&&p.ok===true&&p.connect_ready===true?0:1); } catch { process.exit(1); }' "$health_body"; then
         printf 'Health endpoint response failed validation (expected {ok:true, connect_ready:true}): %s\n' "$health_body" >&2; return 1
       fi
       ready=1; break
