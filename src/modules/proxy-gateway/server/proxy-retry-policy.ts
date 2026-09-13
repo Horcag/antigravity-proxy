@@ -289,8 +289,7 @@ export class ProxyRetryPolicy {
       error instanceof UpstreamRequestError &&
       (error.status === 401 || error.status === 403 || error.status === 429)
     );
-  }
-  markUpstreamSuccess(
+  } markUpstreamSuccess(
     accountId: string,
     model?: string,
     sessionKey?: string,
@@ -300,6 +299,7 @@ export class ProxyRetryPolicy {
     expectedIncarnation?: number,
     retryState?: ProxyTokenRetryState,
   ): AffinityCommitResult {
+    if (retryState && this.isTerminal(retryState)) return { kind: 'rejected', reason: 'migration-confirmation-rejected' };
     if (retryState) {
       retryState.status = 'confirmed';
       retryState.removeAbortListener?.();
