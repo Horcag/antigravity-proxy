@@ -236,14 +236,27 @@ export class ConnectIngressService {
             ? err.receiptOwner
             : new AnonymousTransportReceiptOwner(crypto.randomUUID());
           receiptOwner.observeResponse(res);
+          const rejectAndTerminate = () => {
+            receiptOwner.reject('internal_error');
+            try {
+              if (!res.writableEnded && !(res as any).destroyed) {
+                res.destroy(new Error('Gateway internal error response could not be completed'));
+              }
+            } catch {
+              // If the response cannot be destroyed, emit the rejected owner directly.
+            }
+            receiptOwner.emit();
+          };
           if (!res.headersSent) {
             try {
               receiptOwner.expectDownstreamCommit('internal_error');
               res.writeHead(502, { 'content-type': 'application/json' });
               res.end(JSON.stringify({ error: { code: 502, message: 'Gateway internal error' } }));
             } catch {
-              receiptOwner.reject('internal_error');
+              rejectAndTerminate();
             }
+          } else if (!res.writableEnded) {
+            rejectAndTerminate();
           }
         });
       },

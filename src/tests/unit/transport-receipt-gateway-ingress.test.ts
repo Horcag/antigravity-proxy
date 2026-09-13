@@ -33,6 +33,16 @@ function request(host: string): any {
   return req;
 }
 
+function pendingRequest(host: string): { req: any; release: () => void } {
+  const req = request(host);
+  let releaseBody!: () => void;
+  req[Symbol.asyncIterator] = async function* () {
+    await new Promise<void>((resolve) => { releaseBody = resolve; });
+    yield Buffer.from(JSON.stringify({ model: 'gemini-2.5-pro' }));
+  };
+  return { req, release: () => releaseBody() };
+}
+
 describe('transport receipt gateway and ingress terminal ownership', () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -101,6 +111,93 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
     expect(info).toHaveBeenCalledTimes(1);
     expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({
       receiptId: 'transferred', classification: 'internal_error', result: 'committed', downstreamCommitCount: 1,
+    });
+    ingress.close();
+  });
+
+  it('propagates a deadline response write failure after body buffering exits through client abort', async () => {
+    vi.useFakeTimers();
+    try {
+      const gateway = new CloudCodeFailoverGateway();
+      const { req, release } = pendingRequest('daily-cloudcode-pa.googleapis.com');
+      const res = response();
+      const writeFailure = new Error('deadline write failed');
+      res.writeHead.mockImplementation(() => { throw writeFailure; });
+
+      const handling = gateway.handleRequest(req, res);
+      await vi.advanceTimersByTimeAsync(120000);
+      release();
+
+      await expect(handling).rejects.toMatchObject({
+        name: 'GatewayReceiptTransferError',
+        originalCause: writeFailure,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not nest an existing receipt transfer error around another owner', async () => {
+    const originalCause = new Error('original write failure');
+    const transferred = new GatewayReceiptTransferError(
+      new AnonymousTransportReceiptOwner('existing-transfer'),
+      originalCause,
+    );
+    const leases = { getNextToken: vi.fn(async () => { throw transferred; }) };
+    const gateway = new CloudCodeFailoverGateway(leases as any);
+
+    await expect(gateway.handleRequest(request('daily-cloudcode-pa.googleapis.com'), response()))
+      .rejects.toBe(transferred);
+    expect(transferred.originalCause).toBe(originalCause);
+  });
+
+  it('emits one rejected receipt when the ingress fallback response write fails', async () => {
+    const ingress = new ConnectIngressService();
+    const server = new EventEmitter() as any;
+    server.on = vi.fn(EventEmitter.prototype.on.bind(server));
+    ingress.attach(server);
+    const owner = new AnonymousTransportReceiptOwner('fallback-write-failure');
+    (ingress as any).failoverGateway.handleRequest = vi.fn().mockRejectedValue(
+      new GatewayReceiptTransferError(owner, new Error('upstream write failure')),
+    );
+    const res = response();
+    res.end.mockImplementation(() => { throw new Error('fallback end failed'); });
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const listener = (ingress as any).h2Server.listeners('request')[0];
+
+    listener(request('daily-cloudcode-pa.googleapis.com'), res);
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(res.destroy).toHaveBeenCalledTimes(1);
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({
+      receiptId: 'fallback-write-failure', classification: 'internal_error', result: 'rejected', downstreamCommitCount: 0,
+    });
+    ingress.close();
+  });
+
+  it('terminates and rejects a transferred owner when headers are already sent', async () => {
+    const ingress = new ConnectIngressService();
+    const server = new EventEmitter() as any;
+    server.on = vi.fn(EventEmitter.prototype.on.bind(server));
+    ingress.attach(server);
+    const owner = new AnonymousTransportReceiptOwner('headers-sent-transfer');
+    (ingress as any).failoverGateway.handleRequest = vi.fn().mockRejectedValue(
+      new GatewayReceiptTransferError(owner, new Error('headers already sent')),
+    );
+    const res = response();
+    res.headersSent = true;
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const listener = (ingress as any).h2Server.listeners('request')[0];
+
+    listener(request('daily-cloudcode-pa.googleapis.com'), res);
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(res.writeHead).not.toHaveBeenCalled();
+    expect(res.destroy).toHaveBeenCalledTimes(1);
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({
+      receiptId: 'headers-sent-transfer', classification: 'internal_error', result: 'rejected', downstreamCommitCount: 0,
     });
     ingress.close();
   });

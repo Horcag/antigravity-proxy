@@ -87,6 +87,7 @@ export class CloudCodeFailoverGateway {
     res: http.ServerResponse | http2.Http2ServerResponse,
   ): Promise<void> {
     const receiptOwner = new AnonymousTransportReceiptOwner(crypto.randomUUID()); receiptOwner.observeResponse(res);
+    let deadlineWriteFailure: GatewayReceiptTransferError | null = null;
     try {
     const rawUrl = req.url || '/';
     let urlPath = rawUrl;
@@ -142,8 +143,7 @@ export class CloudCodeFailoverGateway {
     let activeStopCandidateRenewal: (() => void) | undefined;
     let currentUpstreamReq: http.ClientRequest | undefined;
     let currentUpstreamRes: http.IncomingMessage | undefined;
-    let responseCommitted = false;
-    let deadlineWriteFailure: GatewayReceiptTransferError | null = null; let exhaustedByUnavailable = false;
+    let responseCommitted = false; let exhaustedByUnavailable = false;
     const cleanupActiveAttempt = () => {
       if (activeStopCandidateRenewal) {
         activeStopCandidateRenewal();
@@ -227,7 +227,7 @@ export class CloudCodeFailoverGateway {
     let totalBodyBytes = 0;
     const bodyChunks: Buffer[] = [];
     for await (const chunk of req) {
-      if (clientAborted) return;
+      if (clientAborted) return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
       const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       totalBodyBytes += buf.length;
       if (totalBodyBytes > MAX_REQUEST_BODY_BYTES) {
@@ -249,7 +249,7 @@ export class CloudCodeFailoverGateway {
     const rawBody = Buffer.concat(bodyChunks);
 
     if (clientAborted || res.destroyed) {
-      return;
+      return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
     }
 
     // 2. Parse payload if JSON to extract model and project
@@ -288,7 +288,7 @@ export class CloudCodeFailoverGateway {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (clientAborted || res.destroyed) {
-        return;
+        return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
       }
 
       const remainingTimeMs = deadlineAt - Date.now();
@@ -376,7 +376,7 @@ export class CloudCodeFailoverGateway {
 
       if (clientAborted || res.destroyed) {
         lease?.releaseReservation?.();
-        return;
+        return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
       }
 
       const account = lease?.account ?? null;
@@ -547,7 +547,7 @@ export class CloudCodeFailoverGateway {
         if (clientAborted || res.destroyed) {
           cleanupActiveAttempt();
           bodyStream.destroy();
-          return;
+          return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
         }
 
         // Check for rate limit / quota exhaustion
@@ -898,7 +898,7 @@ export class CloudCodeFailoverGateway {
         if (clientAborted || res.destroyed) {
           cleanupActiveAttempt();
           bodyStream.destroy();
-          return;
+          return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
         }
 
         const firstChunk = firstChunkResult.buffer;
@@ -1154,7 +1154,7 @@ export class CloudCodeFailoverGateway {
             if (res.writableEnded || (res as any).destroyed || clientAborted) {
               cleanupActiveAttempt();
               bodyStream.destroy();
-              return;
+              return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
             }
           }
         }
@@ -1214,7 +1214,7 @@ export class CloudCodeFailoverGateway {
         }),
       );
     }
-    } catch (err) { throw new GatewayReceiptTransferError(receiptOwner, err); }
+    } catch (err) { if (err instanceof GatewayReceiptTransferError) throw err; throw new GatewayReceiptTransferError(receiptOwner, err); }
   }
 
   private writeHeaders(
