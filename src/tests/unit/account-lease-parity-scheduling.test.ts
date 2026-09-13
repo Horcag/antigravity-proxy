@@ -1678,7 +1678,7 @@ describe('AccountLeaseService parity scheduling replay', () => {
     }
   });
 
-  it('uses round robin instead of session affinity in balance mode', async () => {
+  it('keeps a committed session affinity in balance mode', async () => {
     setServerConfig(
       createProxyConfig({
         parity_enabled: true,
@@ -1693,9 +1693,9 @@ describe('AccountLeaseService parity scheduling replay', () => {
     ).resolves.toMatchObject({ id: 'acc-1' });
     await expect(
       service.getNextToken({ sessionKey: 'openai:user-1', model: 'gemini-2.5-flash' }),
-    ).resolves.toMatchObject({ id: 'acc-2' });
+    ).resolves.toMatchObject({ id: 'acc-1' });
     await expect(service.getNextToken({ model: 'gemini-2.5-flash' })).resolves.toMatchObject({
-      id: 'acc-1',
+      id: 'acc-2',
     });
   });
 
@@ -2486,4 +2486,3 @@ describe('AccountLeaseService parity scheduling replay', () => {
     expect(service.getInFlightWork('acc-1')).toBe(0);
   });
 });
-

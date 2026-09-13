@@ -404,6 +404,69 @@ describe('ProxyRetryPolicy', () => {
     ).toBe(false);
   });
 
+  it('does not dispatch a migration candidate when ownership is denied', async () => {
+    const { policy, accountLeaseService } = createPolicy();
+    const leaseService = accountLeaseService as any;
+    const releaseReservation = vi.fn();
+    leaseService.acquireAttemptLease = vi.fn().mockResolvedValue({
+      account: createToken('acc-2'),
+      generation: 1,
+      tableIncarnation: 1,
+      releaseReservation,
+    });
+    leaseService.getSessionBinding = vi.fn().mockReturnValue({
+      accountId: 'acc-1',
+      generation: 1,
+    });
+    leaseService.startSessionMigration = vi.fn().mockReturnValue(null);
+
+    const retryState = policy.createTokenRetryState();
+    retryState.attemptedAccountIds.add('acc-1');
+    retryState.migrationAuthorization = {
+      reason: 'quota-exhausted',
+      sessionKey: 'session-1',
+      expectedGeneration: 1,
+      expectedTableIncarnation: 1,
+      ownerRequestId: retryState.requestId,
+    };
+
+    await expect(policy.selectRetryToken(retryState, 'gemini-3-flash', 'session-1')).resolves.toBeNull();
+    expect(releaseReservation).toHaveBeenCalledOnce();
+  });
+
+  it('does not migrate a committed session after a transient upstream failure', async () => {
+    const { policy, accountLeaseService } = createPolicy();
+    const leaseService = accountLeaseService as any;
+    const retryState = policy.createTokenRetryState();
+
+    await expect(
+      policy.applyUpstreamPenalty(
+        'acc-1',
+        'gemini-3-flash',
+        new UpstreamRequestError({ status: 503, reason: 'upstream_error' }),
+        retryState,
+      ),
+    ).resolves.toBe(true);
+    expect(retryState.migrationAuthorization).toBeUndefined();
+
+    const releaseReservation = vi.fn();
+    leaseService.acquireAttemptLease = vi.fn().mockResolvedValue({
+      account: createToken('acc-2'),
+      generation: 1,
+      tableIncarnation: 1,
+      releaseReservation,
+    });
+    leaseService.getSessionBinding = vi.fn().mockReturnValue({
+      accountId: 'acc-1',
+      generation: 1,
+    });
+    retryState.attemptedAccountIds.add('acc-1');
+
+    await expect(policy.selectRetryToken(retryState, 'gemini-3-flash', 'session-1')).resolves.toBeNull();
+    expect(leaseService.startSessionMigration).toBeUndefined();
+    expect(releaseReservation).toHaveBeenCalledOnce();
+  });
+
   it.each([401, 403, 429, 500, 503])(
     'keeps retry eligibility for upstream status %i',
     async (status) => {

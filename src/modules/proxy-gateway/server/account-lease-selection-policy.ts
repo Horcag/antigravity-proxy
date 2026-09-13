@@ -222,29 +222,24 @@ export class AccountLeaseSelectionPolicy {
     if (!sessionKey || !accountId) {
       return false;
     }
-    // Hard session bindings are ONLY for verified session keys (Gate 9, T12-F04)
     if (!isVerifiedSessionKey(sessionKey)) {
       if (isHintSessionKey(sessionKey)) {
         this.recordCacheHint(sessionKey, accountId, Math.max(0, expiresAt - Date.now()));
       }
       return false;
     }
-    // Strict incarnation fencing: if expectedIncarnation is provided, it must match current tableIncarnation!
     if (expectedIncarnation !== undefined && expectedIncarnation !== this.tableIncarnation) {
       return false;
     }
     const current = this.sessionBindings.get(sessionKey);
     const now = Date.now();
     if (current && current.expiresAt > now && current.tableIncarnation === this.tableIncarnation) {
-      // If session is currently migrating, ordinary bindSession must NOT overwrite it (T10-F03)
       if (current.state === 'migrating') {
         return false;
       }
-      // Strict version fencing: expected generation must match current generation
       if (expectedGeneration !== undefined && expectedGeneration !== current.generation) {
         return false;
       }
-      // Cannot flip an active binding to another account without explicit migration (Probe C26)
       if (expectedGeneration !== undefined && current.state === 'active' && current.accountId !== accountId) {
         return false;
       }
@@ -259,7 +254,6 @@ export class AccountLeaseSelectionPolicy {
       return true;
     }
 
-    // New binding or expired session re-binding initialization
     if (
       expectedGeneration !== undefined &&
       expectedGeneration !== 1 &&
@@ -315,7 +309,6 @@ export class AccountLeaseSelectionPolicy {
     // If currently migrating:
     if (current.state === 'migrating') {
       const isMigrationExpired = current.migrationExpiresAt ? now > current.migrationExpiresAt : false;
-      // Allow the same owner to update candidate if previous candidate failed during failover (A -> B -> C)
       if (current.migrationOwnerRequestId === ownerRequestId && current.generation === currentGeneration) {
         this.sessionBindings.set(sessionKey, {
           ...current,
@@ -332,7 +325,6 @@ export class AccountLeaseSelectionPolicy {
           targetAccountId,
         };
       }
-      // If previous migration expired/abandoned, allow new owner to take over
       if (isMigrationExpired) {
         const newGen = current.generation + 1;
         this.sessionBindings.set(sessionKey, {
@@ -353,7 +345,6 @@ export class AccountLeaseSelectionPolicy {
           targetAccountId,
         };
       }
-      // Active migration owned by another request; reject concurrent migration (Probe C05, C09)
       return null;
     }
 
@@ -449,23 +440,18 @@ export class AccountLeaseSelectionPolicy {
       return false;
     }
     const now = Date.now();
-    // Must be in migrating state (Probe C20)
     if (current.state !== 'migrating') {
       return false;
     }
-    // Migration must not be expired
     if (current.migrationExpiresAt && now > current.migrationExpiresAt) {
       return false;
     }
-    // Exact generation match
     if (current.generation !== expectedGeneration) {
       return false;
     }
-    // Candidate account must equal requested target (Probe C07, C21)
     if (current.migratingToAccountId !== targetAccountId) {
       return false;
     }
-    // Owner request ID must be present and match exactly (Probe C08, C22)
     if (current.migrationOwnerRequestId !== ownerRequestId) {
       return false;
     }
@@ -483,11 +469,27 @@ export class AccountLeaseSelectionPolicy {
     return true;
   }
 
+  abortSessionMigration(sessionKey: string | undefined, expectedGeneration: number, ownerRequestId?: string, expectedIncarnation?: number): boolean {
+    if (!sessionKey || !ownerRequestId || !isVerifiedSessionKey(sessionKey)) return false;
+    if (expectedIncarnation !== undefined && expectedIncarnation !== this.tableIncarnation) return false;
+    const current = this.sessionBindings.get(sessionKey);
+    if (!current || current.state !== 'migrating' || current.tableIncarnation !== this.tableIncarnation ||
+      current.generation !== expectedGeneration || current.migrationOwnerRequestId !== ownerRequestId) {
+      return false;
+    }
+    this.sessionBindings.set(sessionKey, { ...current, state: 'active', migratingToAccountId: undefined,
+      migrationOwnerRequestId: undefined, migrationExpiresAt: undefined, lastActivityAt: Date.now() });
+    return true;
+  }
+
   private collectEligibleTokens<T>(
     allTokens: Array<AccountLeaseSelectionEntry<T>>,
     request: AccountLeaseSelectionRequest<T>,
     now: number,
   ): Array<AccountLeaseSelectionEntry<T>> {
+
+
+
     const maxConcurrency = request.config.maxConcurrencyPerAccount ?? 8;
     return this.collectRateLimitEligibleTokens(allTokens, request).filter(([accountId]) => {
       const cooldownUntil = request.accountCooldowns.get(accountId);
@@ -550,13 +552,11 @@ export class AccountLeaseSelectionPolicy {
     if (isVerifiedSessionKey(sessionKey)) {
       const stickyBinding = this.getValidSessionBinding(sessionKey, now);
       if (stickyBinding) {
-        // In migrating state, do not speculatively route followers to unconfirmed migratingToAccountId
         const targetAccountId = stickyBinding.accountId;
         return candidates.find(([accountId]) => accountId === targetAccountId) ?? null;
       }
     }
 
-    // 2. Cache-hint placement locality (soft affinity, no migration state, bounded storage)
     if (isHintSessionKey(sessionKey)) {
       const hintAccountId = this.getCacheHint(sessionKey);
       if (hintAccountId) {
@@ -745,14 +745,6 @@ export class AccountLeaseSelectionPolicy {
       return null;
     }
 
-    const preferred = this.findPreferredToken(
-      availableTokens,
-      request.config.preferredAccountId,
-    );
-    if (preferred) {
-      return preferred;
-    }
-
     const stickyToken = this.findStickySessionToken(
       availableTokens,
       request.sessionKey,
@@ -762,6 +754,14 @@ export class AccountLeaseSelectionPolicy {
       return stickyToken;
     }
 
+    const preferred = this.findPreferredToken(
+      availableTokens,
+      request.config.preferredAccountId,
+    );
+    if (preferred) {
+      return preferred;
+    }
+
     return this.pickRoundRobinEntry(availableTokens);
   }
 
@@ -769,20 +769,18 @@ export class AccountLeaseSelectionPolicy {
     request: AccountLeaseSelectionRequest<T>,
   ): Promise<AccountLeaseSelectionEntry<T> | null> {
     const availableTokens = this.collectEligibleTokens(request.allTokens, request, request.now);
+    const stickyToken = this.findStickySessionToken(
+      availableTokens,
+      request.sessionKey,
+      request.now,
+    );
+    if (stickyToken) {
+      return stickyToken;
+    }
+
     const preferred = this.findPreferredToken(availableTokens, request.config.preferredAccountId);
     if (preferred) {
       return preferred;
-    }
-
-    if (request.config.schedulingMode !== 'balance') {
-      const stickyToken = this.findStickySessionToken(
-        availableTokens,
-        request.sessionKey,
-        request.now,
-      );
-      if (stickyToken) {
-        return stickyToken;
-      }
     }
 
     if (request.config.schedulingMode === 'performance-first') {
@@ -869,14 +867,6 @@ export class AccountLeaseSelectionPolicy {
       return null;
     }
 
-    const preferred = this.findPreferredToken(
-      candidateAccountPool,
-      request.config.preferredAccountId,
-    );
-    if (preferred) {
-      return preferred[0];
-    }
-
     const stickyToken = this.findStickySessionToken(
       candidateAccountPool,
       request.sessionKey,
@@ -884,6 +874,14 @@ export class AccountLeaseSelectionPolicy {
     );
     if (stickyToken) {
       return stickyToken[0];
+    }
+
+    const preferred = this.findPreferredToken(
+      candidateAccountPool,
+      request.config.preferredAccountId,
+    );
+    if (preferred) {
+      return preferred[0];
     }
 
     return this.peekRoundRobinCandidateAccountId(candidateAccountPool);
@@ -897,20 +895,18 @@ export class AccountLeaseSelectionPolicy {
       return null;
     }
 
+    const stickyToken = this.findStickySessionToken(
+      availableTokens,
+      request.sessionKey,
+      request.now,
+    );
+    if (stickyToken) {
+      return stickyToken[0];
+    }
+
     const preferred = this.findPreferredToken(availableTokens, request.config.preferredAccountId);
     if (preferred) {
       return preferred[0];
-    }
-
-    if (request.config.schedulingMode !== 'balance') {
-      const stickyToken = this.findStickySessionToken(
-        availableTokens,
-        request.sessionKey,
-        request.now,
-      );
-      if (stickyToken) {
-        return stickyToken[0];
-      }
     }
 
     if (request.config.schedulingMode === 'performance-first') {
@@ -959,4 +955,6 @@ export class AccountLeaseSelectionPolicy {
       }
     }
   }
+
+
 }
