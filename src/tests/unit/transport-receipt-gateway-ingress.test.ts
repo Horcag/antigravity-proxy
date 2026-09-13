@@ -88,7 +88,7 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
     });
   });
 
-  it('ingress logs the original gateway cause and waits for its own error response finish', async () => {
+  it('ingress logs only a safe gateway classification and waits for its own error response finish', async () => {
     const ingress = new ConnectIngressService();
     const server = new EventEmitter() as any;
     server.on = vi.fn(EventEmitter.prototype.on.bind(server));
@@ -105,7 +105,10 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
 
     listener(request('daily-cloudcode-pa.googleapis.com'), res);
     await new Promise(resolve => setImmediate(resolve));
-    expect(error).toHaveBeenCalledWith(expect.any(String), cause);
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining('connect_ingress_gateway_failure'),
+    );
+    expect(String(error.mock.calls[0][0])).not.toContain(cause.message);
     expect(info).not.toHaveBeenCalled();
     res.emit('finish');
 
@@ -114,6 +117,85 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
       receiptId: 'transferred', classification: 'internal_error', result: 'committed', downstreamCommitCount: 1,
     });
     ingress.close();
+  });
+
+  it('transfers a validated upstream writeHead failure to ingress and terminates its receipt', async () => {
+    const ingress = new ConnectIngressService();
+    const server = new EventEmitter() as any;
+    server.on = vi.fn(EventEmitter.prototype.on.bind(server));
+    ingress.attach(server);
+    const leases: any = { getNextToken: vi.fn() };
+    const gateway = new CloudCodeFailoverGateway(leases);
+    (ingress as any).failoverGateway = gateway;
+    const account = {
+      id: 'account', provider: 'google', email: 'account@example.test', is_active: true,
+      created_at: Date.now(), last_used: Date.now(),
+      token: { access_token: 'token', refresh_token: 'refresh', token_type: 'Bearer', expires_in: 3600, expiry_timestamp: Date.now() + 3600, project_id: 'project' },
+    };
+    leases.getNextToken.mockResolvedValue(account);
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async () => {
+      const bodyStream = new PassThrough();
+      queueMicrotask(() => bodyStream.end(Buffer.from('{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}')));
+      return { statusCode: 200, headers: { 'content-type': 'application/json' }, bodyStream };
+    });
+    const res = response();
+    res.writeHead
+      .mockImplementationOnce(() => { throw new Error('upstream response headers failed'); })
+      .mockImplementation(() => { res.headersSent = true; });
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const listener = (ingress as any).h2Server.listeners('request')[0];
+
+    listener(request('daily-cloudcode-pa.googleapis.com'), res);
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(res.writeHead).toHaveBeenNthCalledWith(1, 200, expect.anything());
+    expect(res.writeHead).toHaveBeenNthCalledWith(2, 502, expect.anything());
+    expect(info).not.toHaveBeenCalled();
+    res.emit('finish');
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({
+      classification: 'internal_error', result: 'committed', downstreamCommitCount: 1,
+    });
+    ingress.close();
+  });
+
+  it.each([
+    ['affinity owner expiry', (leases: any) => {
+      const controller = new AbortController();
+      controller.abort();
+      leases.acquireAttemptLease = vi.fn(async () => ({
+        account: { id: 'account', provider: 'google' }, generation: 1,
+        releaseReservation: vi.fn(), affinityAbortSignal: controller.signal,
+      }));
+    }],
+    ['migration denial', (leases: any) => {
+      leases.acquireAttemptLease = vi.fn(async () => ({
+        account: { id: 'account-2', provider: 'google' }, generation: 1,
+        tableIncarnation: 1, releaseReservation: vi.fn(),
+      }));
+      leases.getSessionBinding = vi.fn(() => ({ accountId: 'account-1', generation: 1, tableIncarnation: 1 }));
+      leases.authorizeBoundSessionMigration = vi.fn((_sessionKey: string, _model: string, requestId: string) => ({
+        reason: 'quota-exhausted', sessionKey: 'session-1', expectedGeneration: 1,
+        expectedTableIncarnation: 1, ownerRequestId: requestId,
+      }));
+      leases.startSessionMigration = vi.fn(() => null);
+    }],
+  ])('commits an unavailable receipt for %s', async (_caseName, configureLeases) => {
+    const leases: any = {};
+    configureLeases(leases);
+    const gateway = new CloudCodeFailoverGateway(leases);
+    const req = request('daily-cloudcode-pa.googleapis.com');
+    if (_caseName === 'migration denial') req.headers['x-session-id'] = 'session-1';
+    const res = response();
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+
+    await gateway.handleRequest(req, res);
+    expect(res.writeHead).toHaveBeenCalledWith(503, expect.anything());
+    res.emit('finish');
+    expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({
+      classification: 'unavailable', result: 'committed', downstreamCommitCount: 1,
+    });
   });
 
   it('propagates a deadline response write failure after body buffering exits through client abort', async () => {

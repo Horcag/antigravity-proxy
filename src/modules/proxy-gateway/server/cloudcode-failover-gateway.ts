@@ -142,7 +142,7 @@ export class CloudCodeFailoverGateway {
     let activeStopCandidateRenewal: (() => void) | undefined; let activeAbortMigration: (() => void) | undefined;
     let currentUpstreamReq: http.ClientRequest | undefined;
     let currentUpstreamRes: http.IncomingMessage | undefined;
-    let responseCommitted = false; let exhaustedByUnavailable = false;
+    let responseCommitted = false; let upstreamResponseSelected = false; let exhaustedByUnavailable = false;
     const cleanupActiveAttempt = (completePlacement = true) => {
       if (activeStopCandidateRenewal) { activeStopCandidateRenewal(); activeStopCandidateRenewal = undefined; }
       if (activeReleaseReservation) { activeReleaseReservation(); activeReleaseReservation = undefined; }
@@ -164,8 +164,7 @@ export class CloudCodeFailoverGateway {
       affinityOwnerExpired = true;
       requestAbortController.abort(); clearLogicalDeadline(); cleanupActiveAttempt(false); destroyActiveUpstream();
       if (!responseCommitted && !res.headersSent && !res.writableEnded && !res.destroyed) {
-        responseCommitted = true;
-        this.writeHeaders(res, 503, { 'content-type': 'application/json' });
+        receiptOwner.expectDownstreamCommit('unavailable'); this.writeHeaders(res, 503, { 'content-type': 'application/json' }); responseCommitted = true;
         res.end(JSON.stringify({ error: { code: 503, status: 'UNAVAILABLE', message: 'Session affinity owner expired' } }));
       } else if (!res.writableEnded && !res.destroyed) res.destroy();
     };
@@ -410,8 +409,7 @@ export class CloudCodeFailoverGateway {
       if (needsMigration && !migrationCapability) {
         cleanupActiveAttempt();
         if (!responseCommitted && !res.writableEnded) {
-          responseCommitted = true;
-          this.writeHeaders(res, 503, { 'content-type': 'application/json' });
+          receiptOwner.expectDownstreamCommit('unavailable'); this.writeHeaders(res, 503, { 'content-type': 'application/json' }); responseCommitted = true;
           res.end(JSON.stringify({
             error: {
               code: 503,
@@ -985,10 +983,9 @@ export class CloudCodeFailoverGateway {
                 }
               }
             }
-            activeCompleteAffinityPlacement?.('committed'); activeCompleteAffinityPlacement = undefined; responseCommitted = true;
-            receiptOwner.expectDownstreamCommit('validated_response');
-            stopCandidateRenewal();
-            this.writeHeaders(res, statusCode, headers);
+            activeCompleteAffinityPlacement?.('committed'); activeCompleteAffinityPlacement = undefined; upstreamResponseSelected = true;
+            receiptOwner.expectDownstreamCommit('validated_response'); stopCandidateRenewal();
+            this.writeHeaders(res, statusCode, headers); responseCommitted = true;
             break;
           }
         }
@@ -1069,12 +1066,12 @@ export class CloudCodeFailoverGateway {
         clearLogicalDeadline();
         cleanupActiveAttempt();
         return;
-      } catch {
+      } catch (err) {
         cleanupActiveAttempt();
         if (deadlineWriteFailure) throw deadlineWriteFailure;
-        if (responseCommitted) {
-          return;
-        }
+        if (err instanceof GatewayReceiptTransferError) throw err;
+        if (upstreamResponseSelected && !responseCommitted) throw new GatewayReceiptTransferError(receiptOwner, err);
+        if (responseCommitted) return;
         logger.warn(
           `[CloudCodeGateway] Upstream network error: operation=upstream_request reason=network_error attempt=${attempt}/${maxAttempts}`,
         );

@@ -153,9 +153,7 @@ export class ProxyRetryPolicy {
     this.releaseReservation(retryState); this.abortAffinityPlacement(retryState);
     retryState.sessionKey = sessionKey;
     retryState.migrationAuthorization ??= this.accountLeaseService.authorizeBoundSessionMigration?.(sessionKey, model, retryState.requestId);
-    const initialBinding = sessionKey && typeof this.accountLeaseService.getSessionBinding === 'function'
-        ? this.accountLeaseService.getSessionBinding(sessionKey)
-        : null;
+    const initialBinding = sessionKey && typeof this.accountLeaseService.getSessionBinding === 'function' ? this.accountLeaseService.getSessionBinding(sessionKey) : null;
     let selectedAccount: CloudAccount | null = null;
     if (this.accountLeaseService.acquireAttemptLease) {
       const lease = await this.accountLeaseService.acquireAttemptLease({
@@ -221,17 +219,21 @@ export class ProxyRetryPolicy {
       this.releaseReservation(retryState);
       return null;
     }
+    const currentBinding = sessionKey && typeof this.accountLeaseService.getSessionBinding === 'function'
+      ? this.accountLeaseService.getSessionBinding(sessionKey)
+      : initialBinding;
+    if (retryState.migrationAuthorization && !authorizesMigration(retryState.migrationAuthorization, sessionKey, currentBinding, retryState.requestId)) retryState.migrationAuthorization = undefined;
     const needsMigration = Boolean(
       sessionKey &&
       isVerifiedSessionKey(sessionKey) &&
       selectedAccount &&
-      initialBinding &&
-      initialBinding.accountId !== selectedAccount.id,
+      currentBinding &&
+      currentBinding.accountId !== selectedAccount.id,
     );
     const migrationAuthorized = authorizesMigration(
       retryState.migrationAuthorization,
       sessionKey,
-      initialBinding,
+      currentBinding,
       retryState.requestId,
     );
     if (needsMigration && !migrationAuthorized) {
@@ -249,10 +251,7 @@ export class ProxyRetryPolicy {
       needsMigration &&
       typeof this.accountLeaseService.startSessionMigration === 'function'
     ) {
-      const currentGen =
-        retryState.sessionGeneration ??
-        initialBinding?.generation ??
-        1;
+      const currentGen = retryState.sessionGeneration ?? currentBinding?.generation ?? 1;
       const migrationCap = this.accountLeaseService.startSessionMigration(
         sessionKey,
         currentGen,

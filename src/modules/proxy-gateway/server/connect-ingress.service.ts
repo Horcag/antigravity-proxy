@@ -3,6 +3,7 @@ import http from 'node:http';
 import http2 from 'node:http2';
 import net from 'node:net';
 import { logger } from '../../../shared/logging/logger';
+import { formatSafeEvent } from '../../../shared/logging/safe-event';
 import { CaManager } from './cert/ca-manager';
 import { CloudCodeFailoverGateway, GatewayReceiptTransferError } from './cloudcode-failover-gateway';
 import { AnonymousTransportReceiptOwner } from './anonymous-transport-receipt';
@@ -230,8 +231,9 @@ export class ConnectIngressService {
       },
       (req, res) => {
         this.failoverGateway.handleRequest(req, res).catch((err: unknown) => {
-          const originalCause = err instanceof GatewayReceiptTransferError ? err.originalCause : err;
-          logger.error('[ConnectIngress] Error processing request in transparent gateway', originalCause);
+          logger.error(formatSafeEvent('connect_ingress_gateway_failure', {
+            classification: err instanceof GatewayReceiptTransferError ? 'receipt_transfer' : 'gateway_failure',
+          }, ['classification']));
           const receiptOwner = err instanceof GatewayReceiptTransferError
             ? err.receiptOwner
             : new AnonymousTransportReceiptOwner(crypto.randomUUID());
