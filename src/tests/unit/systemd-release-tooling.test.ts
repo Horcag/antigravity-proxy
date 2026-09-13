@@ -210,7 +210,7 @@ describe('systemd release tooling', { timeout: 60_000 }, () => {
     expect(unit).toContain('Group=antigravity-proxy');
     expect(unit).not.toContain('/usr/bin/node');
     const library = readFileSync(releaseLibrary, 'utf8');
-    expect(library).toContain('npm ci --prefix "$staging_fs" --omit=dev');
+    expect(library).toContain('"$npm_binary" ci --prefix "$staging_fs" --omit=dev');
     expect(library).not.toContain('npm ci --prefix "$staging_fs" --omit=dev --ignore-scripts');
     expect(library).toContain('release_runtime_probe');
     expect(readFileSync(probeLog, 'utf8')).toContain(`uid=${process.getuid?.()} command=`);

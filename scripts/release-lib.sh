@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Shared primitives for the systemd release scripts. This file is sourced, not executed.
+# shellcheck source=scripts/release-runtime-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/release-runtime-lib.sh"
+
 
 release_init() {
   project_dir="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -66,11 +69,7 @@ release_init() {
   require_absolute_path "$release_lock_file" RELEASE_LOCK_FILE
   validate_release_id "$release_id"
   case "$bundle_node" in 0|1) ;; *) die "BUNDLE_NODE must be 0 or 1" ;; esac
-  node_binary="${NODE_BINARY:-$(command -v node || true)}"
-  [ -n "$node_binary" ] || die "Node runtime not found; set NODE_BINARY to an executable absolute path"
-  require_absolute_path "$node_binary" NODE_BINARY
-  [ -x "$node_binary" ] || die "NODE_BINARY is not executable: $node_binary"
-  node_binary="$(readlink -f "$node_binary")"
+  resolve_release_runtime
 
   releases_dir="$install_root/releases"
   current_link="$install_root/current"
@@ -616,8 +615,9 @@ create_release() {
     chown "$release_operator:$operator_group" "$staging_fs"
     runuser -u "$release_operator" -- env \
       HOME="$(getent passwd "$release_operator" | cut -d: -f6)" \
+      PATH="$node_runtime_bin:/usr/local/bin:/usr/bin:/bin" \
       npm_config_cache="$staging_fs/.npm-cache" \
-      npm ci --prefix "$staging_fs" --omit=dev
+      "$npm_binary" ci --prefix "$staging_fs" --omit=dev
   fi
   if [ "$bundle_node" = 1 ]; then
     install -D -m 0755 "$node_binary" "$staging_fs/bin/node"
