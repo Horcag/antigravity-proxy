@@ -16,7 +16,7 @@ import { authorizesMigration, createMigrationAuthorization, safeAffinityCommitRe
 import { extractModelName, extractSessionKey, isReplaySafeOperation, composeAttemptRequest, preflightValidateJsonRequest } from './cloudcode-request-adapter';
 import { classifyUpstreamFailure, type FailureEvidence } from './upstream-failure';
 import { evaluateRetryDecision } from './upstream-retry-decision';
-import { logUpstreamFailure } from './cloudcode-diagnostics';
+import { logUpstreamFailure, sanitizeLogString } from './cloudcode-diagnostics';
 import { formatTerminalDownstreamError } from './cloudcode-terminal-response';
 export { isVerifiedSessionKey, isHintSessionKey };
 export type ProtocolFailureCategory = 'inspection-limit' | 'unsupported-encoding' | 'malformed-upstream-message' | 'deadline-exceeded' | 'account-quota' | 'upstream-transient';
@@ -64,7 +64,10 @@ export class CloudCodeFailoverGateway {
     };
     const writeDownstream = (classification: Parameters<AnonymousTransportReceiptOwner['expectDownstreamCommit']>[0], statusCode: number, headers: http.IncomingHttpHeaders, body?: string | Buffer): boolean => {
       let s = statusCode, h = headers, b = body;
-      if (statusCode >= 400) { const f = formatTerminalDownstreamError(req, statusCode, headers, body); s = f.statusCode; h = f.headers; b = f.body; }
+      if (statusCode >= 400 || (headers['grpc-status'] !== undefined && String(headers['grpc-status']) !== '0')) {
+        const f = formatTerminalDownstreamError(req, statusCode, headers, body);
+        s = f.statusCode; h = f.headers; b = f.body;
+      }
       writeDownstreamHeaders(classification, s, h); return endDownstream(b);
     };
     const writeDownstreamChunk = (chunk: Buffer): boolean => {
@@ -108,8 +111,8 @@ export class CloudCodeFailoverGateway {
     let clientAborted = false, affinityOwnerExpired = false;
     let activeReleaseReservation: (() => void) | undefined; let activeCompleteAffinityPlacement: ((outcome: 'aborted' | 'committed') => void) | undefined;
     let activeStopCandidateRenewal: (() => void) | undefined; let activeAbortMigration: (() => void) | undefined;
-    let currentUpstreamReq: http.ClientRequest | undefined;
-    let currentUpstreamRes: http.IncomingMessage | undefined;
+    let currentUpstreamReq: http.ClientRequest | null = null;
+    let currentUpstreamRes: http.IncomingMessage | null = null;
     let upstreamResponseSelected = false; let exhaustedByUnavailable = false;
     const cleanupActiveAttempt = (completePlacement = true) => {
       if (activeStopCandidateRenewal) { activeStopCandidateRenewal(); activeStopCandidateRenewal = undefined; }
@@ -250,8 +253,10 @@ export class CloudCodeFailoverGateway {
     let migrationCapability: MigrationCapability | null = null;
     let attemptGeneration = 1;
     let attemptTableIncarnation: number | undefined;
+    let leaseRetainedForSameAccount = false;
 
     const releaseActiveLease = () => {
+      leaseRetainedForSameAccount = false;
       if (activeLease) {
         cleanupActiveAttempt();
         activeLease = null;
@@ -259,6 +264,8 @@ export class CloudCodeFailoverGateway {
     };
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      currentUpstreamReq = null;
+      currentUpstreamRes = null;
       if (clientAborted || affinityOwnerExpired || res.destroyed) {
         releaseActiveLease();
         return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
@@ -321,87 +328,57 @@ export class CloudCodeFailoverGateway {
         activeReleaseReservation = activeLease?.releaseReservation;
         activeCompleteAffinityPlacement = activeLease?.completeAffinityPlacement;
         if (activeLease?.affinityAbortSignal?.aborted) { abortExpiredAffinityOwner(); return; }
-        activeLease?.affinityAbortSignal?.addEventListener('abort', abortExpiredAffinityOwner, { once: true });
-        const initialBinding =
-          sessionKey && typeof this.accountLeaseService?.getSessionBinding === 'function'
-            ? this.accountLeaseService.getSessionBinding(sessionKey)
-            : null;
-        attemptGeneration = activeLease?.generation ?? initialBinding?.generation ?? 1;
-        attemptTableIncarnation = activeLease?.tableIncarnation ?? initialBinding?.tableIncarnation;
-        migrationCapability = null;
-        const needsMigration = Boolean(
-          sessionKey &&
-          isVerifiedSessionKey(sessionKey) &&
-          activeLease?.account &&
-          initialBinding &&
-          initialBinding.accountId !== activeLease.account.id,
-        );
-        if (
-          authorizesMigration(migrationAuthorization, sessionKey, initialBinding, requestId) &&
-          needsMigration &&
-          sessionKey &&
-          isVerifiedSessionKey(sessionKey) &&
-          activeLease?.account &&
-          typeof this.accountLeaseService?.startSessionMigration === 'function'
-        ) {
-          migrationCapability = this.accountLeaseService.startSessionMigration(
-            sessionKey,
-            attemptGeneration,
-            activeLease.account.id,
-            requestId,
-            attemptTableIncarnation,
+        if (!leaseRetainedForSameAccount) {
+          activeLease?.affinityAbortSignal?.addEventListener('abort', abortExpiredAffinityOwner, { once: true });
+          const initialBinding =
+            sessionKey && typeof this.accountLeaseService?.getSessionBinding === 'function'
+              ? this.accountLeaseService.getSessionBinding(sessionKey)
+              : null;
+          attemptGeneration = activeLease?.generation ?? initialBinding?.generation ?? 1;
+          attemptTableIncarnation = activeLease?.tableIncarnation ?? initialBinding?.tableIncarnation;
+          migrationCapability = null;
+          const needsMigration = Boolean(
+            sessionKey && isVerifiedSessionKey(sessionKey) && activeLease?.account &&
+            initialBinding && initialBinding.accountId !== activeLease.account.id,
           );
-          if (migrationCapability) {
-            attemptGeneration = migrationCapability.generation;
+          if (
+            authorizesMigration(migrationAuthorization, sessionKey, initialBinding, requestId) &&
+            needsMigration && sessionKey && isVerifiedSessionKey(sessionKey) && activeLease?.account &&
+            typeof this.accountLeaseService?.startSessionMigration === 'function'
+          ) {
+            migrationCapability = this.accountLeaseService.startSessionMigration(
+              sessionKey, attemptGeneration, activeLease.account.id, requestId, attemptTableIncarnation,
+            );
+            if (migrationCapability) {
+              attemptGeneration = migrationCapability.generation;
+              const cap = migrationCapability;
+              activeAbortMigration = () => {
+                this.accountLeaseService?.abortSessionMigration?.(cap.sessionKey, cap.generation, cap.ownerRequestId, cap.tableIncarnation);
+              };
+            }
+          }
+          if (needsMigration && !migrationCapability) {
+            releaseActiveLease();
+            if (!responseCommitted && !res.writableEnded) {
+              writeDownstream('unavailable', 503, { 'content-type': 'application/json' },
+                JSON.stringify({ error: { code: 503, message: 'Session affinity migration was denied', status: 'UNAVAILABLE' } }));
+            }
+            return;
+          }
+          let candidateRenewalTimer: NodeJS.Timeout | null = null;
+          if (sessionKey && isVerifiedSessionKey(sessionKey) && migrationCapability) {
             const cap = migrationCapability;
-            activeAbortMigration = () => {
-              this.accountLeaseService?.abortSessionMigration?.(
-                cap.sessionKey,
-                cap.generation,
-                cap.ownerRequestId,
-                cap.tableIncarnation,
-              );
-            };
+            candidateRenewalTimer = setInterval(() => {
+              try {
+                const renewed = this.accountLeaseService?.renewSessionMigration?.(sessionKey, cap.generation, requestId, 30000, cap.tableIncarnation);
+                if (renewed === false) logger.warn('[CloudCodeGateway] Candidate migration renewal rejected');
+              } catch { /* empty */ }
+            }, 15000);
+            candidateRenewalTimer.unref?.();
           }
+          activeStopCandidateRenewal = () => { if (candidateRenewalTimer) { clearInterval(candidateRenewalTimer); candidateRenewalTimer = null; } };
         }
-        if (needsMigration && !migrationCapability) {
-          releaseActiveLease();
-          if (!responseCommitted && !res.writableEnded) {
-            writeDownstream('unavailable', 503, { 'content-type': 'application/json' }, JSON.stringify({
-              error: {
-                code: 503,
-                message: 'Session affinity migration was denied',
-                status: 'UNAVAILABLE',
-              },
-            }));
-          }
-          return;
-        }
-        let candidateRenewalTimer: NodeJS.Timeout | null = null;
-        if (sessionKey && isVerifiedSessionKey(sessionKey) && migrationCapability) {
-          const cap = migrationCapability;
-          candidateRenewalTimer = setInterval(() => {
-            try {
-              const renewed = this.accountLeaseService?.renewSessionMigration?.(
-                sessionKey,
-                cap.generation,
-                requestId,
-                30000,
-                cap.tableIncarnation,
-              );
-              if (renewed === false) {
-                logger.warn(
-                  '[CloudCodeGateway] Candidate migration renewal rejected',
-                );
-              }
-            } catch { /* empty */ }
-          }, 15000);
-          candidateRenewalTimer.unref?.();
-        }
-        const stopCandidateRenewal = () => {
-          if (candidateRenewalTimer) { clearInterval(candidateRenewalTimer); candidateRenewalTimer = null; }
-        };
-        activeStopCandidateRenewal = stopCandidateRenewal;
+        leaseRetainedForSameAccount = false;
 
         if (clientAborted || res.destroyed) {
           releaseActiveLease();
@@ -427,7 +404,7 @@ export class CloudCodeFailoverGateway {
           attempt,
         });
         logger.debug(
-          `[CloudCodeGateway] Attempt ${attempt} model=${effectiveModel || 'default'} operation=upstream_attempt`,
+          `[CloudCodeGateway] Attempt ${attempt} model=${sanitizeLogString(effectiveModel) || 'default'} operation=upstream_attempt`,
         );
 
         const handleFailureOutcome = async (
@@ -441,7 +418,7 @@ export class CloudCodeFailoverGateway {
             isReplaySafe, ambiguityProbesUsed, maxAmbiguityProbes: 1,
             projectCorrectionsUsed: accountProjectCorrectionsUsed, maxProjectCorrections: 1,
             quotaHeaderMode, hasAlternativeAccounts: attempt < maxAttempts, effectiveModel,
-            transientRetriesUsed,
+            transientRetriesUsed, maxTransientRetries: 1,
           });
 
           logUpstreamFailure({
@@ -457,16 +434,16 @@ export class CloudCodeFailoverGateway {
                   accountIdOrEmail: account.id, status: status >= 400 ? status : 429,
                   model: effectiveModel, body: failureEvidence.rawErrorText, headers: responseHeaders,
                   reason: decision.healthEffect.isQuota ? RateLimitReason.QuotaExhausted : RateLimitReason.RateLimitExceeded,
-                }).catch((err) => {
-                  logger.warn(`[CloudCodeGateway] Failed to record account error health effect: ${err instanceof Error ? err.message : String(err)}`);
+                }).catch(() => {
+                  logger.warn('[CloudCodeGateway] Failed to record account error health effect: health_effect_failed');
                 });
               } else if (decision.healthEffect.kind === 'credential-rejected') {
                 this.accountLeaseService.markAsForbidden?.(account.id);
               } else if (decision.healthEffect.kind === 'model-unrequestable') {
                 this.accountLeaseService.markModelUnrequestable?.(account.id, decision.healthEffect.effectiveModel);
               }
-            } catch (err) {
-              logger.warn(`[CloudCodeGateway] Failed to record account error health effect: ${err instanceof Error ? err.message : String(err)}`);
+            } catch {
+              logger.warn('[CloudCodeGateway] Failed to record account error health effect: health_effect_failed');
             }
           }
 
@@ -478,6 +455,7 @@ export class CloudCodeFailoverGateway {
                 `[CloudCodeGateway] Upstream project rejected (attempt ${attempt}/${maxAttempts}). Retrying without x-goog-user-project header on same account...`,
               );
             }
+            leaseRetainedForSameAccount = true;
             return 'continue';
           }
 
@@ -487,6 +465,7 @@ export class CloudCodeFailoverGateway {
             logger.warn(
               `[CloudCodeGateway] Upstream returned transient ${status} (attempt ${attempt}/${maxAttempts}). Retrying on same account...`,
             );
+            leaseRetainedForSameAccount = true;
             return 'continue';
           }
 
@@ -550,10 +529,13 @@ export class CloudCodeFailoverGateway {
           const isGrpc = headers['grpc-status'] !== undefined || String(headers['content-type'] || '').includes('application/grpc');
           const isSse = String(headers['content-type'] || '').includes('text/event-stream');
           const isJson = String(headers['content-type'] || '').includes('application/json');
+          const rawGrpcMsg = headers['grpc-message'];
+          const grpcMsg = Array.isArray(rawGrpcMsg) ? rawGrpcMsg.join(', ') : rawGrpcMsg ? String(rawGrpcMsg) : undefined;
           const evidence = classifyUpstreamFailure({
             statusCode,
             headers,
             bufferedBody,
+            errorText: isGrpc && grpcMsg ? grpcMsg : undefined,
             modelName: effectiveModel,
             urlPath: attemptUrlPath,
             source: isGrpc ? 'grpc' : isSse ? 'sse' : isJson ? 'json' : 'http',
@@ -565,15 +547,19 @@ export class CloudCodeFailoverGateway {
         const grpcStatus = headers['grpc-status'];
         if (grpcStatus !== undefined && String(grpcStatus) !== '0') {
           bodyStream.destroy();
+          const combinedHeaders = { ...headers, ...bodyStream.trailers };
+          const rawGrpcMsg = combinedHeaders['grpc-message'];
+          const grpcMsg = Array.isArray(rawGrpcMsg) ? rawGrpcMsg.join(', ') : rawGrpcMsg ? String(rawGrpcMsg) : undefined;
           const evidence = classifyUpstreamFailure({
             statusCode,
-            headers: { ...headers, ...bodyStream.trailers },
+            headers: combinedHeaders,
+            errorText: grpcMsg,
             modelName: effectiveModel,
             urlPath: attemptUrlPath,
             source: 'grpc',
           });
           const terminalStatus = evidence.httpStatus && evidence.httpStatus >= 400 ? evidence.httpStatus : 502;
-          const outcome = await handleFailureOutcome(evidence, terminalStatus, { ...headers, ...bodyStream.trailers });
+          const outcome = await handleFailureOutcome(evidence, terminalStatus, combinedHeaders);
           if (outcome === 'continue') continue;
           return;
         }
@@ -1024,12 +1010,12 @@ export class CloudCodeFailoverGateway {
         if (upstreamResponseSelected && !responseCommitted) throw new GatewayReceiptTransferError(receiptOwner, err);
         if (responseCommitted) { destroyActiveUpstream(); rejectAndTerminateDownstream(err); return; }
         if (!currentUpstreamReq) {
-          logger.warn(`[CloudCodeGateway] Preparation error before upstream dispatch: ${err instanceof Error ? err.message : String(err)}`);
+          logger.warn('[CloudCodeGateway] Preparation error before upstream dispatch: preparation_failed');
           writeDownstream('bad_gateway', 502, { 'content-type': 'application/json' },
             JSON.stringify({
               error: {
                 code: 502,
-                message: `Gateway preparation error: ${err instanceof Error ? err.message : 'Unknown error'}`,
+                message: 'Gateway preparation error: preparation_failed',
                 status: 'INTERNAL',
               },
             }));

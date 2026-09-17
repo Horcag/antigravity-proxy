@@ -66,7 +66,7 @@ export function evaluateRetryDecision(params: EvaluateRetryParams): RetryDecisio
     hasAlternativeAccounts,
     effectiveModel,
     transientRetriesUsed = 0,
-    maxTransientRetries = 0,
+    maxTransientRetries = 1,
   } = params;
 
   // Invariant 1: If response was already committed downstream, never retry or splice streams
@@ -157,6 +157,12 @@ export function evaluateRetryDecision(params: EvaluateRetryParams): RetryDecisio
       };
 
     case 'transient':
+      if (hasAlternativeAccounts) {
+        return {
+          action: { kind: 'migrate-account', reason: 'upstream-transient' },
+          healthEffect: { kind: 'none' },
+        };
+      }
       if (maxTransientRetries > 0 && transientRetriesUsed < maxTransientRetries) {
         return {
           action: { kind: 'retry-transient' },
@@ -164,9 +170,7 @@ export function evaluateRetryDecision(params: EvaluateRetryParams): RetryDecisio
         };
       }
       return {
-        action: hasAlternativeAccounts
-          ? { kind: 'migrate-account', reason: 'upstream-transient' }
-          : { kind: 'retry-transient' },
+        action: { kind: 'commit-error' },
         healthEffect: { kind: 'none' },
       };
 

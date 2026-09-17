@@ -120,6 +120,10 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
     errorText = decoded.text;
     decodeError = decoded.decodeError;
   }
+  if ((!errorText || !errorText.trim()) && headers['grpc-message']) {
+    const gm = headers['grpc-message'];
+    errorText = Array.isArray(gm) ? gm.join(', ') : String(gm);
+  }
 
   let rpcStatus: string | undefined;
   let errorInfoReason: string | undefined;
@@ -158,19 +162,36 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
     const code = String(grpcHeader);
     if (code === '3') {
       const isInvalid = hasFieldViolations ||
-        /field.*violation|syntax.*error|malformed json|unexpected token/i.test(errorText);
+        /field.*violation|syntax.*error|malformed json|unexpected token|missing.*field|field.*missing|missing.*required|required.*field/i.test(errorText) ||
+        /thought.*signature|signature.*required|image.*corrupt|unsupported.*mime|image.*decode|failed to decode image/i.test(errorText) ||
+        /file.*resource.*not found|cachedcontent.*not found|resource '?(?:files|cachedcontents)\//i.test(errorText);
       const cat = isInvalid ? 'invalid-request' : 'ambiguous-invalid-argument';
       const rule = isInvalid ? 'google.grpc.bad-request' : 'google.grpc.invalid-argument';
-      return makeEvidence(cat, rule, 'grpc', 400, 'INVALID_ARGUMENT',
-        buildSafeErrorMessage(cat, rule, 'INVALID_ARGUMENT', 400, errorInfoReason), errorText, false, isInvalid ? 'explicit' : 'unknown');
+      return makeEvidence(cat, rule, 'grpc', 400, 'INVALID_ARGUMENT', buildSafeErrorMessage(cat, rule, 'INVALID_ARGUMENT', 400, errorInfoReason), errorText, false, isInvalid ? 'explicit' : 'unknown');
     }
     if (code === '5') {
-      return makeEvidence('model-capability', 'google.grpc.not-found', 'grpc', 404, 'NOT_FOUND',
-        buildSafeErrorMessage('model-capability', 'google.grpc.not-found', 'NOT_FOUND', 404, errorInfoReason || modelName), errorText, false);
+      const isResourceNotFound = /file.*resource.*not found|cachedcontent.*not found|resource '?(?:files|cachedcontents)\/|file.*not found|cachedcontent/i.test(errorText);
+      if (isResourceNotFound) {
+        return makeEvidence('invalid-request', 'google.grpc.not-found.resource', 'grpc', 404, 'NOT_FOUND', buildSafeErrorMessage('invalid-request', 'google.grpc.not-found.resource', 'NOT_FOUND', 404, errorInfoReason), errorText, false, 'explicit');
+      }
+      const escapedModel = modelName ? escapeRegExp(modelName) : '';
+      const mentionsModel = errorInfoReason === 'MODEL_NOT_FOUND' || errorInfoReason === 'MODEL_DEPRECATED' || /models\//i.test(errorText) ||
+        /model.*not found|unsupported model|model not supported|model does not exist/i.test(errorText) ||
+        (Boolean(escapedModel) && (new RegExp(`models/${escapedModel}`, 'i').test(errorText) || new RegExp(`model ['"]?${escapedModel}['"]?`, 'i').test(errorText)));
+      if (mentionsModel) {
+        return makeEvidence('model-capability', 'google.grpc.not-found', 'grpc', 404, 'NOT_FOUND', buildSafeErrorMessage('model-capability', 'google.grpc.not-found', 'NOT_FOUND', 404, errorInfoReason || modelName), errorText, false, 'explicit');
+      }
+      return makeEvidence('invalid-request', 'google.grpc.not-found', 'grpc', 404, 'NOT_FOUND', buildSafeErrorMessage('invalid-request', 'google.grpc.not-found', 'NOT_FOUND', 404, errorInfoReason), errorText, false, 'unknown');
     }
     if (code === '7') {
-      return makeEvidence('project-context', 'google.grpc.permission-denied', 'grpc', 403, 'PERMISSION_DENIED',
-        buildSafeErrorMessage('project-context', 'google.grpc.permission-denied', 'PERMISSION_DENIED', 403, errorInfoReason), errorText, false);
+      const isProjectEvidence = lowerText.includes('x-goog-user-project') || lowerText.includes('serviceusage.services.use') ||
+        lowerText.includes('quota project') || lowerText.includes('consumer project') || lowerText.includes('caller project') ||
+        lowerText.includes('permission to use this quota project') || lowerText.includes('permission to use quota project') ||
+        errorInfoDomain === 'serviceusage.googleapis.com' || errorInfoReason === 'USER_PROJECT_DENIED' || errorInfoReason === 'CONSUMER_INVALID' || errorInfoReason === 'SERVICE_DISABLED';
+      if (isProjectEvidence) {
+        return makeEvidence('project-context', 'google.grpc.permission-denied', 'grpc', 403, 'PERMISSION_DENIED', buildSafeErrorMessage('project-context', 'google.grpc.permission-denied', 'PERMISSION_DENIED', 403, errorInfoReason), errorText, false, 'explicit');
+      }
+      return makeEvidence('authentication', 'google.grpc.permission-denied', 'grpc', 403, 'PERMISSION_DENIED', buildSafeErrorMessage('authentication', 'google.grpc.permission-denied', 'PERMISSION_DENIED', 403, errorInfoReason), errorText, false, 'heuristic');
     }
     if (code === '8') {
       return makeEvidence('quota', 'google.grpc.resource-exhausted', 'grpc', 429, 'RESOURCE_EXHAUSTED',

@@ -1,5 +1,6 @@
 import type * as http from 'node:http';
 import type * as http2 from 'node:http2';
+import * as zlib from 'node:zlib';
 
 export interface FormattedTerminalError {
   statusCode: number;
@@ -25,10 +26,10 @@ const HTTP_TO_GRPC_STATUS: Record<number, string> = {
 
 /**
  * Format terminal downstream error headers and payload consistency:
- * 1. Strips content-encoding header (since error payload is plaintext/uncompressed).
+ * 1. Decompresses compressed bodies (gzip/deflate/br) into uncompressed text and strips content-encoding.
  * 2. Updates content-length to exact byte length of terminal payload.
- * 3. Frames SSE streams as `data: ${JSON.stringify(errorPayload)}\n\n` with text/event-stream content-type.
- * 4. Sets canonical gRPC status and message headers for native gRPC requests.
+ * 3. Frames SSE streams without double-wrapping existing SSE structures.
+ * 4. Sets canonical gRPC status and message headers with HTTP 200 for native gRPC requests.
  */
 export function formatTerminalDownstreamError(
   req: http.IncomingMessage | http2.Http2ServerRequest | { headers: http.IncomingHttpHeaders },
@@ -38,10 +39,35 @@ export function formatTerminalDownstreamError(
 ): FormattedTerminalError {
   const resultHeaders: http.IncomingHttpHeaders = { ...headers };
 
-  // 1. Strip content-encoding (error payloads are uncompressed)
+  // 1. Detect content-encoding, decompress body if compressed, then strip content-encoding header
+  let contentEncoding: string | undefined;
   for (const key of Object.keys(resultHeaders)) {
     if (key.toLowerCase() === 'content-encoding') {
+      contentEncoding = String(resultHeaders[key] || '').toLowerCase();
       delete resultHeaders[key];
+    }
+  }
+
+  let terminalBody: string | Buffer | undefined = body;
+  const bodyBuf = Buffer.isBuffer(terminalBody)
+    ? terminalBody
+    : typeof terminalBody === 'string'
+      ? Buffer.from(terminalBody, 'utf-8')
+      : undefined;
+
+  if (bodyBuf && bodyBuf.length > 0) {
+    const isGzipMagic = bodyBuf.length >= 2 && bodyBuf[0] === 0x1f && bodyBuf[1] === 0x8b;
+    const enc = contentEncoding || (isGzipMagic ? 'gzip' : '');
+    try {
+      if (enc.includes('gzip') || isGzipMagic) {
+        terminalBody = zlib.gunzipSync(bodyBuf).toString('utf-8');
+      } else if (enc.includes('deflate')) {
+        terminalBody = zlib.inflateSync(bodyBuf).toString('utf-8');
+      } else if (enc.includes('br')) {
+        terminalBody = zlib.brotliDecompressSync(bodyBuf).toString('utf-8');
+      }
+    } catch {
+      // Decompression fallback: retain original body if decompression fails
     }
   }
 
@@ -51,15 +77,13 @@ export function formatTerminalDownstreamError(
   const resContentType = String(resultHeaders['content-type'] || '').toLowerCase();
 
   const isSse = reqAccept.includes('text/event-stream') || resContentType.includes('text/event-stream');
-  const isGrpc =
-    reqContentType.includes('application/grpc') ||
-    resContentType.includes('application/grpc') ||
-    resultHeaders['grpc-status'] !== undefined;
+  const isGrpc = reqContentType.includes('application/grpc');
 
-  let terminalBody = body;
+  let terminalStatusCode = statusCode;
 
   if (isGrpc) {
-    // Native gRPC error framing
+    // Native gRPC error framing: must return HTTP 200 with grpc-status and grpc-message
+    terminalStatusCode = 200;
     let grpcStatus = resultHeaders['grpc-status'];
     if (grpcStatus === undefined || String(grpcStatus) === '0') {
       grpcStatus = HTTP_TO_GRPC_STATUS[statusCode] || '13';
@@ -69,32 +93,55 @@ export function formatTerminalDownstreamError(
       resultHeaders['grpc-message'] = String(resultHeaders['grpc-status-details-bin'] || `HTTP_${statusCode}`);
     }
     resultHeaders['content-type'] = 'application/grpc';
+    terminalBody = Buffer.alloc(0);
+    resultHeaders['content-length'] = '0';
   } else if (isSse) {
     // SSE stream framing: data: {...}\n\n
-    let errorPayload: Record<string, unknown>;
-    const rawText = typeof body === 'string' ? body : Buffer.isBuffer(body) ? body.toString('utf-8') : '';
+    let errorPayload: Record<string, unknown> | null = null;
+    const rawText = typeof terminalBody === 'string' ? terminalBody : Buffer.isBuffer(terminalBody) ? terminalBody.toString('utf-8') : '';
+    const trimmed = rawText.trim();
 
-    if (rawText.trim().startsWith('{')) {
+    if (trimmed.startsWith('data:')) {
+      const dataPayload = trimmed.slice(5).trim();
+      if (dataPayload.startsWith('{')) {
+        try {
+          const parsed = JSON.parse(dataPayload);
+          if (parsed && typeof parsed === 'object') {
+            errorPayload = (parsed as Record<string, unknown>).error
+              ? (parsed as Record<string, unknown>)
+              : { error: parsed };
+          }
+        } catch { /* not valid JSON, preserve framing */ }
+      }
+      if (errorPayload) {
+        terminalBody = `data: ${JSON.stringify(errorPayload)}\n\n`;
+      } else {
+        terminalBody = trimmed.endsWith('\n\n') ? trimmed : `${trimmed}\n\n`;
+      }
+    } else if (trimmed.startsWith('{')) {
       try {
-        const parsed = JSON.parse(rawText.trim());
+        const parsed = JSON.parse(trimmed);
         if (parsed && typeof parsed === 'object') {
-          errorPayload = parsed.error ? parsed : { error: parsed };
+          errorPayload = (parsed as Record<string, unknown>).error
+            ? (parsed as Record<string, unknown>)
+            : { error: parsed };
         } else {
-          errorPayload = { error: { code: statusCode, message: rawText.trim() } };
+          errorPayload = { error: { code: statusCode, message: trimmed } };
         }
       } catch {
-        errorPayload = { error: { code: statusCode, message: rawText.trim() || 'Error' } };
+        errorPayload = { error: { code: statusCode, message: trimmed || 'Error' } };
       }
+      terminalBody = `data: ${JSON.stringify(errorPayload)}\n\n`;
     } else {
       errorPayload = {
         error: {
           code: statusCode,
-          message: rawText.trim() || `HTTP error ${statusCode}`,
+          message: trimmed || `HTTP error ${statusCode}`,
         },
       };
+      terminalBody = `data: ${JSON.stringify(errorPayload)}\n\n`;
     }
 
-    terminalBody = `data: ${JSON.stringify(errorPayload)}\n\n`;
     resultHeaders['content-type'] = 'text/event-stream; charset=utf-8';
   }
 
@@ -104,7 +151,7 @@ export function formatTerminalDownstreamError(
   }
 
   return {
-    statusCode,
+    statusCode: terminalStatusCode,
     headers: resultHeaders,
     body: terminalBody,
   };
