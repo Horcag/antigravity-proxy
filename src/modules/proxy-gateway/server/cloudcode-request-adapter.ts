@@ -3,11 +3,10 @@ import * as crypto from 'node:crypto';
 import type { IncomingHttpHeaders } from 'node:http';
 
 const REPLAY_SAFE_POST_ACTIONS = new Set([
-  ':streamGenerateContent',
-  ':generateContent',
-  ':predict',
-  ':streamRawPredict',
-  ':countTokens',
+  ':streamGenerateContent', ':generateContent', ':predict', ':streamRawPredict', ':countTokens',
+  ':loadCodeAssist', ':fetchAvailableModels', ':retrieveUserQuotaSummary', ':fetchCredits',
+  ':listCloudAICompanionProjects', ':listModelConfigs', ':listExperiments',
+  ':fetchCodeCustomizationState', ':fetchAdminControls', ':getCodeAssistGlobalUserSetting', ':loadModel',
 ]);
 
 export interface ComposeAttemptOptions {

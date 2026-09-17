@@ -11,6 +11,16 @@ const ALLOWED_OPERATIONS = new Set([
   'predict',
   'streamRawPredict',
   'loadModel',
+  'loadCodeAssist',
+  'fetchAvailableModels',
+  'retrieveUserQuotaSummary',
+  'fetchCredits',
+  'listCloudAICompanionProjects',
+  'listModelConfigs',
+  'listExperiments',
+  'fetchCodeCustomizationState',
+  'fetchAdminControls',
+  'getCodeAssistGlobalUserSetting',
 ]);
 
 export interface LogUpstreamFailureParams {
