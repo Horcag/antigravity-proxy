@@ -2,15 +2,9 @@ import * as zlib from 'node:zlib';
 import type { IncomingHttpHeaders } from 'node:http';
 
 export type FailureCategory =
-  | 'quota'
-  | 'authentication'
-  | 'permission-denied'
-  | 'model-capability'
-  | 'project-context'
-  | 'invalid-request'
-  | 'ambiguous-invalid-argument'
-  | 'transient'
-  | 'unknown';
+  | 'quota' | 'authentication' | 'permission-denied' | 'model-capability'
+  | 'project-context' | 'invalid-request' | 'ambiguous-invalid-argument'
+  | 'transient' | 'unknown';
 
 export interface FailureEvidence {
   category: FailureCategory;
@@ -44,9 +38,7 @@ export function safeDecodeErrorBody(
   bufferedBody: Buffer | undefined,
   contentEncoding?: string | string[],
 ): DecodedErrorBody {
-  if (!bufferedBody || bufferedBody.length === 0) {
-    return { text: '', truncated: false, decodeError: false };
-  }
+  if (!bufferedBody || bufferedBody.length === 0) return { text: '', truncated: false, decodeError: false };
   const enc = (Array.isArray(contentEncoding) ? contentEncoding[0] : contentEncoding || '').toLowerCase();
   const maxOutputLength = 65536;
   try {
@@ -55,9 +47,7 @@ export function safeDecodeErrorBody(
     else if (enc.includes('deflate')) decompressed = zlib.inflateSync(bufferedBody, { maxOutputLength });
     else if (enc.includes('br')) decompressed = zlib.brotliDecompressSync(bufferedBody, { maxOutputLength });
     else {
-      if (bufferedBody.length > maxOutputLength) {
-        return { text: bufferedBody.subarray(0, maxOutputLength).toString('utf-8'), truncated: true, decodeError: false };
-      }
+      if (bufferedBody.length > maxOutputLength) return { text: bufferedBody.subarray(0, maxOutputLength).toString('utf-8'), truncated: true, decodeError: false };
       return { text: bufferedBody.toString('utf-8'), truncated: false, decodeError: false };
     }
     return { text: decompressed.toString('utf-8'), truncated: decompressed.length >= maxOutputLength, decodeError: false };
@@ -69,11 +59,7 @@ export function safeDecodeErrorBody(
 const VALID_REASON_CODE = /^[a-zA-Z0-9_.:-]{1,64}$/;
 
 export function safeDecodeGrpcMessage(raw: string): string {
-  try {
-    return decodeURIComponent(raw);
-  } catch {
-    return raw;
-  }
+  try { return decodeURIComponent(raw); } catch { return raw; }
 }
 
 function escapeRegExp(str: string): string {
@@ -105,17 +91,7 @@ function makeEvidence(
   isQuota = false,
   conf: 'explicit' | 'heuristic' | 'unknown' = 'explicit',
 ): FailureEvidence {
-  return {
-    category: cat,
-    confidence: conf,
-    source: src,
-    httpStatus: code,
-    rpcStatus: rpc,
-    ruleId: rule,
-    safeMessage: msg,
-    isQuota,
-    rawErrorText: raw,
-  };
+  return { category: cat, confidence: conf, source: src, httpStatus: code, rpcStatus: rpc, ruleId: rule, safeMessage: msg, isQuota, rawErrorText: raw };
 }
 
 export function classifyUpstreamFailure(options: ClassifyFailureOptions): FailureEvidence {
@@ -206,6 +182,11 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
     if (code === '8') {
       return makeEvidence('quota', 'google.grpc.resource-exhausted', 'grpc', 429, 'RESOURCE_EXHAUSTED',
         buildSafeErrorMessage('quota', 'google.grpc.resource-exhausted', 'RESOURCE_EXHAUSTED', 429, errorInfoReason), errorText, true);
+    }
+    if (code === '9') {
+      const rule = lowerText.includes('location') ? 'google.location.unsupported-location' : 'google.grpc.failed-precondition';
+      return makeEvidence('permission-denied', rule, 'grpc', 400, 'FAILED_PRECONDITION',
+        buildSafeErrorMessage('permission-denied', rule, 'FAILED_PRECONDITION', 400, errorInfoReason), errorText, false, 'explicit');
     }
     if (code === '14') {
       return makeEvidence('transient', 'google.grpc.unavailable', 'grpc', 503, 'UNAVAILABLE',
@@ -323,17 +304,30 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
       buildSafeErrorMessage('authentication', 'google.auth.invalid-credentials', rpc, statusCode, errorInfoReason), errorText, false);
   }
 
-  // 8. Ambiguous 400 INVALID_ARGUMENT vs other 400 invalid-request
+  // 8. Location / Precondition / Permission Denied
+  const isLocation =
+    rpcStatus === 'FAILED_PRECONDITION' ||
+    lowerText.includes('location is not supported') ||
+    errorInfoReason === 'LOCATION_NOT_SUPPORTED';
+  if (isLocation) {
+    const rpc = rpcStatus || 'FAILED_PRECONDITION';
+    return makeEvidence('permission-denied', 'google.location.unsupported-location', source, statusCode, rpc,
+      buildSafeErrorMessage('permission-denied', 'google.location.unsupported-location', rpc, statusCode, errorInfoReason), errorText, false);
+  }
+  if (statusCode === 403 || rpcStatus === 'PERMISSION_DENIED') {
+    const rpc = rpcStatus || 'PERMISSION_DENIED';
+    return makeEvidence('permission-denied', 'google.permission.denied', source, statusCode, rpc,
+      buildSafeErrorMessage('permission-denied', 'google.permission.denied', rpc, statusCode, errorInfoReason), errorText, false);
+  }
+
+  // 9. Ambiguous 400 INVALID_ARGUMENT vs other 400 invalid-request
   if (statusCode === 400 && !decodeError) {
     const isAmbiguous = (isValidJson || !errorText.trim()) && (!rpcStatus || rpcStatus === 'INVALID_ARGUMENT');
-    if (isAmbiguous) {
-      const rpc = rpcStatus || 'INVALID_ARGUMENT';
-      return makeEvidence('ambiguous-invalid-argument', 'google.generic.invalid-argument', source, statusCode, rpc,
-        buildSafeErrorMessage('ambiguous-invalid-argument', 'google.generic.invalid-argument', rpc, statusCode), errorText, false, 'unknown');
-    }
     const rpc = rpcStatus || 'INVALID_ARGUMENT';
-    return makeEvidence('invalid-request', 'google.request.invalid-400', source, statusCode, rpc,
-      buildSafeErrorMessage('invalid-request', 'google.request.invalid-400', rpc, statusCode, errorInfoReason), errorText, false);
+    const cat = isAmbiguous ? 'ambiguous-invalid-argument' : 'invalid-request';
+    const rule = isAmbiguous ? 'google.generic.invalid-argument' : 'google.request.invalid-400';
+    return makeEvidence(cat, rule, source, statusCode, rpc,
+      buildSafeErrorMessage(cat, rule, rpc, statusCode, isAmbiguous ? undefined : errorInfoReason), errorText, false, isAmbiguous ? 'unknown' : 'explicit');
   }
 
   // 9. Transient / Network / Decoding error
