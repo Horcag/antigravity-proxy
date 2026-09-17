@@ -8,6 +8,7 @@ export type MigrationAuthorizationReason =
   | 'account-deleted'
   | 'account-disabled'
   | 'authentication-failure'
+  | 'permission-denied'
   | 'model-incompatible'
   | 'quota-exhausted'
   | 'project-rejected'

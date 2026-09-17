@@ -17,7 +17,7 @@ import { extractModelName, extractSessionKey, isReplaySafeOperation, composeAtte
 import { classifyUpstreamFailure, type FailureEvidence } from './upstream-failure';
 import { evaluateRetryDecision } from './upstream-retry-decision';
 import { logUpstreamFailure, sanitizeLogString } from './cloudcode-diagnostics';
-import { formatTerminalDownstreamError } from './cloudcode-terminal-response';
+import { formatTerminalDownstreamError, resolveHasAlternativeAccounts } from './cloudcode-terminal-response';
 export { isVerifiedSessionKey, isHintSessionKey };
 export type ProtocolFailureCategory = 'inspection-limit' | 'unsupported-encoding' | 'malformed-upstream-message' | 'deadline-exceeded' | 'account-quota' | 'upstream-transient';
 export interface ProtocolFrameDecision {
@@ -63,12 +63,16 @@ export class CloudCodeFailoverGateway {
       try { if (body === undefined) res.end(); else res.end(body); return true; } catch (err) { rejectAndTerminateDownstream(err); return false; }
     };
     const writeDownstream = (classification: Parameters<AnonymousTransportReceiptOwner['expectDownstreamCommit']>[0], statusCode: number, headers: http.IncomingHttpHeaders, body?: string | Buffer): boolean => {
-      let s = statusCode, h = headers, b = body;
+      let s = statusCode, h = headers, b = body, trailers: Record<string, string> | undefined;
       if (statusCode >= 400 || (headers['grpc-status'] !== undefined && String(headers['grpc-status']) !== '0')) {
         const f = formatTerminalDownstreamError(req, statusCode, headers, body);
-        s = f.statusCode; h = f.headers; b = f.body;
+        s = f.statusCode; h = f.headers; b = f.body; trailers = f.trailers;
       }
-      writeDownstreamHeaders(classification, s, h); return endDownstream(b);
+      writeDownstreamHeaders(classification, s, h);
+      if (trailers && typeof (res as any).addTrailers === 'function') {
+        try { (res as any).addTrailers(trailers); } catch { /* ignore */ }
+      }
+      return endDownstream(b);
     };
     const writeDownstreamChunk = (chunk: Buffer): boolean => {
       try { return (res as any).write(chunk); } catch (err) { rejectAndTerminateDownstream(err); return false; }
@@ -408,17 +412,15 @@ export class CloudCodeFailoverGateway {
         );
 
         const handleFailureOutcome = async (
-          failureEvidence: FailureEvidence,
-          status: number,
-          responseHeaders: http.IncomingHttpHeaders,
-          responseBody?: Buffer,
+          failureEvidence: FailureEvidence, status: number, responseHeaders: http.IncomingHttpHeaders, responseBody?: Buffer,
         ): Promise<'continue' | 'terminal'> => {
           const decision = evaluateRetryDecision({
             evidence: failureEvidence, attempt, maxAttempts, downstreamCommitted: responseCommitted,
             isReplaySafe, ambiguityProbesUsed, maxAmbiguityProbes: 1,
             projectCorrectionsUsed: accountProjectCorrectionsUsed, maxProjectCorrections: 1,
-            quotaHeaderMode, hasAlternativeAccounts: attempt < maxAttempts, effectiveModel,
-            transientRetriesUsed, maxTransientRetries: 1,
+            quotaHeaderMode,
+            hasAlternativeAccounts: resolveHasAlternativeAccounts(this.accountLeaseService, account, attemptedAccountIds, attempt, maxAttempts),
+            effectiveModel, transientRetriesUsed, maxTransientRetries: 1,
           });
 
           logUpstreamFailure({
@@ -451,9 +453,7 @@ export class CloudCodeFailoverGateway {
             if (decision.action.repair === 'project-context') {
               accountProjectCorrectionsUsed++;
               quotaHeaderMode = 'without-quota-header';
-              logger.warn(
-                `[CloudCodeGateway] Upstream project rejected (attempt ${attempt}/${maxAttempts}). Retrying without x-goog-user-project header on same account...`,
-              );
+              logger.warn(`[CloudCodeGateway] Upstream project rejected (attempt ${attempt}/${maxAttempts}). Retrying without x-goog-user-project header on same account...`);
             }
             leaseRetainedForSameAccount = true;
             return 'continue';

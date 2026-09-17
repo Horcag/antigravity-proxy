@@ -6,6 +6,7 @@ export interface FormattedTerminalError {
   statusCode: number;
   headers: http.IncomingHttpHeaders;
   body: string | Buffer | undefined;
+  trailers?: Record<string, string>;
 }
 
 const HTTP_TO_GRPC_STATUS: Record<number, string> = {
@@ -24,12 +25,14 @@ const HTTP_TO_GRPC_STATUS: Record<number, string> = {
   504: '4', // DEADLINE_EXCEEDED
 };
 
+const MAX_TERMINAL_DECOMPRESS_BYTES = 1024 * 1024; // 1MB limit
+
 /**
  * Format terminal downstream error headers and payload consistency:
  * 1. Decompresses compressed bodies (gzip/deflate/br) into uncompressed text and strips content-encoding.
  * 2. Updates content-length to exact byte length of terminal payload.
  * 3. Frames SSE streams without double-wrapping existing SSE structures.
- * 4. Sets canonical gRPC status and message headers with HTTP 200 for native gRPC requests.
+ * 4. Sets canonical gRPC status and message trailers with HTTP 200 for native gRPC requests.
  */
 export function formatTerminalDownstreamError(
   req: http.IncomingMessage | http2.Http2ServerRequest | { headers: http.IncomingHttpHeaders },
@@ -39,12 +42,14 @@ export function formatTerminalDownstreamError(
 ): FormattedTerminalError {
   const resultHeaders: http.IncomingHttpHeaders = { ...headers };
 
-  // 1. Detect content-encoding, decompress body if compressed, then strip content-encoding header
+  // 1. Detect content-encoding and body buffer without premature header deletion
+  let contentEncodingKey: string | undefined;
   let contentEncoding: string | undefined;
   for (const key of Object.keys(resultHeaders)) {
     if (key.toLowerCase() === 'content-encoding') {
+      contentEncodingKey = key;
       contentEncoding = String(resultHeaders[key] || '').toLowerCase();
-      delete resultHeaders[key];
+      break;
     }
   }
 
@@ -58,16 +63,36 @@ export function formatTerminalDownstreamError(
   if (bodyBuf && bodyBuf.length > 0) {
     const isGzipMagic = bodyBuf.length >= 2 && bodyBuf[0] === 0x1f && bodyBuf[1] === 0x8b;
     const enc = contentEncoding || (isGzipMagic ? 'gzip' : '');
-    try {
-      if (enc.includes('gzip') || isGzipMagic) {
-        terminalBody = zlib.gunzipSync(bodyBuf).toString('utf-8');
-      } else if (enc.includes('deflate')) {
-        terminalBody = zlib.inflateSync(bodyBuf).toString('utf-8');
-      } else if (enc.includes('br')) {
-        terminalBody = zlib.brotliDecompressSync(bodyBuf).toString('utf-8');
+    if (enc) {
+      try {
+        let decompressed: Buffer;
+        if (enc.includes('gzip') || isGzipMagic) {
+          decompressed = zlib.gunzipSync(bodyBuf, { maxOutputLength: MAX_TERMINAL_DECOMPRESS_BYTES });
+        } else if (enc.includes('deflate')) {
+          decompressed = zlib.inflateSync(bodyBuf, { maxOutputLength: MAX_TERMINAL_DECOMPRESS_BYTES });
+        } else if (enc.includes('br')) {
+          decompressed = zlib.brotliDecompressSync(bodyBuf, { maxOutputLength: MAX_TERMINAL_DECOMPRESS_BYTES });
+        } else {
+          decompressed = bodyBuf;
+        }
+        terminalBody = decompressed.toString('utf-8');
+        if (contentEncodingKey) delete resultHeaders[contentEncodingKey];
+        delete resultHeaders['content-length'];
+      } catch {
+        // Decompression failed (corrupt gzip, truncated, or exceeded 1MB limit).
+        // NEVER emit raw corrupt/truncated compressed bytes as plaintext JSON!
+        // Synthesize a safe, well-formed JSON error:
+        if (contentEncodingKey) delete resultHeaders[contentEncodingKey];
+        delete resultHeaders['content-length'];
+        resultHeaders['content-type'] = 'application/json; charset=utf-8';
+        terminalBody = JSON.stringify({
+          error: {
+            code: statusCode,
+            message: 'Upstream error response could not be decoded',
+            status: 'BAD_GATEWAY',
+          },
+        });
       }
-    } catch {
-      // Decompression fallback: retain original body if decompression fails
     }
   }
 
@@ -80,21 +105,28 @@ export function formatTerminalDownstreamError(
   const isGrpc = reqContentType.includes('application/grpc');
 
   let terminalStatusCode = statusCode;
+  let trailers: Record<string, string> | undefined;
 
   if (isGrpc) {
-    // Native gRPC error framing: must return HTTP 200 with grpc-status and grpc-message
+    // Native gRPC error framing: must return HTTP 200 with grpc-status and grpc-message in trailers
     terminalStatusCode = 200;
     let grpcStatus = resultHeaders['grpc-status'];
     if (grpcStatus === undefined || String(grpcStatus) === '0') {
       grpcStatus = HTTP_TO_GRPC_STATUS[statusCode] || '13';
-      resultHeaders['grpc-status'] = grpcStatus;
     }
-    if (!resultHeaders['grpc-message']) {
-      resultHeaders['grpc-message'] = String(resultHeaders['grpc-status-details-bin'] || `HTTP_${statusCode}`);
+    let grpcMessage = resultHeaders['grpc-message'];
+    if (!grpcMessage) {
+      grpcMessage = String(resultHeaders['grpc-status-details-bin'] || `HTTP_${statusCode}`);
     }
     resultHeaders['content-type'] = 'application/grpc';
-    terminalBody = Buffer.alloc(0);
     resultHeaders['content-length'] = '0';
+    delete resultHeaders['grpc-status'];
+    delete resultHeaders['grpc-message'];
+    terminalBody = Buffer.alloc(0);
+    trailers = {
+      'grpc-status': String(grpcStatus),
+      'grpc-message': String(grpcMessage),
+    };
   } else if (isSse) {
     // SSE stream framing: data: {...}\n\n
     let errorPayload: Record<string, unknown> | null = null;
@@ -145,7 +177,7 @@ export function formatTerminalDownstreamError(
     resultHeaders['content-type'] = 'text/event-stream; charset=utf-8';
   }
 
-  if (terminalBody !== undefined) {
+  if (terminalBody !== undefined && !isGrpc) {
     const byteLength = typeof terminalBody === 'string' ? Buffer.byteLength(terminalBody, 'utf-8') : terminalBody.length;
     resultHeaders['content-length'] = String(byteLength);
   }
@@ -154,5 +186,28 @@ export function formatTerminalDownstreamError(
     statusCode: terminalStatusCode,
     headers: resultHeaders,
     body: terminalBody,
+    trailers,
   };
+}
+
+export function resolveHasAlternativeAccounts(
+  accountLeaseService: unknown,
+  account: { id: string } | null | undefined,
+  attemptedAccountIds: Set<string>,
+  attempt: number,
+  maxAttempts: number,
+): boolean {
+  const service = accountLeaseService as {
+    getUsableAccountCount?: () => number;
+    getQuotaDiagnostics?: () => { accounts?: unknown[] };
+  } | undefined;
+  const totalAccounts = typeof service?.getUsableAccountCount === 'function'
+    ? service.getUsableAccountCount()
+    : typeof service?.getQuotaDiagnostics === 'function'
+      ? service.getQuotaDiagnostics()?.accounts?.length
+      : undefined;
+  const attemptedCount = account && !attemptedAccountIds.has(account.id) ? attemptedAccountIds.size + 1 : attemptedAccountIds.size;
+  return totalAccounts !== undefined
+    ? totalAccounts > attemptedCount && attempt < maxAttempts
+    : attempt < maxAttempts;
 }

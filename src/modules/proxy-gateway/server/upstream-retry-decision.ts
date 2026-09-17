@@ -110,6 +110,14 @@ export function evaluateRetryDecision(params: EvaluateRetryParams): RetryDecisio
         healthEffect: { kind: 'credential-rejected' },
       };
 
+    case 'permission-denied':
+      return {
+        action: hasAlternativeAccounts
+          ? { kind: 'migrate-account', reason: 'permission-denied' }
+          : { kind: 'commit-error' },
+        healthEffect: { kind: 'none' }, // CRUCIAL: zero credential penalty, never markAsForbidden!
+      };
+
     case 'model-capability':
       return {
         action: hasAlternativeAccounts
@@ -157,15 +165,15 @@ export function evaluateRetryDecision(params: EvaluateRetryParams): RetryDecisio
       };
 
     case 'transient':
-      if (hasAlternativeAccounts) {
-        return {
-          action: { kind: 'migrate-account', reason: 'upstream-transient' },
-          healthEffect: { kind: 'none' },
-        };
-      }
       if (maxTransientRetries > 0 && transientRetriesUsed < maxTransientRetries) {
         return {
           action: { kind: 'retry-transient' },
+          healthEffect: { kind: 'none' },
+        };
+      }
+      if (hasAlternativeAccounts) {
+        return {
+          action: { kind: 'migrate-account', reason: 'upstream-transient' },
           healthEffect: { kind: 'none' },
         };
       }

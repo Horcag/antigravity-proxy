@@ -388,7 +388,7 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     });
     const res = createMockResponse();
     await gateway.handleRequest(req, res);
-    expect(attemptCount).toBe(2);
+    expect(attemptCount).toBe(3);
     // Ensure final response committed was from acc-2
     expect(res.writeHead).toHaveBeenCalledWith(200, expect.objectContaining({ 'content-type': 'application/json' }));
   });
