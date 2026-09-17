@@ -131,10 +131,8 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
   }
   if ((!errorText || !errorText.trim()) && headers['grpc-message']) {
     const gm = headers['grpc-message'];
-    errorText = Array.isArray(gm) ? gm.join(', ') : String(gm);
-  }
-  if (errorText !== undefined && (headers['grpc-message'] || source === 'grpc' || errorText.includes('%'))) {
-    errorText = safeDecodeGrpcMessage(errorText);
+    const rawGm = Array.isArray(gm) ? gm.join(', ') : String(gm);
+    errorText = safeDecodeGrpcMessage(rawGm);
   }
 
   let rpcStatus: string | undefined;

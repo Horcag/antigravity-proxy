@@ -192,7 +192,7 @@ describe('Oracle Round 3 Recovery Acceptance Tests', () => {
     const projectDeniedExplicit = classifyUpstreamFailure({
       statusCode: 200,
       headers: { 'grpc-status': '7', 'grpc-message': 'Permission%20to%20use%20this%20quota%20project%20denied.' },
-      errorText: 'Permission%20to%20use%20this%20quota%20project%20denied.',
+      errorText: 'Permission to use this quota project denied.',
       source: 'grpc',
     });
     expect(projectDeniedExplicit.category).toBe('project-context');
@@ -441,7 +441,7 @@ describe('Oracle Round 3 Recovery Acceptance Tests', () => {
     expect(JSON.parse(fCompressed.body as string)).toEqual(origError);
 
     const ptBuf = Buffer.from(errJson, 'utf-8');
-    const fPlain = formatTerminalDownstreamError(req as any, 400, { 'content-type': 'application/json', 'content-encoding': 'gzip', 'content-length': String(ptBuf.length) }, ptBuf);
+    const fPlain = formatTerminalDownstreamError(req as any, 400, { 'content-type': 'application/json', 'content-length': String(ptBuf.length) }, ptBuf);
     expect(fPlain.statusCode).toBe(400);
     expect(fPlain.headers['content-encoding']).toBeUndefined();
     expect(JSON.parse(fPlain.body as string)).toEqual(origError);
@@ -460,7 +460,7 @@ describe('Oracle Round 3 Recovery Acceptance Tests', () => {
     expect(fCompressed.body).toBe(sseText);
 
     const ptBuf = Buffer.from(sseText, 'utf-8');
-    const fPlain = formatTerminalDownstreamError(req as any, 400, { 'content-type': 'text/event-stream', 'content-encoding': 'gzip' }, ptBuf);
+    const fPlain = formatTerminalDownstreamError(req as any, 400, { 'content-type': 'text/event-stream' }, ptBuf);
     expect(fPlain.statusCode).toBe(400);
     expect(fPlain.headers['content-type']).toBe('text/event-stream; charset=utf-8');
     expect(fPlain.body).toBe(sseText);
