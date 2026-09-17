@@ -68,7 +68,7 @@ export function safeDecodeErrorBody(
 
 const VALID_REASON_CODE = /^[a-zA-Z0-9_.:-]{1,64}$/;
 
-function safeDecodeGrpcMessage(raw: string): string {
+export function safeDecodeGrpcMessage(raw: string): string {
   try {
     return decodeURIComponent(raw);
   } catch {
@@ -131,7 +131,10 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
   }
   if ((!errorText || !errorText.trim()) && headers['grpc-message']) {
     const gm = headers['grpc-message'];
-    errorText = safeDecodeGrpcMessage(Array.isArray(gm) ? gm.join(', ') : String(gm));
+    errorText = Array.isArray(gm) ? gm.join(', ') : String(gm);
+  }
+  if (errorText !== undefined && (headers['grpc-message'] || source === 'grpc' || errorText.includes('%'))) {
+    errorText = safeDecodeGrpcMessage(errorText);
   }
 
   let rpcStatus: string | undefined;

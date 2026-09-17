@@ -46,18 +46,11 @@ describe('Oracle Round 3 Recovery Acceptance Tests', () => {
 
   beforeEach(() => {
     mockLeaseService = {
-      getNextToken: vi.fn(),
-      acquireAttemptLease: vi.fn(),
-      getSessionBinding: vi.fn(),
-      startSessionMigration: vi.fn(),
-      renewSessionMigration: vi.fn(),
-      failSessionMigrationCandidate: vi.fn(),
-      confirmOrBindSession: vi.fn(),
-      markFromUpstreamError: vi.fn().mockResolvedValue(undefined),
-      markModelUnrequestable: vi.fn(),
-      markAsForbidden: vi.fn(),
-      resolveDynamicModelForAccount: vi.fn((_id, model) => model),
-      getTableIncarnation: vi.fn(() => 1),
+      getNextToken: vi.fn(), acquireAttemptLease: vi.fn(), getSessionBinding: vi.fn(),
+      startSessionMigration: vi.fn(), renewSessionMigration: vi.fn(), failSessionMigrationCandidate: vi.fn(),
+      confirmOrBindSession: vi.fn(), markFromUpstreamError: vi.fn().mockResolvedValue(undefined),
+      markModelUnrequestable: vi.fn(), markAsForbidden: vi.fn(),
+      resolveDynamicModelForAccount: vi.fn((_id, model) => model), getTableIncarnation: vi.fn(() => 1),
     };
     gateway = new CloudCodeFailoverGateway(mockLeaseService);
   });
@@ -120,41 +113,21 @@ describe('Oracle Round 3 Recovery Acceptance Tests', () => {
   it('B2: Gzip bomb (>1MB decompressed) is caught and returned as safe bad gateway JSON error', () => {
     const req = { headers: { accept: 'application/json' } };
     const bombBuf = zlib.gzipSync(Buffer.alloc(2 * 1024 * 1024, 'x'));
-    const formattedBomb = formatTerminalDownstreamError(req as any, 400, {
-      'content-type': 'application/json',
-      'content-encoding': 'gzip',
-    }, bombBuf);
-
+    const formattedBomb = formatTerminalDownstreamError(req as any, 400, { 'content-type': 'application/json', 'content-encoding': 'gzip' }, bombBuf);
     expect(formattedBomb.statusCode).toBe(400);
     expect(formattedBomb.headers['content-encoding']).toBeUndefined();
     expect(formattedBomb.headers['content-type']).toBe('application/json; charset=utf-8');
-    expect(JSON.parse(formattedBomb.body as string)).toEqual({
-      error: {
-        code: 400,
-        message: 'Upstream error response could not be decoded',
-        status: 'BAD_GATEWAY',
-      },
-    });
+    expect(JSON.parse(formattedBomb.body as string)).toEqual({ error: { code: 400, message: 'Upstream error response could not be decoded', status: 'BAD_GATEWAY' } });
   });
 
   it('B2: Truncated or corrupt gzip bytes are caught and returned as safe bad gateway JSON error', () => {
     const req = { headers: { accept: 'application/json' } };
     const corruptBuf = Buffer.from([0x1f, 0x8b, 0x08, 0x00, 0x12, 0x34, 0x56, 0x78]);
-    const formattedCorrupt = formatTerminalDownstreamError(req as any, 400, {
-      'content-type': 'application/json',
-      'content-encoding': 'gzip',
-    }, corruptBuf);
-
+    const formattedCorrupt = formatTerminalDownstreamError(req as any, 400, { 'content-type': 'application/json', 'content-encoding': 'gzip' }, corruptBuf);
     expect(formattedCorrupt.statusCode).toBe(400);
     expect(formattedCorrupt.headers['content-encoding']).toBeUndefined();
     expect(formattedCorrupt.headers['content-type']).toBe('application/json; charset=utf-8');
-    expect(JSON.parse(formattedCorrupt.body as string)).toEqual({
-      error: {
-        code: 400,
-        message: 'Upstream error response could not be decoded',
-        status: 'BAD_GATEWAY',
-      },
-    });
+    expect(JSON.parse(formattedCorrupt.body as string)).toEqual({ error: { code: 400, message: 'Upstream error response could not be decoded', status: 'BAD_GATEWAY' } });
   });
 
   // Requirement 2 / B1: gRPC status classification safeguards
@@ -211,13 +184,18 @@ describe('Oracle Round 3 Recovery Acceptance Tests', () => {
   it('B1: percent-encoded grpc-message with quota project denied classifies as project-context', () => {
     const projectDeniedEncoded = classifyUpstreamFailure({
       statusCode: 200,
-      headers: {
-        'grpc-status': '7',
-        'grpc-message': 'Permission%20to%20use%20this%20quota%20project%20denied.',
-      },
+      headers: { 'grpc-status': '7', 'grpc-message': 'Permission%20to%20use%20this%20quota%20project%20denied.' },
       source: 'grpc',
     });
     expect(projectDeniedEncoded.category).toBe('project-context');
+
+    const projectDeniedExplicit = classifyUpstreamFailure({
+      statusCode: 200,
+      headers: { 'grpc-status': '7', 'grpc-message': 'Permission%20to%20use%20this%20quota%20project%20denied.' },
+      errorText: 'Permission%20to%20use%20this%20quota%20project%20denied.',
+      source: 'grpc',
+    });
+    expect(projectDeniedExplicit.category).toBe('project-context');
   });
 
   it('B1: gRPC status 3 with explicit signature or corrupt image classifies as invalid-request', () => {
@@ -308,45 +286,15 @@ describe('Oracle Round 3 Recovery Acceptance Tests', () => {
 
   // Requirement 4 / B3 & Requirement 5 / P2: Gateway sanitization and transient retry reachability
   it('B3 & P2: evaluateRetryDecision enables transient retry when maxTransientRetries is default 1', () => {
-    const retryDecision = evaluateRetryDecision({
-      evidence: {
-        category: 'transient', confidence: 'explicit', source: 'http', httpStatus: 503,
-        rpcStatus: 'UNAVAILABLE', ruleId: 'google.transient.unavailable', safeMessage: '[google.transient.unavailable] TRANSIENT (UNAVAILABLE)', isQuota: false,
-      },
-      attempt: 1, maxAttempts: 3, downstreamCommitted: false, isReplaySafe: true, ambiguityProbesUsed: 0,
-      projectCorrectionsUsed: 0, hasAlternativeAccounts: false, transientRetriesUsed: 0,
-    });
-    expect(retryDecision.action.kind).toBe('retry-transient');
-
-    const exhaustedDecision = evaluateRetryDecision({
-      evidence: {
-        category: 'transient', confidence: 'explicit', source: 'http', httpStatus: 503,
-        rpcStatus: 'UNAVAILABLE', ruleId: 'google.transient.unavailable', safeMessage: '[google.transient.unavailable] TRANSIENT (UNAVAILABLE)', isQuota: false,
-      },
-      attempt: 2, maxAttempts: 3, downstreamCommitted: false, isReplaySafe: true, ambiguityProbesUsed: 0,
-      projectCorrectionsUsed: 0, hasAlternativeAccounts: false, transientRetriesUsed: 1,
-    });
-    expect(exhaustedDecision.action.kind).toBe('commit-error');
-
-    const retryWithAltDecision = evaluateRetryDecision({
-      evidence: {
-        category: 'transient', confidence: 'explicit', source: 'http', httpStatus: 503,
-        rpcStatus: 'UNAVAILABLE', ruleId: 'google.transient.unavailable', safeMessage: '[google.transient.unavailable] TRANSIENT (UNAVAILABLE)', isQuota: false,
-      },
-      attempt: 1, maxAttempts: 3, downstreamCommitted: false, isReplaySafe: true, ambiguityProbesUsed: 0,
-      projectCorrectionsUsed: 0, hasAlternativeAccounts: true, transientRetriesUsed: 0,
-    });
-    expect(retryWithAltDecision.action.kind).toBe('retry-transient');
-
-    const migrateDecision = evaluateRetryDecision({
-      evidence: {
-        category: 'transient', confidence: 'explicit', source: 'http', httpStatus: 503,
-        rpcStatus: 'UNAVAILABLE', ruleId: 'google.transient.unavailable', safeMessage: '[google.transient.unavailable] TRANSIENT (UNAVAILABLE)', isQuota: false,
-      },
-      attempt: 1, maxAttempts: 3, downstreamCommitted: false, isReplaySafe: true, ambiguityProbesUsed: 0,
-      projectCorrectionsUsed: 0, hasAlternativeAccounts: true, transientRetriesUsed: 1,
-    });
-    expect(migrateDecision.action.kind).toBe('migrate-account');
+    const ev = {
+      category: 'transient' as const, confidence: 'explicit' as const, source: 'http' as const, httpStatus: 503,
+      rpcStatus: 'UNAVAILABLE', ruleId: 'google.transient.unavailable', safeMessage: '[google.transient.unavailable] TRANSIENT (UNAVAILABLE)', isQuota: false,
+    };
+    const base = { evidence: ev, maxAttempts: 3, downstreamCommitted: false, isReplaySafe: true, ambiguityProbesUsed: 0, projectCorrectionsUsed: 0 };
+    expect(evaluateRetryDecision({ ...base, attempt: 1, hasAlternativeAccounts: false, transientRetriesUsed: 0 }).action.kind).toBe('retry-transient');
+    expect(evaluateRetryDecision({ ...base, attempt: 2, hasAlternativeAccounts: false, transientRetriesUsed: 1 }).action.kind).toBe('commit-error');
+    expect(evaluateRetryDecision({ ...base, attempt: 1, hasAlternativeAccounts: true, transientRetriesUsed: 0 }).action.kind).toBe('retry-transient');
+    expect(evaluateRetryDecision({ ...base, attempt: 1, hasAlternativeAccounts: true, transientRetriesUsed: 1 }).action.kind).toBe('migrate-account');
   });
 
   // Requirement 4 / B3 & Requirement 5 / P2: Dispatch State Reset on Attempt > 1
@@ -434,4 +382,107 @@ describe('Oracle Round 3 Recovery Acceptance Tests', () => {
     expect(mockLeaseService.acquireAttemptLease).toHaveBeenCalledTimes(1);
     expect(mockLeaseService.startSessionMigration).not.toHaveBeenCalled();
   });
+
+  it('B1: Gateway handles percent-encoded quota project denial in grpc-message with project repair and zero penalties', async () => {
+    const accA = createMockAccount('acc-A', 'a@test.com');
+    mockLeaseService.acquireAttemptLease.mockResolvedValue({ account: accA, generation: 1, tableIncarnation: 1, releaseReservation: vi.fn() });
+    mockLeaseService.getQuotaDiagnostics = vi.fn(() => ({ accounts: [{ id: 'acc-A' }] }));
+
+    let upstreamCalls = 0;
+    const executedProjects: Array<string | undefined> = [];
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async (...args: any[]) => {
+      upstreamCalls++;
+      executedProjects.push(((args[2] || {}) as Record<string, string>)['x-goog-user-project']);
+      if (upstreamCalls === 1) {
+        return {
+          statusCode: 200,
+          headers: { 'content-type': 'application/grpc', 'grpc-status': '7', 'grpc-message': 'Permission%20to%20use%20this%20quota%20project%20denied.' },
+          bufferedBody: Buffer.alloc(0), bodyStream: createMockStream([]),
+        };
+      }
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'application/json' },
+        bufferedBody: Buffer.from('{"candidates":[{"content":{"parts":[{"text":"Success after repair"}]}}]}'),
+        bodyStream: createMockStream(['{"candidates":[{"content":{"parts":[{"text":"Success after repair"}]}}]}']),
+      };
+    });
+
+    const req = createMockRequest({ 'x-goog-user-project': 'project-acc-A' });
+    const res = createMockResponse();
+    await gateway.handleRequest(req, res);
+
+    expect(upstreamCalls).toBe(2);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('Success after repair');
+    expect(executedProjects[0]).toBe('project-acc-A');
+    expect(executedProjects[1]).toBeUndefined();
+    expect(mockLeaseService.acquireAttemptLease).toHaveBeenCalledTimes(1);
+    expect(mockLeaseService.markFromUpstreamError).not.toHaveBeenCalled();
+    expect(mockLeaseService.markAsForbidden).not.toHaveBeenCalled();
+  });
+
+  it('B2: Valid compressed HTTP-200 JSON application error preserves original status, message, and details', () => {
+    const origError = {
+      error: {
+        code: 400,
+        message: 'thought_signature is missing',
+        status: 'INVALID_ARGUMENT',
+        details: [{ '@type': 'type.googleapis.com/google.rpc.BadRequest', fieldViolations: [{ field: 'thought_signature', description: 'required' }] }],
+      },
+    };
+    const errJson = JSON.stringify(origError);
+    const req = { headers: { accept: 'application/json' } };
+
+    const gz = zlib.gzipSync(Buffer.from(errJson, 'utf-8'));
+    const fCompressed = formatTerminalDownstreamError(req as any, 400, { 'content-type': 'application/json', 'content-encoding': 'gzip', 'content-length': String(gz.length) }, gz);
+    expect(fCompressed.statusCode).toBe(400);
+    expect(fCompressed.headers['content-encoding']).toBeUndefined();
+    expect(JSON.parse(fCompressed.body as string)).toEqual(origError);
+
+    const ptBuf = Buffer.from(errJson, 'utf-8');
+    const fPlain = formatTerminalDownstreamError(req as any, 400, { 'content-type': 'application/json', 'content-encoding': 'gzip', 'content-length': String(ptBuf.length) }, ptBuf);
+    expect(fPlain.statusCode).toBe(400);
+    expect(fPlain.headers['content-encoding']).toBeUndefined();
+    expect(JSON.parse(fPlain.body as string)).toEqual(origError);
+    expect(fPlain.body).not.toContain('Upstream error response could not be decoded');
+  });
+
+  it('B2: Valid compressed HTTP-200 SSE application error preserves structured error in SSE format', () => {
+    const origError = { error: { code: 400, message: 'thought_signature is missing', status: 'INVALID_ARGUMENT' } };
+    const sseText = `data: ${JSON.stringify(origError)}\n\n`;
+    const req = { headers: { accept: 'text/event-stream' } };
+
+    const gz = zlib.gzipSync(Buffer.from(sseText, 'utf-8'));
+    const fCompressed = formatTerminalDownstreamError(req as any, 400, { 'content-type': 'text/event-stream', 'content-encoding': 'gzip' }, gz);
+    expect(fCompressed.statusCode).toBe(400);
+    expect(fCompressed.headers['content-type']).toBe('text/event-stream; charset=utf-8');
+    expect(fCompressed.body).toBe(sseText);
+
+    const ptBuf = Buffer.from(sseText, 'utf-8');
+    const fPlain = formatTerminalDownstreamError(req as any, 400, { 'content-type': 'text/event-stream', 'content-encoding': 'gzip' }, ptBuf);
+    expect(fPlain.statusCode).toBe(400);
+    expect(fPlain.headers['content-type']).toBe('text/event-stream; charset=utf-8');
+    expect(fPlain.body).toBe(sseText);
+    expect(fPlain.body).not.toContain('Upstream error response could not be decoded');
+  });
+
+  it('P2: If addTrailers throws, writeDownstream rejects and terminates downstream', async () => {
+    const accA = createMockAccount('acc-A', 'a@test.com');
+    mockLeaseService.acquireAttemptLease.mockResolvedValue({ account: accA, generation: 1, tableIncarnation: 1, releaseReservation: vi.fn() });
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async () => ({
+      statusCode: 200, headers: { 'content-type': 'application/grpc', 'grpc-status': '14', 'grpc-message': 'Service unavailable' },
+      bufferedBody: Buffer.alloc(0), bodyStream: createMockStream([]),
+    }));
+
+    const req = createMockRequest({ 'content-type': 'application/grpc' });
+    const res = createMockResponse();
+    res.addTrailers = vi.fn(() => { throw new Error('Trailer write failed'); });
+    res.destroy = vi.fn();
+
+    await gateway.handleRequest(req, res);
+    expect(res.addTrailers).toHaveBeenCalled();
+    expect(res.destroy).toHaveBeenCalled();
+  });
 });
+

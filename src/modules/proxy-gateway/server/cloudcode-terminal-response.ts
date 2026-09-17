@@ -62,36 +62,47 @@ export function formatTerminalDownstreamError(
 
   if (bodyBuf && bodyBuf.length > 0) {
     const isGzipMagic = bodyBuf.length >= 2 && bodyBuf[0] === 0x1f && bodyBuf[1] === 0x8b;
-    const enc = contentEncoding || (isGzipMagic ? 'gzip' : '');
-    if (enc) {
-      try {
-        let decompressed: Buffer;
-        if (enc.includes('gzip') || isGzipMagic) {
-          decompressed = zlib.gunzipSync(bodyBuf, { maxOutputLength: MAX_TERMINAL_DECOMPRESS_BYTES });
-        } else if (enc.includes('deflate')) {
-          decompressed = zlib.inflateSync(bodyBuf, { maxOutputLength: MAX_TERMINAL_DECOMPRESS_BYTES });
-        } else if (enc.includes('br')) {
-          decompressed = zlib.brotliDecompressSync(bodyBuf, { maxOutputLength: MAX_TERMINAL_DECOMPRESS_BYTES });
-        } else {
-          decompressed = bodyBuf;
+    const isDeflateMagic = bodyBuf.length >= 2 && (bodyBuf[0] === 0x78 || bodyBuf[0] === 0x58);
+    const isAlreadyPlaintext =
+      bodyBuf.length > 0 &&
+      (bodyBuf[0] === 0x7b || bodyBuf[0] === 0x5b || bodyBuf.toString('utf-8', 0, 5).startsWith('data:'));
+
+    if (isAlreadyPlaintext && !isGzipMagic && !isDeflateMagic) {
+      if (contentEncodingKey) delete resultHeaders[contentEncodingKey];
+      delete resultHeaders['content-length'];
+      terminalBody = bodyBuf.toString('utf-8');
+    } else {
+      const enc = contentEncoding || (isGzipMagic ? 'gzip' : '');
+      if (enc) {
+        try {
+          let decompressed: Buffer;
+          if (enc.includes('gzip') || isGzipMagic) {
+            decompressed = zlib.gunzipSync(bodyBuf, { maxOutputLength: MAX_TERMINAL_DECOMPRESS_BYTES });
+          } else if (enc.includes('deflate')) {
+            decompressed = zlib.inflateSync(bodyBuf, { maxOutputLength: MAX_TERMINAL_DECOMPRESS_BYTES });
+          } else if (enc.includes('br')) {
+            decompressed = zlib.brotliDecompressSync(bodyBuf, { maxOutputLength: MAX_TERMINAL_DECOMPRESS_BYTES });
+          } else {
+            decompressed = bodyBuf;
+          }
+          terminalBody = decompressed.toString('utf-8');
+          if (contentEncodingKey) delete resultHeaders[contentEncodingKey];
+          delete resultHeaders['content-length'];
+        } catch {
+          // Decompression failed (corrupt gzip, truncated, or exceeded 1MB limit).
+          // NEVER emit raw corrupt/truncated compressed bytes as plaintext JSON!
+          // Synthesize a safe, well-formed JSON error:
+          if (contentEncodingKey) delete resultHeaders[contentEncodingKey];
+          delete resultHeaders['content-length'];
+          resultHeaders['content-type'] = 'application/json; charset=utf-8';
+          terminalBody = JSON.stringify({
+            error: {
+              code: statusCode,
+              message: 'Upstream error response could not be decoded',
+              status: 'BAD_GATEWAY',
+            },
+          });
         }
-        terminalBody = decompressed.toString('utf-8');
-        if (contentEncodingKey) delete resultHeaders[contentEncodingKey];
-        delete resultHeaders['content-length'];
-      } catch {
-        // Decompression failed (corrupt gzip, truncated, or exceeded 1MB limit).
-        // NEVER emit raw corrupt/truncated compressed bytes as plaintext JSON!
-        // Synthesize a safe, well-formed JSON error:
-        if (contentEncodingKey) delete resultHeaders[contentEncodingKey];
-        delete resultHeaders['content-length'];
-        resultHeaders['content-type'] = 'application/json; charset=utf-8';
-        terminalBody = JSON.stringify({
-          error: {
-            code: statusCode,
-            message: 'Upstream error response could not be decoded',
-            status: 'BAD_GATEWAY',
-          },
-        });
       }
     }
   }

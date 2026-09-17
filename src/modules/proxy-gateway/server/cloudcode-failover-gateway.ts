@@ -14,7 +14,7 @@ import { type MigrationCapability, isVerifiedSessionKey, isHintSessionKey } from
 import { AnonymousTransportReceiptOwner } from './anonymous-transport-receipt';
 import { authorizesMigration, createMigrationAuthorization, safeAffinityCommitRejectionReason, type MigrationAuthorization, type MigrationAuthorizationReason } from './cache-affinity-coordinator';
 import { extractModelName, extractSessionKey, isReplaySafeOperation, composeAttemptRequest, preflightValidateJsonRequest } from './cloudcode-request-adapter';
-import { classifyUpstreamFailure, type FailureEvidence } from './upstream-failure';
+import { classifyUpstreamFailure, safeDecodeGrpcMessage, type FailureEvidence } from './upstream-failure';
 import { evaluateRetryDecision } from './upstream-retry-decision';
 import { logUpstreamFailure, sanitizeLogString } from './cloudcode-diagnostics';
 import { formatTerminalDownstreamError, resolveHasAlternativeAccounts } from './cloudcode-terminal-response';
@@ -70,7 +70,7 @@ export class CloudCodeFailoverGateway {
       }
       writeDownstreamHeaders(classification, s, h);
       if (trailers && typeof (res as any).addTrailers === 'function') {
-        try { (res as any).addTrailers(trailers); } catch { /* ignore */ }
+        try { (res as any).addTrailers(trailers); } catch (err) { rejectAndTerminateDownstream(err); return false; }
       }
       return endDownstream(b);
     };
@@ -530,7 +530,7 @@ export class CloudCodeFailoverGateway {
           const isSse = String(headers['content-type'] || '').includes('text/event-stream');
           const isJson = String(headers['content-type'] || '').includes('application/json');
           const rawGrpcMsg = headers['grpc-message'];
-          const grpcMsg = Array.isArray(rawGrpcMsg) ? rawGrpcMsg.join(', ') : rawGrpcMsg ? String(rawGrpcMsg) : undefined;
+          const grpcMsg = Array.isArray(rawGrpcMsg) ? rawGrpcMsg.map(safeDecodeGrpcMessage).join(', ') : rawGrpcMsg ? safeDecodeGrpcMessage(String(rawGrpcMsg)) : undefined;
           const evidence = classifyUpstreamFailure({
             statusCode,
             headers,
@@ -549,7 +549,7 @@ export class CloudCodeFailoverGateway {
           bodyStream.destroy();
           const combinedHeaders = { ...headers, ...bodyStream.trailers };
           const rawGrpcMsg = combinedHeaders['grpc-message'];
-          const grpcMsg = Array.isArray(rawGrpcMsg) ? rawGrpcMsg.join(', ') : rawGrpcMsg ? String(rawGrpcMsg) : undefined;
+          const grpcMsg = Array.isArray(rawGrpcMsg) ? rawGrpcMsg.map(safeDecodeGrpcMessage).join(', ') : rawGrpcMsg ? safeDecodeGrpcMessage(String(rawGrpcMsg)) : undefined;
           const evidence = classifyUpstreamFailure({
             statusCode,
             headers: combinedHeaders,
@@ -798,17 +798,17 @@ export class CloudCodeFailoverGateway {
               return;
             }
             const frameStatus = frameDecision.isQuota ? 429 : frameDecision.isTransient ? 503 : statusCode;
+            const appHeaders = { ...headers, ...bodyStream.trailers };
+            delete appHeaders['content-encoding'];
+            delete appHeaders['content-length'];
             const evidence = classifyUpstreamFailure({
-              statusCode: frameStatus,
-              headers: { ...headers, ...bodyStream.trailers },
-              errorText: frameDecision.errorText,
-              modelName: effectiveModel,
-              urlPath: attemptUrlPath,
+              statusCode: frameStatus, headers: appHeaders, errorText: frameDecision.errorText,
+              modelName: effectiveModel, urlPath: attemptUrlPath,
               source: contentType?.includes('text/event-stream') ? 'sse' : 'json',
             });
             const terminalStatus = evidence.httpStatus && evidence.httpStatus >= 400 ? evidence.httpStatus : frameStatus >= 400 ? frameStatus : 400;
             const terminalBody = frameDecision.errorText ? Buffer.from(frameDecision.errorText, 'utf-8') : undefined;
-            const outcome = await handleFailureOutcome(evidence, terminalStatus, { ...headers, ...bodyStream.trailers }, terminalBody);
+            const outcome = await handleFailureOutcome(evidence, terminalStatus, appHeaders, terminalBody);
             if (outcome === 'continue') continue;
             return;
           }
