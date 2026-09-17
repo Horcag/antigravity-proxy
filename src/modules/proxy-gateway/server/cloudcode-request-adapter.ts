@@ -4,9 +4,11 @@ import type { IncomingHttpHeaders } from 'node:http';
 
 const REPLAY_SAFE_POST_ACTIONS = new Set([
   ':streamGenerateContent', ':generateContent', ':predict', ':streamRawPredict', ':countTokens',
-  ':loadCodeAssist', ':fetchAvailableModels', ':retrieveUserQuotaSummary', ':fetchCredits',
-  ':listCloudAICompanionProjects', ':listModelConfigs', ':listExperiments',
+  ':loadCodeAssist', ':fetchUserInfo', ':fetchAvailableModels', ':retrieveUserQuota',
+  ':retrieveUserQuotaSummary', ':fetchLicenses', ':fetchCredits', ':listAgents', ':listInstances',
+  ':listAuthorizedDevices', ':listRemoteRepositories', ':listCloudAICompanionProjects', ':listModelConfigs', ':listExperiments',
   ':fetchCodeCustomizationState', ':fetchAdminControls', ':getCodeAssistGlobalUserSetting', ':loadModel',
+  ':fetchQuotaStatus', ':fetchConfig', ':fetchFromTrawlerCache',
 ]);
 
 export interface ComposeAttemptOptions {
@@ -46,9 +48,7 @@ export function isReplaySafeOperation(
   }
 
   if (m === 'GET') {
-    if (pathname === '/v1/models' || pathname === '/v1beta/models' || pathname === '/v1internal/models') {
-      return true;
-    }
+    if (pathname === '/v1/models' || pathname === '/v1beta/models' || pathname === '/v1internal/models') return true;
     return /^\/v1(?:beta|internal)?\/models\/[a-zA-Z0-9_.-]+$/.test(pathname);
   }
 

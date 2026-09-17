@@ -10,9 +10,16 @@ import type { CloudAccount } from '../../modules/cloud-account/types.js';
 
 const READ_ONLY_RPCS = [
   ':loadCodeAssist',
+  ':fetchUserInfo',
   ':fetchAvailableModels',
+  ':retrieveUserQuota',
   ':retrieveUserQuotaSummary',
+  ':fetchLicenses',
   ':fetchCredits',
+  ':listAgents',
+  ':listInstances',
+  ':listAuthorizedDevices',
+  ':listRemoteRepositories',
   ':listCloudAICompanionProjects',
   ':listModelConfigs',
   ':listExperiments',
@@ -20,6 +27,9 @@ const READ_ONLY_RPCS = [
   ':fetchAdminControls',
   ':getCodeAssistGlobalUserSetting',
   ':loadModel',
+  ':fetchQuotaStatus',
+  ':fetchConfig',
+  ':fetchFromTrawlerCache',
 ];
 
 function createMockStream(chunks: Array<string | Buffer> = ['{}']): any {
@@ -112,8 +122,10 @@ describe('Cloud Code eligibility project-context repair', () => {
     }
   });
 
-  it('extracts loadCodeAssist as a sanitized diagnostics operation', () => {
-    expect(extractSanitizedOperation('/v1internal:loadCodeAssist')).toBe('loadCodeAssist');
+  it('extracts read-only RPCs as sanitized diagnostics operations', () => {
+    for (const rpc of READ_ONLY_RPCS) {
+      expect(extractSanitizedOperation(`/v1internal${rpc}`)).toBe(rpc.slice(1));
+    }
   });
 
   it('retries first project-context failure without quota header, then migrates or commits terminally', () => {
@@ -172,7 +184,7 @@ describe('Cloud Code eligibility project-context repair', () => {
     });
   });
 
-  it('repairs loadCodeAssist by suppressing the first 403 and retrying same account without x-goog-user-project', async () => {
+  it('repairs fetchUserInfo by suppressing the first 403 and retrying same account without x-goog-user-project', async () => {
     const account = createMockAccount('disabled-proj');
     const calls: Array<{ headers: Record<string, string>; body: Buffer }> = [];
     leaseService.getNextToken.mockResolvedValue(account);
@@ -203,6 +215,7 @@ describe('Cloud Code eligibility project-context repair', () => {
     });
 
     const req = createMockRequest({
+      url: '/v1internal:fetchUserInfo',
       headers: {
         host: 'daily-cloudcode-pa.googleapis.com',
         'content-type': 'application/json',
