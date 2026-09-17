@@ -32,6 +32,8 @@ export interface EvaluateRetryParams {
   quotaHeaderMode?: 'with-quota-header' | 'without-quota-header';
   hasAlternativeAccounts: boolean;
   effectiveModel?: string;
+  transientRetriesUsed?: number;
+  maxTransientRetries?: number;
 }
 
 function deriveTerminalHealthEffect(evidence: FailureEvidence, effectiveModel?: string): HealthEffect {
@@ -63,6 +65,8 @@ export function evaluateRetryDecision(params: EvaluateRetryParams): RetryDecisio
     quotaHeaderMode = 'with-quota-header',
     hasAlternativeAccounts,
     effectiveModel,
+    transientRetriesUsed = 0,
+    maxTransientRetries = 0,
   } = params;
 
   // Invariant 1: If response was already committed downstream, never retry or splice streams
@@ -153,6 +157,12 @@ export function evaluateRetryDecision(params: EvaluateRetryParams): RetryDecisio
       };
 
     case 'transient':
+      if (maxTransientRetries > 0 && transientRetriesUsed < maxTransientRetries) {
+        return {
+          action: { kind: 'retry-transient' },
+          healthEffect: { kind: 'none' },
+        };
+      }
       return {
         action: hasAlternativeAccounts
           ? { kind: 'migrate-account', reason: 'upstream-transient' }

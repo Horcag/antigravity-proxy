@@ -24,11 +24,14 @@ export class ProductionOwnerGate {
   private static lockFilePath: string | null = null;
 
   private static getSocketPath(): string {
+    const baseName = process.env.AG_PROXY_SOCKET_NAME?.trim() || 'antigravity-proxy-production-owner';
+    const workerSuffix = process.env.VITEST_POOL_ID !== undefined ? `-${process.env.VITEST_POOL_ID}` : '';
+    const socketName = `${baseName}${workerSuffix}`;
     // On Linux, use abstract domain socket which is cleaned up automatically on process exit
     if (process.platform === 'linux') {
-      return '\0antigravity-proxy-production-owner';
+      return `\0${socketName}`;
     }
-    return path.join(os.tmpdir(), 'antigravity-proxy-production-owner.sock');
+    return path.join(os.tmpdir(), `${socketName}.sock`);
   }
 
   static async acquireExclusiveOwnership(port?: number): Promise<void> {

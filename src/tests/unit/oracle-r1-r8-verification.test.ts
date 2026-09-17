@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { CloudCodeFailoverGateway } from '../../modules/proxy-gateway/server/cloudcode-failover-gateway.js';
-import { isReplaySafeOperation, rewriteJsonPayloadLossless } from '../../modules/proxy-gateway/server/cloudcode-request-adapter.js';
+import { isReplaySafeOperation, rewriteJsonPayloadLossless, validateAndExtractRequestModel } from '../../modules/proxy-gateway/server/cloudcode-request-adapter.js';
 import { classifyUpstreamFailure } from '../../modules/proxy-gateway/server/upstream-failure.js';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
@@ -200,5 +200,126 @@ describe('Oracle R1-R8 Architectural Verification', () => {
     const rewritten = rewriteJsonPayloadLossless(raw, { model: 'gemini-2.5-pro', routingProject: 'new-p' });
     expect(rewritten).toContain('9007199254740993');
     expect(rewritten).toContain('"project":"new-p"');
+  });
+
+  // B1: Equivalence of HTTP, JSON, SSE, and gRPC project denials and ambiguous gRPC 3 recovery
+  it('B1: HTTP, JSON, SSE, and gRPC equivalence through handleRequest with project repair and gRPC 3', async () => {
+    const accountA = createMockAccount('acc-A', 'acca@test.com');
+    const accountB = createMockAccount('acc-B', 'accb@test.com');
+
+    // Equivalence: JSON, SSE, and gRPC project permission denials all trigger same-account retry
+    const protocols = [
+      { name: 'JSON PERMISSION_DENIED', status: 403, headers: { 'content-type': 'application/json' }, bufferedBody: Buffer.from('{"error":{"code":403,"status":"PERMISSION_DENIED","message":"Permission denied on project-acc-A"}}') },
+      { name: 'SSE PERMISSION_DENIED', status: 200, headers: { 'content-type': 'text/event-stream' }, bufferedBody: Buffer.from('data: {"error":{"code":403,"status":"PERMISSION_DENIED","message":"Permission denied on project-acc-A"}}\n\n') },
+      { name: 'gRPC PERMISSION_DENIED (status 7)', status: 200, headers: { 'content-type': 'application/grpc', 'grpc-status': '7', 'grpc-message': 'Permission denied on project-acc-A' }, bufferedBody: Buffer.alloc(0) },
+    ];
+
+    for (const proto of protocols) {
+      mockLeaseService.getNextToken.mockResolvedValue(accountA);
+      let attempts = 0;
+      vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async () => {
+        attempts++;
+        if (attempts === 1) {
+          return { statusCode: proto.status, headers: proto.headers, bufferedBody: proto.bufferedBody, bodyStream: createMockStream([proto.bufferedBody]) };
+        }
+        return { statusCode: 200, headers: { 'content-type': 'application/json' }, bufferedBody: Buffer.from('{"candidates":[]}'), bodyStream: createMockStream() };
+      });
+
+      const req = createMockRequest({
+        headers: { 'x-goog-user-project': 'project-acc-A', host: 'daily-cloudcode-pa.googleapis.com' },
+        body: JSON.stringify({ model: 'gemini-2.5-pro', contents: [] }),
+      });
+      const res = createMockResponse();
+
+      await gateway.handleRequest(req, res);
+
+      expect(attempts, `${proto.name} must trigger repair attempt`).toBe(2);
+      expect(res.statusCode, `${proto.name} must return 200`).toBe(200);
+    }
+
+    // gRPC status 3 with ambiguous payload rotates account rather than terminating immediately
+    let leaseIndex = 0;
+    mockLeaseService.getNextToken.mockImplementation(async () => {
+      leaseIndex++;
+      return leaseIndex === 1 ? accountA : accountB;
+    });
+
+    let calls = 0;
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async () => {
+      calls++;
+      if (calls === 1) {
+        return {
+          statusCode: 200,
+          headers: { 'content-type': 'application/grpc', 'grpc-status': '3', 'grpc-message': 'Invalid argument' },
+          bufferedBody: Buffer.from('{"error":{"code":400,"message":"Invalid argument"}}'),
+          bodyStream: createMockStream(),
+        };
+      }
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'application/json' },
+        bufferedBody: Buffer.from('{"candidates":[]}'),
+        bodyStream: createMockStream(),
+      };
+    });
+
+    const req = createMockRequest({
+      headers: { host: 'daily-cloudcode-pa.googleapis.com' },
+      body: JSON.stringify({ model: 'gemini-2.5-pro', contents: [] }),
+    });
+    const res = createMockResponse();
+
+    await gateway.handleRequest(req, res);
+
+    expect(calls).toBe(2);
+    expect(res.statusCode).toBe(200);
+  });
+
+  // B4: Root-level envelope does NOT gain invented nested request.model or request.project, and model conflict detection
+  it('B4: Root-level envelope does NOT gain invented nested request.model or request.project and detects conflicts', () => {
+    // 1. Root-level envelope: no nested request object is created
+    const rootJson = '{"contents":[],"model":"gemini-1.5-pro","project":"p1"}';
+    const rewrittenRoot = rewriteJsonPayloadLossless(rootJson, {
+      model: 'gemini-2.5-pro',
+      routingProject: 'p2',
+    });
+    const parsedRoot = JSON.parse(rewrittenRoot);
+    expect(parsedRoot.model).toBe('gemini-2.5-pro');
+    expect(parsedRoot.project).toBe('p2');
+    expect(parsedRoot.request).toBeUndefined();
+
+    // 2. Nested envelope: preserves request structure without creating root model/project
+    const nestedJson = '{"request":{"contents":[],"model":"gemini-1.5-pro","project":"p1"}}';
+    const rewrittenNested = rewriteJsonPayloadLossless(nestedJson, {
+      model: 'gemini-2.5-pro',
+      routingProject: 'p2',
+    });
+    const parsedNested = JSON.parse(rewrittenNested);
+    expect(parsedNested.request.model).toBe('gemini-2.5-pro');
+    expect(parsedNested.request.project).toBe('p2');
+    expect(parsedNested.model).toBeUndefined();
+    expect(parsedNested.project).toBeUndefined();
+
+    // 3. validateAndExtractRequestModel detects model conflicts
+    const rootNestedConflict = validateAndExtractRequestModel('/v1internal:streamGenerateContent', {
+      model: 'gemini-2.5-pro',
+      request: { model: 'gemini-1.5-flash' },
+    });
+    expect(rootNestedConflict.valid).toBe(false);
+    expect(rootNestedConflict.error).toContain('Conflicting model selectors');
+
+    const urlBodyConflict = validateAndExtractRequestModel(
+      '/v1internal/models/gemini-2.5-pro:streamGenerateContent',
+      { model: 'gemini-1.5-flash' },
+    );
+    expect(urlBodyConflict.valid).toBe(false);
+    expect(urlBodyConflict.error).toContain('Conflicting model selectors');
+
+    const validExtract = validateAndExtractRequestModel(
+      '/v1internal/models/gemini-2.5-pro:streamGenerateContent',
+      { model: 'gemini-2.5-pro' },
+    );
+    expect(validExtract.valid).toBe(true);
+    expect(validExtract.model).toBe('gemini-2.5-pro');
   });
 });

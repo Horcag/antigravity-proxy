@@ -56,16 +56,35 @@ export function isReplaySafeOperation(
   return false;
 }
 
-export function extractModelName(urlPath: string, body?: unknown): string | undefined {
-  const anyBody = body as any;
-  if (anyBody && typeof anyBody === 'object') {
-    if (typeof anyBody.model === 'string' && anyBody.model.trim()) return anyBody.model.trim();
+export function validateAndExtractRequestModel(
+  urlPath: string,
+  body?: unknown,
+): { valid: boolean; model?: string; error?: string } {
+  const urlMatch = urlPath.match(/\/models\/([^/:]+)/);
+  const urlModel = urlMatch?.[1]?.trim() || undefined;
+
+  let rootModel: string | undefined;
+  let nestedModel: string | undefined;
+  if (body && typeof body === 'object') {
+    const anyBody = body as any;
+    if (typeof anyBody.model === 'string' && anyBody.model.trim()) rootModel = anyBody.model.trim();
     if (anyBody.request && typeof anyBody.request === 'object' && typeof anyBody.request.model === 'string') {
-      return anyBody.request.model.trim();
+      nestedModel = anyBody.request.model.trim() || undefined;
     }
   }
-  const urlMatch = urlPath.match(/\/models\/([^/:]+)/);
-  return urlMatch?.[1]?.trim() || undefined;
+
+  if (rootModel && nestedModel && rootModel !== nestedModel) {
+    return { valid: false, error: `Conflicting model selectors: root "${rootModel}" does not match nested "${nestedModel}"` };
+  }
+  const bodyModel = rootModel || nestedModel;
+  if (urlModel && bodyModel && urlModel !== bodyModel) {
+    return { valid: false, error: `Conflicting model selectors: URL model "${urlModel}" does not match body model "${bodyModel}"` };
+  }
+  return { valid: true, model: bodyModel || urlModel || undefined };
+}
+
+export function extractModelName(urlPath: string, body?: unknown): string | undefined {
+  return validateAndExtractRequestModel(urlPath, body).model;
 }
 
 export function decompressBody(buffer: Buffer, contentEncoding?: string | string[]): { text: string; error?: boolean } {
@@ -97,13 +116,9 @@ export function preflightValidateJsonRequest(
     const parsed = JSON.parse(decomp.text);
     if (!parsed || typeof parsed !== 'object') return { valid: false, error: 'Malformed JSON root element' };
 
-    const rootModel = typeof parsed.model === 'string' ? parsed.model.trim() : undefined;
-    const nestedModel = parsed.request && typeof parsed.request === 'object' && typeof parsed.request.model === 'string'
-      ? parsed.request.model.trim()
-      : undefined;
-
-    if (rootModel && nestedModel && rootModel !== nestedModel) {
-      return { valid: false, error: `Conflicting model selectors: root "${rootModel}" does not match nested "${nestedModel}"` };
+    const modelValidation = validateAndExtractRequestModel(urlPath, parsed);
+    if (!modelValidation.valid) {
+      return { valid: false, error: modelValidation.error };
     }
 
     const hasAccountPinned = Boolean(
@@ -140,18 +155,22 @@ export function rewriteJsonPayloadLossless(
   const parsed = (JSON.parse as any)(rawJsonText, reviver);
 
   if (edits.model) {
-    if ('model' in parsed) parsed.model = edits.model;
-    if (parsed.request && typeof parsed.request === 'object') {
+    if ('model' in parsed) {
+      parsed.model = edits.model;
+    }
+    if (parsed.request && typeof parsed.request === 'object' && 'model' in parsed.request) {
       parsed.request.model = edits.model;
     }
   }
 
   if (edits.isProjectless) {
-    delete parsed.project;
-    if (parsed.request && typeof parsed.request === 'object') delete parsed.request.project;
+    if ('project' in parsed) delete parsed.project;
+    if (parsed.request && typeof parsed.request === 'object' && 'project' in parsed.request) delete parsed.request.project;
   } else if (edits.routingProject) {
-    parsed.project = edits.routingProject;
-    if (parsed.request && typeof parsed.request === 'object') {
+    if ('project' in parsed) {
+      parsed.project = edits.routingProject;
+    }
+    if (parsed.request && typeof parsed.request === 'object' && 'project' in parsed.request) {
       parsed.request.project = edits.routingProject;
     }
   }
@@ -196,24 +215,33 @@ export function composeAttemptRequest(options: ComposeAttemptOptions): {
   const needsModelEdit = Boolean(effectiveModel && effectiveModel !== requestedModel);
   const needsProjectEdit = Boolean(routingProject || isProjectless);
 
-  if ((needsModelEdit || needsProjectEdit) && rawBody.length > 0) {
+  const rawContentType = (Array.isArray(reqHeaders['content-type'])
+    ? reqHeaders['content-type'][0]
+    : reqHeaders['content-type'] || '').toLowerCase();
+  const isJson = rawContentType.includes('application/json') || (!rawContentType && (urlPath.includes(':') || urlPath.includes('/models/')));
+
+  if (isJson && (needsModelEdit || needsProjectEdit) && rawBody.length > 0) {
     const decomp = decompressBody(rawBody, contentEncoding);
     if (!decomp.error && decomp.text) {
-      const rewritten = rewriteJsonPayloadLossless(decomp.text, {
-        model: needsModelEdit ? effectiveModel : undefined,
-        routingProject: isProjectless ? undefined : routingProject,
-        isProjectless,
-      });
+      try {
+        const rewritten = rewriteJsonPayloadLossless(decomp.text, {
+          model: needsModelEdit ? effectiveModel : undefined,
+          routingProject: isProjectless ? undefined : routingProject,
+          isProjectless,
+        });
 
-      const utfBuf = Buffer.from(rewritten, 'utf-8');
-      if (contentEncoding.includes('gzip')) {
-        payloadToSend = zlib.gzipSync(utfBuf);
-      } else if (contentEncoding.includes('deflate')) {
-        payloadToSend = zlib.deflateSync(utfBuf);
-      } else if (contentEncoding.includes('br')) {
-        payloadToSend = zlib.brotliCompressSync(utfBuf);
-      } else {
-        payloadToSend = utfBuf;
+        const utfBuf = Buffer.from(rewritten, 'utf-8');
+        if (contentEncoding.includes('gzip')) {
+          payloadToSend = zlib.gzipSync(utfBuf);
+        } else if (contentEncoding.includes('deflate')) {
+          payloadToSend = zlib.deflateSync(utfBuf);
+        } else if (contentEncoding.includes('br')) {
+          payloadToSend = zlib.brotliCompressSync(utfBuf);
+        } else {
+          payloadToSend = utfBuf;
+        }
+      } catch {
+        payloadToSend = rawBody;
       }
     }
   }
@@ -250,8 +278,13 @@ export function composeAttemptRequest(options: ComposeAttemptOptions): {
   }
 
   if (accessToken) {
+    for (const key of Object.keys(upstreamHeaders)) {
+      const lower = key.toLowerCase();
+      if (lower === 'x-goog-api-key' || lower === 'authorization') {
+        delete upstreamHeaders[key];
+      }
+    }
     upstreamHeaders['authorization'] = `Bearer ${accessToken}`;
-    delete upstreamHeaders['x-goog-api-key'];
   } else if (attempt === 1 && reqHeaders['authorization']) {
     upstreamHeaders['authorization'] = String(reqHeaders['authorization']);
   }
@@ -313,5 +346,3 @@ export function extractSessionKey(
   }
   return undefined;
 }
-
-

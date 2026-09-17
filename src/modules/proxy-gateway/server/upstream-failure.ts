@@ -1,6 +1,5 @@
 import * as zlib from 'node:zlib';
 import type { IncomingHttpHeaders } from 'node:http';
-import { sanitizeLogString } from './cloudcode-diagnostics.js';
 
 export type FailureCategory =
   | 'quota'
@@ -66,6 +65,12 @@ export function safeDecodeErrorBody(
   }
 }
 
+const VALID_REASON_CODE = /^[a-zA-Z0-9_.:-]{1,64}$/;
+
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 export function buildSafeErrorMessage(
   category: FailureCategory,
   ruleId: string,
@@ -74,9 +79,8 @@ export function buildSafeErrorMessage(
   sanitizedDetail?: string,
 ): string {
   const code = rpcStatus || (httpStatus ? `HTTP_${httpStatus}` : 'UNKNOWN');
-  if (sanitizedDetail) {
-    const detail = sanitizeLogString(sanitizedDetail).slice(0, 100);
-    return `[${ruleId}] ${category.toUpperCase()} (${code}): ${detail}`;
+  if (sanitizedDetail && VALID_REASON_CODE.test(sanitizedDetail.trim())) {
+    return `[${ruleId}] ${category.toUpperCase()} (${code}): ${sanitizedDetail.trim()}`;
   }
   return `[${ruleId}] ${category.toUpperCase()} (${code})`;
 }
@@ -106,7 +110,8 @@ function makeEvidence(
 }
 
 export function classifyUpstreamFailure(options: ClassifyFailureOptions): FailureEvidence {
-  const { statusCode, headers, bufferedBody, errorText: explicitErrorText, modelName, source = 'http' } = options;
+  const { headers, bufferedBody, errorText: explicitErrorText, modelName, source = 'http' } = options;
+  let { statusCode } = options;
 
   let errorText = explicitErrorText;
   let decodeError = false;
@@ -117,19 +122,19 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
   }
 
   let rpcStatus: string | undefined;
-  let parsedMessage: string | undefined;
   let errorInfoReason: string | undefined;
   let errorInfoDomain: string | undefined;
   let hasFieldViolations = false;
   let hasQuotaViolations = false;
-
+  let isValidJson = false;
   try {
     const trimmed = errorText.trim();
-    if (trimmed.startsWith('{')) {
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
       const parsed = JSON.parse(trimmed);
+      isValidJson = true;
       if (parsed?.error && typeof parsed.error === 'object') {
         if (typeof parsed.error.status === 'string') rpcStatus = parsed.error.status;
-        if (typeof parsed.error.message === 'string') parsedMessage = parsed.error.message;
+        if (typeof parsed.error.code === 'number' && statusCode < 400) statusCode = parsed.error.code;
         if (Array.isArray(parsed.error.details)) {
           for (const d of parsed.error.details) {
             const type = d['@type'] || '';
@@ -151,17 +156,33 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
   const grpcHeader = headers['grpc-status'];
   if (grpcHeader !== undefined && String(grpcHeader) !== '0') {
     const code = String(grpcHeader);
+    if (code === '3') {
+      const isInvalid = hasFieldViolations ||
+        /field.*violation|syntax.*error|malformed json|unexpected token/i.test(errorText);
+      const cat = isInvalid ? 'invalid-request' : 'ambiguous-invalid-argument';
+      const rule = isInvalid ? 'google.grpc.bad-request' : 'google.grpc.invalid-argument';
+      return makeEvidence(cat, rule, 'grpc', 400, 'INVALID_ARGUMENT',
+        buildSafeErrorMessage(cat, rule, 'INVALID_ARGUMENT', 400, errorInfoReason), errorText, false, isInvalid ? 'explicit' : 'unknown');
+    }
+    if (code === '5') {
+      return makeEvidence('model-capability', 'google.grpc.not-found', 'grpc', 404, 'NOT_FOUND',
+        buildSafeErrorMessage('model-capability', 'google.grpc.not-found', 'NOT_FOUND', 404, errorInfoReason || modelName), errorText, false);
+    }
+    if (code === '7') {
+      return makeEvidence('project-context', 'google.grpc.permission-denied', 'grpc', 403, 'PERMISSION_DENIED',
+        buildSafeErrorMessage('project-context', 'google.grpc.permission-denied', 'PERMISSION_DENIED', 403, errorInfoReason), errorText, false);
+    }
     if (code === '8') {
       return makeEvidence('quota', 'google.grpc.resource-exhausted', 'grpc', 429, 'RESOURCE_EXHAUSTED',
-        buildSafeErrorMessage('quota', 'google.grpc.resource-exhausted', 'RESOURCE_EXHAUSTED', 429), errorText, true);
+        buildSafeErrorMessage('quota', 'google.grpc.resource-exhausted', 'RESOURCE_EXHAUSTED', 429, errorInfoReason), errorText, true);
     }
     if (code === '14') {
       return makeEvidence('transient', 'google.grpc.unavailable', 'grpc', 503, 'UNAVAILABLE',
-        buildSafeErrorMessage('transient', 'google.grpc.unavailable', 'UNAVAILABLE', 503), errorText, false);
+        buildSafeErrorMessage('transient', 'google.grpc.unavailable', 'UNAVAILABLE', 503, errorInfoReason), errorText, false);
     }
     if (code === '16') {
       return makeEvidence('authentication', 'google.grpc.unauthenticated', 'grpc', 401, 'UNAUTHENTICATED',
-        buildSafeErrorMessage('authentication', 'google.grpc.unauthenticated', 'UNAUTHENTICATED', 401), errorText, false);
+        buildSafeErrorMessage('authentication', 'google.grpc.unauthenticated', 'UNAUTHENTICATED', 401, errorInfoReason), errorText, false);
     }
   }
 
@@ -169,23 +190,23 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
   if (hasQuotaViolations || errorInfoReason === 'RATE_LIMIT_EXCEEDED' || errorInfoReason === 'RESOURCE_EXHAUSTED') {
     const rpc = rpcStatus || 'RESOURCE_EXHAUSTED';
     return makeEvidence('quota', 'google.aip193.quota-failure', source, statusCode, rpc,
-      buildSafeErrorMessage('quota', 'google.aip193.quota-failure', rpc, statusCode, parsedMessage), errorText, true);
+      buildSafeErrorMessage('quota', 'google.aip193.quota-failure', rpc, statusCode, errorInfoReason), errorText, true);
   }
   if (errorInfoDomain === 'serviceusage.googleapis.com' || errorInfoReason === 'CONSUMER_INVALID' ||
       errorInfoReason === 'SERVICE_DISABLED' || errorInfoReason === 'USER_PROJECT_DENIED') {
     const rpc = rpcStatus || 'PERMISSION_DENIED';
     return makeEvidence('project-context', 'google.aip193.project-context', source, statusCode, rpc,
-      buildSafeErrorMessage('project-context', 'google.aip193.project-context', rpc, statusCode, parsedMessage), errorText, false);
+      buildSafeErrorMessage('project-context', 'google.aip193.project-context', rpc, statusCode, errorInfoReason), errorText, false);
   }
   if (hasFieldViolations) {
     const rpc = rpcStatus || 'INVALID_ARGUMENT';
     return makeEvidence('invalid-request', 'google.aip193.bad-request', source, statusCode, rpc,
-      buildSafeErrorMessage('invalid-request', 'google.aip193.bad-request', rpc, statusCode, parsedMessage), errorText, false);
+      buildSafeErrorMessage('invalid-request', 'google.aip193.bad-request', rpc, statusCode, errorInfoReason), errorText, false);
   }
   if (errorInfoReason === 'MODEL_NOT_FOUND' || errorInfoReason === 'MODEL_DEPRECATED') {
     const rpc = rpcStatus || 'NOT_FOUND';
     return makeEvidence('model-capability', 'google.aip193.model-not-found', source, statusCode, rpc,
-      buildSafeErrorMessage('model-capability', 'google.aip193.model-not-found', rpc, statusCode, modelName), errorText, false);
+      buildSafeErrorMessage('model-capability', 'google.aip193.model-not-found', rpc, statusCode, errorInfoReason || modelName), errorText, false);
   }
 
   // 3. Invalid Request (Evaluated BEFORE model check & quota check)
@@ -198,24 +219,24 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
   if (isInvalidRequest) {
     const rpc = rpcStatus || 'INVALID_ARGUMENT';
     return makeEvidence('invalid-request', 'google.request.invalid', source, statusCode, rpc,
-      buildSafeErrorMessage('invalid-request', 'google.request.invalid', rpc, statusCode, parsedMessage), errorText, false);
+      buildSafeErrorMessage('invalid-request', 'google.request.invalid', rpc, statusCode, errorInfoReason), errorText, false);
   }
 
   // 4. Project Context Failure (Evaluated BEFORE quota check)
   const isProject =
-    (statusCode === 400 || statusCode === 403) && (
+    (statusCode === 400 || statusCode === 403 || rpcStatus === 'PERMISSION_DENIED') && (
       lowerText.includes('x-goog-user-project') ||
       lowerText.includes('serviceusage.services.use') ||
       lowerText.includes('quota project') ||
       lowerText.includes('consumer project') ||
       lowerText.includes('caller project') ||
       lowerText.includes('permission to use this quota project') ||
-      (statusCode === 403 && lowerText.includes('permission_denied') && lowerText.includes('project'))
+      ((statusCode === 403 || rpcStatus === 'PERMISSION_DENIED') && lowerText.includes('project'))
     );
   if (isProject) {
     const rpc = rpcStatus || 'PERMISSION_DENIED';
     return makeEvidence('project-context', 'google.project.context-rejected', source, statusCode, rpc,
-      buildSafeErrorMessage('project-context', 'google.project.context-rejected', rpc, statusCode, parsedMessage), errorText, false);
+      buildSafeErrorMessage('project-context', 'google.project.context-rejected', rpc, statusCode, errorInfoReason), errorText, false);
   }
 
   // 5. Quota / Rate limit (Excludes quota project permission denial)
@@ -235,16 +256,17 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
     const rpc = rpcStatus || 'RESOURCE_EXHAUSTED';
     const finalStatus = statusCode === 200 || !statusCode ? 429 : statusCode;
     return makeEvidence('quota', 'google.quota.exhausted', source, finalStatus, rpc,
-      buildSafeErrorMessage('quota', 'google.quota.exhausted', rpc, finalStatus, parsedMessage), errorText, true);
+      buildSafeErrorMessage('quota', 'google.quota.exhausted', rpc, finalStatus, errorInfoReason), errorText, true);
   }
 
   // 6. Model Capability / Incompatibility (Explicit model identification only)
+  const escapedModel = modelName ? escapeRegExp(modelName) : '';
   const isModelIncompatible =
-    Boolean(modelName) &&
+    Boolean(escapedModel) &&
     (statusCode === 400 || statusCode === 404) &&
     (
-      new RegExp(`models/${modelName}.*(?:not found|is not supported|does not exist)`, 'i').test(errorText) ||
-      new RegExp(`model ['"]?${modelName}['"]?.*(?:not found|is not supported|does not exist)`, 'i').test(errorText) ||
+      new RegExp(`models/${escapedModel}.*(?:not found|is not supported|does not exist)`, 'i').test(errorText) ||
+      new RegExp(`model ['"]?${escapedModel}['"]?.*(?:not found|is not supported|does not exist)`, 'i').test(errorText) ||
       /unsupported model|model not supported|model does not exist/i.test(errorText) ||
       (statusCode === 404 && /model.*not found/i.test(errorText))
     );
@@ -267,14 +289,20 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
   if (isAuth) {
     const rpc = rpcStatus || 'UNAUTHENTICATED';
     return makeEvidence('authentication', 'google.auth.invalid-credentials', source, statusCode, rpc,
-      buildSafeErrorMessage('authentication', 'google.auth.invalid-credentials', rpc, statusCode), errorText, false);
+      buildSafeErrorMessage('authentication', 'google.auth.invalid-credentials', rpc, statusCode, errorInfoReason), errorText, false);
   }
 
-  // 8. Ambiguous 400 INVALID_ARGUMENT (only when body was cleanly parsed)
+  // 8. Ambiguous 400 INVALID_ARGUMENT vs other 400 invalid-request
   if (statusCode === 400 && !decodeError) {
+    const isAmbiguous = (isValidJson || !errorText.trim()) && (!rpcStatus || rpcStatus === 'INVALID_ARGUMENT');
+    if (isAmbiguous) {
+      const rpc = rpcStatus || 'INVALID_ARGUMENT';
+      return makeEvidence('ambiguous-invalid-argument', 'google.generic.invalid-argument', source, statusCode, rpc,
+        buildSafeErrorMessage('ambiguous-invalid-argument', 'google.generic.invalid-argument', rpc, statusCode), errorText, false, 'unknown');
+    }
     const rpc = rpcStatus || 'INVALID_ARGUMENT';
-    return makeEvidence('ambiguous-invalid-argument', 'google.generic.invalid-argument', source, statusCode, rpc,
-      buildSafeErrorMessage('ambiguous-invalid-argument', 'google.generic.invalid-argument', rpc, statusCode), errorText, false, 'unknown');
+    return makeEvidence('invalid-request', 'google.request.invalid-400', source, statusCode, rpc,
+      buildSafeErrorMessage('invalid-request', 'google.request.invalid-400', rpc, statusCode, errorInfoReason), errorText, false);
   }
 
   // 9. Transient / Network / Decoding error

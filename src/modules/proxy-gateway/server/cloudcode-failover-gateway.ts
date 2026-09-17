@@ -17,6 +17,7 @@ import { extractModelName, extractSessionKey, isReplaySafeOperation, composeAtte
 import { classifyUpstreamFailure, type FailureEvidence } from './upstream-failure';
 import { evaluateRetryDecision } from './upstream-retry-decision';
 import { logUpstreamFailure } from './cloudcode-diagnostics';
+import { formatTerminalDownstreamError } from './cloudcode-terminal-response';
 export { isVerifiedSessionKey, isHintSessionKey };
 export type ProtocolFailureCategory = 'inspection-limit' | 'unsupported-encoding' | 'malformed-upstream-message' | 'deadline-exceeded' | 'account-quota' | 'upstream-transient';
 export interface ProtocolFrameDecision {
@@ -62,7 +63,9 @@ export class CloudCodeFailoverGateway {
       try { if (body === undefined) res.end(); else res.end(body); return true; } catch (err) { rejectAndTerminateDownstream(err); return false; }
     };
     const writeDownstream = (classification: Parameters<AnonymousTransportReceiptOwner['expectDownstreamCommit']>[0], statusCode: number, headers: http.IncomingHttpHeaders, body?: string | Buffer): boolean => {
-      writeDownstreamHeaders(classification, statusCode, headers); return endDownstream(body);
+      let s = statusCode, h = headers, b = body;
+      if (statusCode >= 400) { const f = formatTerminalDownstreamError(req, statusCode, headers, body); s = f.statusCode; h = f.headers; b = f.body; }
+      writeDownstreamHeaders(classification, s, h); return endDownstream(b);
     };
     const writeDownstreamChunk = (chunk: Buffer): boolean => {
       try { return (res as any).write(chunk); } catch (err) { rejectAndTerminateDownstream(err); return false; }
@@ -187,12 +190,7 @@ export class CloudCodeFailoverGateway {
       if (totalBodyBytes > MAX_REQUEST_BODY_BYTES) {
         if (!res.headersSent) {
           writeDownstream('request_too_large', 413, { 'content-type': 'application/json' },
-            JSON.stringify({
-              error: {
-                code: 413,
-                message: 'Payload Too Large: request body exceeds 64 MiB limit',
-              },
-            }));
+            JSON.stringify({ error: { code: 413, message: 'Payload Too Large: request body exceeds 64 MiB limit' } }));
         }
         return;
       }
@@ -205,18 +203,8 @@ export class CloudCodeFailoverGateway {
     const preflight = preflightValidateJsonRequest(rawBody, req.headers, urlPath);
     if (!preflight.valid) {
       if (!res.headersSent) {
-        writeDownstream(
-          'bad_gateway',
-          400,
-          { 'content-type': 'application/json' },
-          JSON.stringify({
-            error: {
-              code: 400,
-              message: preflight.error || 'Invalid request body',
-              status: 'INVALID_ARGUMENT',
-            },
-          }),
-        );
+        writeDownstream('bad_gateway', 400, { 'content-type': 'application/json' },
+          JSON.stringify({ error: { code: 400, message: preflight.error || 'Invalid request body', status: 'INVALID_ARGUMENT' } }));
       }
       return;
     }
@@ -238,6 +226,7 @@ export class CloudCodeFailoverGateway {
     const requestId = crypto.randomUUID(); // 3. Failover retry loop (ResponseCommitGate)
     const attemptedAccountIds = new Set<string>();
     const maxAttempts = 5;
+    let transientRetriesUsed = 0;
     let migrationAuthorization: MigrationAuthorization | undefined;
     const issueMigrationAuthorization = (reason: MigrationAuthorizationReason, expectedGen?: number, expectedInc?: number): void => {
       const binding = this.accountLeaseService?.getSessionBinding?.(sessionKey);
@@ -299,61 +288,36 @@ export class CloudCodeFailoverGateway {
         if (this.accountLeaseService) {
           if (typeof this.accountLeaseService.acquireAttemptLease === 'function') {
             activeLease = await this.accountLeaseService.acquireAttemptLease({
-              model: modelName,
-              excludeAccountIds: Array.from(attemptedAccountIds),
-              sessionKey,
-              deferSessionBinding: true,
-              migrationAuthorization,
-              signal: requestAbortController.signal, requestId, affinityOwnerTimeoutMs,
+              model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey,
+              deferSessionBinding: true, migrationAuthorization, signal: requestAbortController.signal, requestId, affinityOwnerTimeoutMs,
             });
           } else {
             const acc = await this.accountLeaseService.getNextToken({
-              model: modelName,
-              excludeAccountIds: Array.from(attemptedAccountIds),
-              sessionKey,
-              deferSessionBinding: true,
+              model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, deferSessionBinding: true,
             });
             if (acc) {
-              activeLease = {
-                account: acc,
-                sessionKey,
-                generation: 1,
-                tableIncarnation: this.accountLeaseService.getTableIncarnation?.(),
-                releaseReservation: acc.releaseReservation ?? (() => {}),
-              };
+              activeLease = { account: acc, sessionKey, generation: 1, tableIncarnation: this.accountLeaseService.getTableIncarnation?.(), releaseReservation: acc.releaseReservation ?? (() => {}) };
             }
           }
         }
         if (this.accountLeaseService && !activeLease) {
-          logger.warn(
-            `[CloudCodeGateway] No account lease available in managed pool on attempt ${attempt}. Disallowing unreserved passthrough.`,
-          );
+          logger.warn(`[CloudCodeGateway] No account lease available in managed pool on attempt ${attempt}. Disallowing unreserved passthrough.`);
           if (!responseCommitted && !res.writableEnded) {
             const ambiguous = lastAmbiguousError as { statusCode: number; headers: http.IncomingHttpHeaders; bufferedBody?: Buffer } | null;
             if (ambiguous) {
-              writeDownstream(
-                'bad_gateway',
-                ambiguous.statusCode,
-                ambiguous.headers,
-                ambiguous.bufferedBody,
-              );
+              writeDownstream('bad_gateway', ambiguous.statusCode, ambiguous.headers, ambiguous.bufferedBody);
               return;
             }
             writeDownstream('unavailable', 503, { 'content-type': 'application/json' },
-              JSON.stringify({
-                error: {
-                  code: 503,
-                  message: 'No available upstream account capacity in managed pool',
-                  status: 'UNAVAILABLE',
-                },
-              }));
+              JSON.stringify({ error: { code: 503, message: 'No available upstream account capacity in managed pool', status: 'UNAVAILABLE' } }));
           }
           return;
         }
-
         quotaHeaderMode = 'with-quota-header';
         accountProjectCorrectionsUsed = 0;
+      }
 
+      try {
         activeReleaseReservation = activeLease?.releaseReservation;
         activeCompleteAffinityPlacement = activeLease?.completeAffinityPlacement;
         if (activeLease?.affinityAbortSignal?.aborted) { abortExpiredAffinityOwner(); return; }
@@ -438,16 +402,13 @@ export class CloudCodeFailoverGateway {
           if (candidateRenewalTimer) { clearInterval(candidateRenewalTimer); candidateRenewalTimer = null; }
         };
         activeStopCandidateRenewal = stopCandidateRenewal;
-      }
 
-      if (clientAborted || res.destroyed) {
-        releaseActiveLease();
-        return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
-      }
+        if (clientAborted || res.destroyed) {
+          releaseActiveLease();
+          return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
+        }
 
-      const account = activeLease?.account ?? null;
-
-      try {
+        const account = activeLease?.account ?? null;
         const effectiveModel =
           account && requestedModel && typeof this.accountLeaseService?.resolveDynamicModelForAccount === 'function'
             ? this.accountLeaseService.resolveDynamicModelForAccount(account.id, requestedModel)
@@ -480,6 +441,7 @@ export class CloudCodeFailoverGateway {
             isReplaySafe, ambiguityProbesUsed, maxAmbiguityProbes: 1,
             projectCorrectionsUsed: accountProjectCorrectionsUsed, maxProjectCorrections: 1,
             quotaHeaderMode, hasAlternativeAccounts: attempt < maxAttempts, effectiveModel,
+            transientRetriesUsed,
           });
 
           logUpstreamFailure({
@@ -520,6 +482,7 @@ export class CloudCodeFailoverGateway {
           }
 
           if (decision.action.kind === 'retry-transient') {
+            transientRetriesUsed++;
             exhaustedByUnavailable = true;
             logger.warn(
               `[CloudCodeGateway] Upstream returned transient ${status} (attempt ${attempt}/${maxAttempts}). Retrying on same account...`,
@@ -584,13 +547,16 @@ export class CloudCodeFailoverGateway {
           return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
         }
         if (statusCode >= 400) {
+          const isGrpc = headers['grpc-status'] !== undefined || String(headers['content-type'] || '').includes('application/grpc');
+          const isSse = String(headers['content-type'] || '').includes('text/event-stream');
+          const isJson = String(headers['content-type'] || '').includes('application/json');
           const evidence = classifyUpstreamFailure({
             statusCode,
             headers,
             bufferedBody,
             modelName: effectiveModel,
             urlPath: attemptUrlPath,
-            source: 'http',
+            source: isGrpc ? 'grpc' : isSse ? 'sse' : isJson ? 'json' : 'http',
           });
           const outcome = await handleFailureOutcome(evidence, statusCode, headers, bufferedBody);
           if (outcome === 'continue') continue;
@@ -914,6 +880,16 @@ export class CloudCodeFailoverGateway {
                     );
                     releaseActiveLease();
                     bodyStream.destroy();
+                    if (!isReplaySafe) {
+                      const errBody = encodeErrorBody({
+                        code: 502,
+                        status: 'BAD_GATEWAY',
+                        message: 'Bad Gateway: Session confirmation rejected on non-replayable operation',
+                        category: 'session-confirmation-rejected',
+                      });
+                      writeDownstream('bad_gateway', 502, { 'content-type': 'application/json' }, errBody);
+                      return;
+                    }
                     continue;
                   }
                 } else if (typeof this.accountLeaseService?.bindSession === 'function') {
@@ -938,6 +914,16 @@ export class CloudCodeFailoverGateway {
                     );
                     releaseActiveLease();
                     bodyStream.destroy();
+                    if (!isReplaySafe) {
+                      const errBody = encodeErrorBody({
+                        code: 502,
+                        status: 'BAD_GATEWAY',
+                        message: 'Bad Gateway: Session binding rejected on non-replayable operation',
+                        category: 'session-binding-rejected',
+                      });
+                      writeDownstream('bad_gateway', 502, { 'content-type': 'application/json' }, errBody);
+                      return;
+                    }
                     continue;
                   }
                 }
@@ -1032,10 +1018,23 @@ export class CloudCodeFailoverGateway {
         return;
       } catch (err) {
         releaseActiveLease();
+        activeStopCandidateRenewal?.();
         if (deadlineWriteFailure) throw deadlineWriteFailure;
         if (err instanceof GatewayReceiptTransferError) throw err;
         if (upstreamResponseSelected && !responseCommitted) throw new GatewayReceiptTransferError(receiptOwner, err);
         if (responseCommitted) { destroyActiveUpstream(); rejectAndTerminateDownstream(err); return; }
+        if (!currentUpstreamReq) {
+          logger.warn(`[CloudCodeGateway] Preparation error before upstream dispatch: ${err instanceof Error ? err.message : String(err)}`);
+          writeDownstream('bad_gateway', 502, { 'content-type': 'application/json' },
+            JSON.stringify({
+              error: {
+                code: 502,
+                message: `Gateway preparation error: ${err instanceof Error ? err.message : 'Unknown error'}`,
+                status: 'INTERNAL',
+              },
+            }));
+          return;
+        }
         if (!isReplaySafe) {
           writeDownstream('bad_gateway', 502, { 'content-type': 'application/json' },
             JSON.stringify({
@@ -1081,20 +1080,10 @@ export class CloudCodeFailoverGateway {
   }
   private writeHeaders(
     res: http.ServerResponse | http2.Http2ServerResponse,
-    statusCode: number,
-    headers: http.IncomingHttpHeaders,
+    statusCode: number, headers: http.IncomingHttpHeaders,
   ): void {
-
-
-
     const responseHeaders: Record<string, string | string[]> = {};
-    const forbidden = new Set([
-      'connection',
-      'keep-alive',
-      'proxy-connection',
-      'transfer-encoding',
-      'upgrade',
-    ]);
+    const forbidden = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade']);
     for (const [k, v] of Object.entries(headers)) {
       if (!k.startsWith(':') && !forbidden.has(k.toLowerCase()) && v !== undefined) {
         responseHeaders[k] = v;
@@ -1108,20 +1097,20 @@ export class CloudCodeFailoverGateway {
   private isQuotaErrorText(text?: string): boolean {
     if (!text) return false;
     const lower = text.toLowerCase();
+    if (lower.includes('quota project') || lower.includes('serviceusage')) return false;
     return (
       lower.includes('quota') ||
       lower.includes('resource_exhausted') ||
       lower.includes('rate limit') ||
-      lower.includes('credit')
+      lower.includes('credit') ||
+      lower.includes('429')
     );
   }
   private classifyParsedEnvelope(
     parsed: any,
     statusCode?: number,
   ): ProtocolFrameDecision | null {
-    if (!parsed || typeof parsed !== 'object') {
-      return null;
-    }
+    if (!parsed || typeof parsed !== 'object') return null;
     const hasUsableCandidates = Array.isArray(parsed.candidates) && parsed.candidates.length > 0;
     const hasUsableChoices = Array.isArray(parsed.choices) && parsed.choices.length > 0;
     const hasModelDeltas = parsed.type === 'content_block_delta' || parsed.delta !== undefined;
@@ -1135,11 +1124,11 @@ export class CloudCodeFailoverGateway {
       const err = parsed.error;
       code = err.code ?? err.status ?? statusCode;
       msg = String(err.message || '').toLowerCase();
-      errorText = JSON.stringify(err);
+      errorText = JSON.stringify({ error: err });
     } else if (typeof parsed.error === 'string') {
       code = statusCode;
       msg = parsed.error.toLowerCase();
-      errorText = parsed.error;
+      errorText = JSON.stringify({ error: { message: parsed.error, code: statusCode } });
     } else if (typeof parsed.message === 'string') {
       const lower = parsed.message.toLowerCase();
       if (
@@ -1149,14 +1138,19 @@ export class CloudCodeFailoverGateway {
       ) {
         code = statusCode;
         msg = lower;
-        errorText = parsed.message;
+        errorText = JSON.stringify({ error: { message: parsed.message, code: statusCode } });
       }
     }
     if (errorText !== undefined) {
       const isQuota =
         code === 429 || code === 'RESOURCE_EXHAUSTED' ||
-        msg.includes('individual quota reached') || msg.includes('quota') ||
-        msg.includes('resource_exhausted') || msg.includes('rate limit');
+        (!msg.includes('quota project') && (
+          msg.includes('individual quota reached') ||
+          msg.includes('exhausted your quota') ||
+          msg.includes('quota exceeded') ||
+          msg.includes('resource_exhausted') ||
+          (msg.includes('rate limit') && !msg.includes('project'))
+        ));
       const isTransient = code === 503 || msg.includes('unavailable');
       return {
         state: 'VALIDATED_ERROR',

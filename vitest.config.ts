@@ -10,5 +10,8 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['src/tests/**/*.test.ts', 'scripts/**/*.test.ts'],
+    env: {
+      AG_PROXY_SOCKET_NAME: 'antigravity-proxy-test-owner',
+    },
   },
 });

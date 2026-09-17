@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { CloudCodeFailoverGateway } from '../../modules/proxy-gateway/server/cloudcode-failover-gateway.js';
-import { classifyUpstreamFailure } from '../../modules/proxy-gateway/server/upstream-failure.js';
+import { classifyUpstreamFailure, buildSafeErrorMessage } from '../../modules/proxy-gateway/server/upstream-failure.js';
 import { evaluateRetryDecision } from '../../modules/proxy-gateway/server/upstream-retry-decision.js';
-import { logUpstreamFailure } from '../../modules/proxy-gateway/server/cloudcode-diagnostics.js';
+import { logUpstreamFailure, sanitizeLogString } from '../../modules/proxy-gateway/server/cloudcode-diagnostics.js';
 import { Logger } from '@nestjs/common';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
@@ -207,5 +207,85 @@ describe('Oracle R1-R8 Acceptance Verification', () => {
     const emitted = nestWarnSpy.mock.calls.flat().map(String).join(' ');
     expect(emitted).not.toContain(secret);
     expect(emitted).toContain('[REDACTED_SENTINEL]');
+  });
+
+  it('B2: Plaintext error header consistency strips content-encoding and frames SSE data', async () => {
+    const accA = createMockAccount('acc-A', 'a@test.com');
+    mockLeaseService.acquireAttemptLease = vi.fn().mockResolvedValue({
+      account: accA, generation: 1, releaseReservation: vi.fn(), completeAffinityPlacement: vi.fn(),
+    });
+
+    const errorBody = Buffer.from(JSON.stringify({ error: { code: 403, message: 'Denied' } }));
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockResolvedValue({
+      statusCode: 403,
+      headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+      bufferedBody: errorBody,
+      bodyStream: createMockStream(),
+    });
+
+    const req = createMockRequest();
+    req.headers['accept'] = 'text/event-stream';
+    const res = createMockResponse();
+
+    await gateway.handleRequest(req, res);
+
+    expect(res.headers['content-encoding']).toBeUndefined();
+    expect(res.headers['content-type']).toContain('text/event-stream');
+    expect(res.body).toMatch(/^data:\s*\{"error":\{.*"code":403.*\}\}\n\n$/);
+    expect(res.headers['content-length']).toBe(String(Buffer.byteLength(res.body)));
+  });
+
+  it('B3: Sanitizer strips quoted JSON credentials canary without synthetic prefix', () => {
+    const rawJsonCanary = '{"access_token": "ya29.CANARY_TOKEN_WITHOUT_PREFIX_12345", "client_secret": "SUPER_SECRET_999"}';
+    const sanitized = sanitizeLogString(rawJsonCanary);
+    expect(sanitized).not.toContain('CANARY_TOKEN_WITHOUT_PREFIX_12345');
+    expect(sanitized).not.toContain('SUPER_SECRET_999');
+    expect(sanitized).toContain('[REDACTED]');
+
+    const safeMsg = buildSafeErrorMessage('invalid-request', 'rule.1', 'INVALID_ARGUMENT', 400, 'unvalidated message with secret token');
+    expect(safeMsg).toBe('[rule.1] INVALID-REQUEST (INVALID_ARGUMENT)');
+    const validReasonMsg = buildSafeErrorMessage('project-context', 'rule.2', 'PERMISSION_DENIED', 403, 'USER_PROJECT_DENIED');
+    expect(validReasonMsg).toBe('[rule.2] PROJECT-CONTEXT (PERMISSION_DENIED): USER_PROJECT_DENIED');
+  });
+
+  it('B5: Session-confirmation rejection on non-replayable operation produces exactly 1 upstream call and terminates with 502', async () => {
+    const accA = createMockAccount('acc-A', 'a@test.com');
+    const accB = createMockAccount('acc-B', 'b@test.com');
+    let leaseAcquiredCount = 0;
+    const releaseReservation = vi.fn();
+    mockLeaseService.acquireAttemptLease = vi.fn().mockImplementation(async () => {
+      leaseAcquiredCount++;
+      return {
+        account: leaseAcquiredCount === 1 ? accA : accB,
+        generation: 1,
+        releaseReservation,
+        completeAffinityPlacement: vi.fn(),
+      };
+    });
+
+    let upstreamCalls = 0;
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async () => {
+      upstreamCalls++;
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'application/json' },
+        bufferedBody: Buffer.from('{"result":"ok"}'),
+        bodyStream: createMockStream(['{"result":"ok"}']),
+      };
+    });
+
+    mockLeaseService.confirmOrBindSession = vi.fn().mockReturnValue({ kind: 'rejected', reason: 'lost-race' });
+
+    const req = createMockRequest();
+    req.method = 'POST';
+    req.url = '/v1internal:deleteSession';
+    req.headers['x-session-id'] = 'session-b5-test';
+    const res = createMockResponse();
+
+    await gateway.handleRequest(req, res);
+
+    expect(upstreamCalls).toBe(1);
+    expect(res.statusCode).toBe(502);
+    expect(releaseReservation).toHaveBeenCalled();
   });
 });
