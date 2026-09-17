@@ -9,7 +9,10 @@ export type MigrationAuthorizationReason =
   | 'account-disabled'
   | 'authentication-failure'
   | 'model-incompatible'
-  | 'quota-exhausted';
+  | 'quota-exhausted'
+  | 'project-rejected'
+  | 'ambiguity-probe'
+  | 'upstream-transient';
 
 export interface MigrationAuthorization {
   reason: MigrationAuthorizationReason;
