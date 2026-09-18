@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
+import Fastify from 'fastify';
+import { Observable } from 'rxjs';
 import { OpenAIProtocolException } from '../../modules/proxy-gateway/server/openai-protocol-error';
 import {
   OpenAIRequestNormalizer,
@@ -329,6 +331,31 @@ describe('OpenAIRequestNormalizer', () => {
       expect(headersSent['content-length']).toBeUndefined();
       expect(headersSent['content-encoding']).toBeUndefined();
       expect(headersSent['content-type']).toBeUndefined();
+    });
+
+    it('transmits compatibility headers and chunks through real Fastify HTTP pipeline', async () => {
+      const { controller } = createController({});
+      const app = Fastify();
+      app.get('/test-stream', (req, reply) => {
+        reply.header('x-ag-proxy-dropped-params', 'user, metadata');
+        reply.header('x-ag-proxy-honored-locally', 'store');
+        const stream = new Observable<string>((sub) => {
+          sub.next('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n');
+          sub.next('data: [DONE]\n\n');
+          sub.complete();
+        });
+        (controller as any).writeSseResponse(reply, stream, 'openai');
+      });
+
+      const response = await app.inject({ method: 'GET', url: '/test-stream' });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toBe('text/event-stream');
+      expect(response.headers['cache-control']).toBe('no-cache');
+      expect(response.headers['connection']).toBe('keep-alive');
+      expect(response.headers['x-ag-proxy-dropped-params']).toBe('user, metadata');
+      expect(response.headers['x-ag-proxy-honored-locally']).toBe('store');
+      expect(response.body).toContain('data: [DONE]\n\n');
+      await app.close();
     });
   });
 
