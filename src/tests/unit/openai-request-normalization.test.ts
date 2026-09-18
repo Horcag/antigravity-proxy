@@ -308,23 +308,27 @@ describe('OpenAIRequestNormalizer', () => {
       expect(reply.headers['x-ag-proxy-honored-locally']).toBe('store');
     });
 
-    it('forwards compatibility headers into raw SSE writeHead during streaming', () => {
+    it('forwards compatibility headers into raw SSE writeHead during streaming while sanitizing conflicting representation headers', () => {
       const { controller } = createController({});
       const reply = createMockReply();
       reply.header('x-ag-proxy-dropped-params', 'user, metadata');
       reply.header('x-ag-proxy-honored-locally', 'store');
+      reply.header('content-length', '1234');
+      reply.header('content-encoding', 'gzip');
+      reply.header('content-type', 'application/json');
 
       const dummyStream: any = { subscribe: () => ({ unsubscribe: vi.fn() }) };
       (controller as any).writeSseResponse(reply, dummyStream, 'chat');
 
-      expect(reply.raw.writeHead).toHaveBeenCalledWith(
-        200,
-        expect.objectContaining({
-          'Content-Type': 'text/event-stream',
-          'x-ag-proxy-dropped-params': 'user, metadata',
-          'x-ag-proxy-honored-locally': 'store',
-        }),
-      );
+      const headersSent = reply.raw.writeHead.mock.calls[0][1];
+      expect(headersSent['Content-Type']).toBe('text/event-stream');
+      expect(headersSent['Cache-Control']).toBe('no-cache');
+      expect(headersSent['Connection']).toBe('keep-alive');
+      expect(headersSent['x-ag-proxy-dropped-params']).toBe('user, metadata');
+      expect(headersSent['x-ag-proxy-honored-locally']).toBe('store');
+      expect(headersSent['content-length']).toBeUndefined();
+      expect(headersSent['content-encoding']).toBeUndefined();
+      expect(headersSent['content-type']).toBeUndefined();
     });
   });
 

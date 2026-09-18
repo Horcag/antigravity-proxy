@@ -3117,9 +3117,8 @@ export class ProxyController {
       (res as { hijack: () => void }).hijack();
     }
 
-    const bufferedHeaders = isFunction((res as any).getHeaders) ? (res as any).getHeaders() : {};
-    delete (bufferedHeaders as any)['content-length'];
-    delete (bufferedHeaders as any)['content-encoding'];
+    const bufferedHeaders = isFunction((res as any).getHeaders) ? { ...(res as any).getHeaders() } : {};
+    Object.keys(bufferedHeaders).forEach((k) => { if (/^(content-(length|encoding|type)|cache-control|connection)$/i.test(k)) delete bufferedHeaders[k]; });
     res.raw.writeHead(HttpStatus.OK, {
       ...bufferedHeaders,
       'Content-Type': 'text/event-stream',
