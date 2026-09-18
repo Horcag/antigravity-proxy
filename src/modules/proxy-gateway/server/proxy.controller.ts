@@ -3118,7 +3118,9 @@ export class ProxyController {
     }
 
     const bufferedHeaders = isFunction((res as any).getHeaders) ? { ...(res as any).getHeaders() } : {};
-    Object.keys(bufferedHeaders).forEach((k) => { if (/^(content-(length|encoding|type)|cache-control|connection)$/i.test(k)) delete bufferedHeaders[k]; });
+    const drop = (h: string) => { delete bufferedHeaders[h]; (res as any).removeHeader?.(h); (res.raw as any)?.removeHeader?.(h); };
+    Object.keys(bufferedHeaders).filter((k) => /^(content-(length|encoding|type)|cache-control|connection)$/i.test(k)).forEach(drop);
+    ['content-length', 'content-encoding', 'content-type', 'cache-control', 'connection'].forEach(drop);
     res.raw.writeHead(HttpStatus.OK, {
       ...bufferedHeaders,
       'Content-Type': 'text/event-stream',
@@ -3396,8 +3398,7 @@ export class ProxyController {
       return new OpenAIProtocolException(overrideMessage, error.getStatus(), error.protocolError);
     }
     if (error instanceof Error) {
-      const overriddenError = new Error(overrideMessage, { cause: error });
-      return overriddenError;
+      return new Error(overrideMessage, { cause: error });
     }
     return new Error(overrideMessage);
   }
@@ -3409,10 +3410,7 @@ export class ProxyController {
     _error?: unknown,
   ): void {
     const base = `[${endpoint}] status=${status} message=${message}`;
-    if (status >= HttpStatus.INTERNAL_SERVER_ERROR) {
-      this.logger.error(base);
-      return;
-    }
-    this.logger.warn(base);
+    if (status >= HttpStatus.INTERNAL_SERVER_ERROR) this.logger.error(base);
+    else this.logger.warn(base);
   }
 }

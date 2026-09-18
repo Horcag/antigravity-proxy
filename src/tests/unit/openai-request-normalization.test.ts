@@ -357,6 +357,56 @@ describe('OpenAIRequestNormalizer', () => {
       expect(response.body).toContain('data: [DONE]\n\n');
       await app.close();
     });
+
+    it('clears pre-existing raw Content-Encoding from underlying Node response in real Fastify HTTP pipeline', async () => {
+      const { controller } = createController({});
+      const app = Fastify();
+      app.get('/test-raw-encoding', (req, reply) => {
+        reply.header('x-ag-proxy-dropped-params', 'user, metadata');
+        reply.header('x-ag-proxy-honored-locally', 'store');
+        reply.raw.setHeader('Content-Encoding', 'gzip');
+        const stream = new Observable<string>((sub) => {
+          sub.next('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n');
+          sub.next('data: [DONE]\n\n');
+          sub.complete();
+        });
+        (controller as any).writeSseResponse(reply, stream, 'openai');
+      });
+
+      const response = await app.inject({ method: 'GET', url: '/test-raw-encoding' });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toBe('text/event-stream');
+      expect(response.headers['content-encoding']).toBeUndefined();
+      expect(response.headers['x-ag-proxy-dropped-params']).toBe('user, metadata');
+      expect(response.headers['x-ag-proxy-honored-locally']).toBe('store');
+      expect(response.body).toContain('data: [DONE]\n\n');
+      await app.close();
+    });
+
+    it('clears pre-existing raw Content-Length from underlying Node response in real Fastify HTTP pipeline', async () => {
+      const { controller } = createController({});
+      const app = Fastify();
+      app.get('/test-raw-length', (req, reply) => {
+        reply.header('x-ag-proxy-dropped-params', 'user, metadata');
+        reply.header('x-ag-proxy-honored-locally', 'store');
+        reply.raw.setHeader('Content-Length', '1');
+        const stream = new Observable<string>((sub) => {
+          sub.next('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n');
+          sub.next('data: [DONE]\n\n');
+          sub.complete();
+        });
+        (controller as any).writeSseResponse(reply, stream, 'openai');
+      });
+
+      const response = await app.inject({ method: 'GET', url: '/test-raw-length' });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toBe('text/event-stream');
+      expect(response.headers['content-length']).toBeUndefined();
+      expect(response.headers['x-ag-proxy-dropped-params']).toBe('user, metadata');
+      expect(response.headers['x-ag-proxy-honored-locally']).toBe('store');
+      expect(response.body).toContain('data: [DONE]\n\n');
+      await app.close();
+    });
   });
 
   describe('Application Fixture: Screenpipe & Legacy Integrations', () => {
