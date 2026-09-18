@@ -61,6 +61,10 @@ import {
   sendAnthropicProtocolError,
   sendOpenAIProtocolError,
 } from './openai-protocol-error';
+import {
+  OpenAIRequestNormalizer,
+  attachCompatibilityHeaders,
+} from './openai-request-normalizer';
 import { isMultipartParserOrLimitError } from './fastify-multipart.provider';
 import { type OpenAIResponsesConfiguration } from '../antigravity/OpenAIResponsesStreamingMapper';
 import { extractRequestAbortSignal } from './request-abort-signal';
@@ -168,6 +172,7 @@ interface ImageOptionInput {
 @UseFilters(ProxyProtocolExceptionFilter)
 export class ProxyController {
   private readonly logger = new Logger(ProxyController.name);
+  private readonly requestNormalizer = new OpenAIRequestNormalizer();
 
   constructor(
     @Inject(ProxyService) private readonly proxyService: ProxyService,
@@ -216,8 +221,15 @@ export class ProxyController {
     @Res() res: FastifyReply,
     @Req() req?: FastifyRequest,
   ) {
-    this.validateChatRequest(body);
-    await this.respondOpenAIChatCompletions(body, res, req);
+    const { normalized, notices } = this.requestNormalizer.normalizeChatRequest(body);
+    attachCompatibilityHeaders(res, notices);
+    if (notices.length > 0) {
+      this.logger.debug(
+        `OpenAI request compatibility notices: ${notices.map((n) => `${n.parameter}:${n.action}(${n.reasonCode})`).join(', ')}`,
+      );
+    }
+    this.validateChatRequest(normalized);
+    await this.respondOpenAIChatCompletions(normalized, res, req);
   }
 
   @Post('completions')
@@ -237,15 +249,11 @@ export class ProxyController {
     const stop = this.normalizeStopSequences(body.stop);
     const request: OpenAIChatRequest = {
       model: body.model,
-      messages: [
-        {
-          role: 'user',
-          content: this.normalizeCompletionPrompt(body.prompt),
-        },
-      ],
+      messages: [{ role: 'user', content: this.normalizeCompletionPrompt(body.prompt) }],
       max_tokens: body.max_tokens,
       temperature: body.temperature,
       top_p: body.top_p,
+      seed: body.seed,
       stop,
       stream: body.stream,
       stream_options: body.stream_options,
@@ -277,6 +285,15 @@ export class ProxyController {
     @Req() req?: FastifyRequest,
   ) {
     this.requireJsonObject(body);
+    const { notices } = this.requestNormalizer.normalizeResponsesOptions(
+      body as Record<string, unknown>,
+    );
+    attachCompatibilityHeaders(res, notices);
+    if (notices.length > 0) {
+      this.logger.debug(
+        `OpenAI Responses compatibility notices: ${notices.map((n) => `${n.parameter}:${n.action}(${n.reasonCode})`).join(', ')}`,
+      );
+    }
     this.requireNonEmptyString(body.model, 'model');
     this.validateResponsesInput(body.input);
     this.validateResponsesTools(body.tools, body.tool_choice);
@@ -779,7 +796,9 @@ export class ProxyController {
       throw this.unsupportedParameter('n', 'only n=1 is supported');
     }
     if (!isNil(body.seed)) {
-      throw this.unsupportedParameter('seed', 'deterministic seeding is not supported');
+      if (!isNumber(body.seed) || !Number.isInteger(body.seed) || body.seed < -2147483648 || body.seed > 2147483647) {
+        throw this.invalidRequest('seed must be an integer between -2147483648 and 2147483647', 'seed');
+      }
     }
     for (const param of ['presence_penalty', 'frequency_penalty'] as const) {
       const value = body[param];
@@ -813,14 +832,6 @@ export class ProxyController {
     if (!isNil(body.top_logprobs)) {
       throw this.unsupportedParameter('top_logprobs', 'log probabilities are not available');
     }
-    this.validateUnhonoredOptions(body, [
-      'service_tier',
-      'store',
-      'metadata',
-      'modalities',
-      'prediction',
-      'parallel_tool_calls',
-    ]);
   }
 
   private validateLegacyOnlyOptions(body: OpenAILegacyCompletionRequest): void {
@@ -908,14 +919,13 @@ export class ProxyController {
   }
 
   /**
-   * `user` is accepted by the OpenAI schema but this gateway has no end-user channel to
-   * forward it on. Rejecting up front beats silently dropping a field callers rely on for
-   * abuse attribution, and it happens before any account is leased.
+   * Validates `user` identity option. Allows bounded string identifiers (<= 512 chars)
+   * while rejecting malformed non-string shapes.
    */
   private validateUnsupportedIdentityOptions(body: { user?: unknown }): void {
-    if (!isNil(body.user)) {
-      throw this.unsupportedParameter('user', 'end-user identifiers are not forwarded upstream');
-    }
+    if (isNil(body.user)) return;
+    if (!isString(body.user)) throw this.invalidRequest('user must be a string', 'user');
+    if (body.user.length > 512) throw this.invalidRequest('user must not exceed 512 characters', 'user');
   }
 
   /** Validates and normalizes `stop` into the Gemini stopSequences shape. */
@@ -1087,24 +1097,6 @@ export class ProxyController {
     this.validateNumericRange('top_p', body.top_p, 0, 1);
     this.validateStreamOptions(body.stream, undefined);
     this.validateResponsesMetadata(body.metadata);
-    this.validateUnhonoredOptions(body, [
-      'previous_response_id',
-      'text',
-      'background',
-      'parallel_tool_calls',
-      'store',
-      'reasoning',
-      'truncation',
-      'max_tool_calls',
-      'include',
-      'service_tier',
-      'prompt_cache_key',
-      'prompt_cache_retention',
-      'safety_identifier',
-      'conversation',
-      'prompt',
-      'top_logprobs',
-    ]);
   }
 
   private validateResponsesMetadata(metadata: unknown): void {
@@ -1112,29 +1104,20 @@ export class ProxyController {
   }
 
   private responsesMetadata(metadata: unknown): Record<string, string> {
-    if (metadata === undefined) {
-      return {};
-    }
-    if (typeof metadata !== 'object' || metadata === null || !isPlainObject(metadata)) {
-      throw this.invalidRequest('metadata must be an object with string values', 'metadata');
-    }
+    if (metadata === undefined || metadata === null) return {};
+    if (!isPlainObject(metadata)) throw this.invalidRequest('metadata must be an object with string values', 'metadata');
+    const entries = Object.entries(metadata as Record<string, unknown>);
+    if (entries.length > 16) throw this.invalidRequest('metadata supports at most 16 entries', 'metadata');
     const result: Record<string, string> = {};
-    for (const [key, value] of Object.entries(metadata)) {
-      if (!isString(value)) {
-        throw this.invalidRequest('metadata must be an object with string values', 'metadata');
-      }
+    for (const [key, value] of entries) {
+      if (key.length > 64) throw this.invalidRequest('metadata key length exceeds 64 characters', `metadata.${key}`);
+      if (!isString(value)) throw this.invalidRequest('metadata must be an object with string values', `metadata.${key}`);
+      if (value.length > 512) throw this.invalidRequest('metadata value length exceeds 512 characters', `metadata.${key}`);
       result[key] = value;
     }
     return result;
   }
 
-  private validateUnhonoredOptions(body: object, params: string[]): void {
-    for (const param of params) {
-      if (Object.hasOwn(body, param)) {
-        throw this.unsupportedParameter(param, 'this option is not forwarded upstream');
-      }
-    }
-  }
 
   private validateResponsesInputItem(item: unknown, index: number): void {
     const inputItem = this.toRecord(item);
@@ -3134,7 +3117,11 @@ export class ProxyController {
       (res as { hijack: () => void }).hijack();
     }
 
+    const bufferedHeaders = isFunction((res as any).getHeaders) ? (res as any).getHeaders() : {};
+    delete (bufferedHeaders as any)['content-length'];
+    delete (bufferedHeaders as any)['content-encoding'];
     res.raw.writeHead(HttpStatus.OK, {
+      ...bufferedHeaders,
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',

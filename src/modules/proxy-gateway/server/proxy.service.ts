@@ -3136,13 +3136,11 @@ export class ProxyService {
       max_tokens: request.max_completion_tokens ?? request.max_tokens,
       temperature: request.temperature,
       top_p: request.top_p,
+      seed: request.seed,
       stop_sequences: this.convertOpenAIStopSequences(request.stop),
       response_mime_type: this.convertOpenAIResponseFormat(request.response_format),
       stream: request.stream,
-      metadata: {
-        ...(request.extra ?? {}),
-        source: 'openai',
-      },
+      metadata: { ...(request.extra ?? {}), source: 'openai' },
     };
   }
 

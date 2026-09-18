@@ -901,12 +901,9 @@ function buildGenerationConfig(
     } else {
       config.maxOutputTokens = getMaxOutputTokens(mappedModel);
     }
-    if (claudeReq.stop_sequences && claudeReq.stop_sequences.length > 0) {
-      config.stopSequences = claudeReq.stop_sequences;
-    }
-    if (claudeReq.response_mime_type) {
-      config.responseMimeType = claudeReq.response_mime_type;
-    }
+    if (claudeReq.stop_sequences && claudeReq.stop_sequences.length > 0) config.stopSequences = claudeReq.stop_sequences;
+    if (claudeReq.response_mime_type) config.responseMimeType = claudeReq.response_mime_type;
+    if (claudeReq.seed !== undefined) config.seed = claudeReq.seed;
     if (isThinkingEnabled) {
       config.thinkingConfig = buildThinkingConfig();
     }

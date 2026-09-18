@@ -65,6 +65,8 @@ export interface ClaudeRequest {
    * Forwarded to Gemini `generationConfig.responseMimeType`.
    */
   response_mime_type?: string;
+  /** Random seed for deterministic generation */
+  seed?: number;
 }
 
 export type ClaudeToolChoice = 'none' | 'auto' | 'required' | { type: 'tool'; name: string };
@@ -193,6 +195,8 @@ export interface GenerationConfig {
   responseModalities?: string[];
   /** Image generation configuration */
   imageConfig?: ImageConfig;
+  /** Random seed for deterministic generation */
+  seed?: number;
 }
 
 /**
