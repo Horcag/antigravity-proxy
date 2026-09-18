@@ -156,6 +156,7 @@ describe('Location Unsupported and Precondition Failover', () => {
 
     await gateway.handleRequest(req, res);
 
+    expect(leaseCallCount).toBe(2);
     expect(upstreamCallCount).toBe(2);
     expect(markAsForbidden).toHaveBeenCalledWith('acc-A');
     expect(res.statusCode).toBe(200);

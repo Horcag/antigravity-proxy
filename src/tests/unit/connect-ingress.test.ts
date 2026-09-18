@@ -403,7 +403,7 @@ describe('ConnectIngressService', () => {
 
   it('connects to verified allowed IP when DNS returns mixed allowed and disallowed addresses', async () => {
     const dns = await import('node:dns');
-    const lookupSpy = vi.spyOn(dns.default || dns, 'lookup').mockImplementation((_host: any, _options: any, callback: any) => {
+    const lookupSpy = (vi.spyOn(dns.default || dns, 'lookup') as any).mockImplementation((_host: any, _options: any, callback: any) => {
       callback(null, [
         { address: '127.0.0.1', family: 4 },
         { address: '93.184.216.34', family: 4 },
