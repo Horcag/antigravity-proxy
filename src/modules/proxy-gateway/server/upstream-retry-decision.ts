@@ -48,7 +48,7 @@ function deriveTerminalHealthEffect(evidence: FailureEvidence, effectiveModel?: 
       return { kind: 'project-capability-rejected' };
     case 'permission-denied':
       return evidence.ruleId === 'google.location.unsupported-location'
-        ? { kind: 'credential-rejected' }
+        ? { kind: 'rate-limited', isQuota: false }
         : { kind: 'none' };
     default:
       return { kind: 'none' };
@@ -120,7 +120,7 @@ export function evaluateRetryDecision(params: EvaluateRetryParams): RetryDecisio
           ? { kind: 'migrate-account', reason: 'permission-denied' }
           : { kind: 'commit-error' },
         healthEffect: evidence.ruleId === 'google.location.unsupported-location'
-          ? { kind: 'credential-rejected' }
+          ? { kind: 'rate-limited', isQuota: false }
           : { kind: 'none' }, // CRUCIAL: zero credential penalty for generic permission-denied, never markAsForbidden!
       };
 

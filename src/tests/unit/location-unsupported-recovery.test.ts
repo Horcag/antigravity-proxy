@@ -81,7 +81,32 @@ describe('Location Unsupported and Precondition Failover', () => {
     expect(evidence.rpcStatus).toBe('FAILED_PRECONDITION');
   });
 
-  it('evaluates retry decision for unsupported location to migrate account and mark credential rejected', () => {
+  it('does not classify generic FAILED_PRECONDITION as unsupported location', () => {
+    const evidence = classifyUpstreamFailure({
+      statusCode: 400,
+      headers: { 'content-type': 'application/json' },
+      errorText: '{"error":{"code":400,"message":"Resource is not ready.","status":"FAILED_PRECONDITION"}}',
+      source: 'json',
+    });
+
+    expect(evidence.category).toBe('invalid-request');
+    expect(evidence.ruleId).toBe('google.precondition.failed');
+    expect(evidence.rpcStatus).toBe('FAILED_PRECONDITION');
+  });
+
+  it('does not classify gRPC status 9 with generic location text as unsupported location', () => {
+    const evidence = classifyUpstreamFailure({
+      statusCode: 200,
+      headers: { 'grpc-status': '9', 'grpc-message': 'Object location has changed; refresh the version.' },
+      source: 'grpc',
+    });
+
+    expect(evidence.category).toBe('permission-denied');
+    expect(evidence.ruleId).toBe('google.grpc.failed-precondition');
+    expect(evidence.rpcStatus).toBe('FAILED_PRECONDITION');
+  });
+
+  it('evaluates retry decision for unsupported location to migrate account and mark rate-limited without credential penalty', () => {
     const evidence = classifyUpstreamFailure({
       statusCode: 400,
       headers: { 'content-type': 'application/json' },
@@ -102,14 +127,16 @@ describe('Location Unsupported and Precondition Failover', () => {
 
     expect(decision.action.kind).toBe('migrate-account');
     expect(decision.action).toEqual({ kind: 'migrate-account', reason: 'permission-denied' });
-    expect(decision.healthEffect.kind).toBe('credential-rejected');
+    expect(decision.healthEffect.kind).toBe('rate-limited');
+    expect((decision.healthEffect as any).isQuota).toBe(false);
   });
 
-  it('gateway fails over from location-rejected account to healthy account and calls markAsForbidden', async () => {
+  it('gateway fails over from location-rejected account to healthy account without markAsForbidden', async () => {
     const accA = createMockAccount('acc-A', 'spanish-user@gmail.com');
     const accB = createMockAccount('acc-B', 'healthy-user@gmail.com');
 
     const markAsForbidden = vi.fn();
+    const markFromUpstreamError = vi.fn().mockResolvedValue(undefined);
     let leaseCallCount = 0;
     const mockLeaseService: any = {
       acquireAttemptLease: vi.fn(async ({ excludeAccountIds }) => {
@@ -129,6 +156,7 @@ describe('Location Unsupported and Precondition Failover', () => {
       completeSessionMigration: vi.fn(),
       failSessionMigrationCandidate: vi.fn(),
       markAsForbidden,
+      markFromUpstreamError,
     };
 
     const gateway = new CloudCodeFailoverGateway(mockLeaseService);
@@ -158,7 +186,8 @@ describe('Location Unsupported and Precondition Failover', () => {
 
     expect(leaseCallCount).toBe(2);
     expect(upstreamCallCount).toBe(2);
-    expect(markAsForbidden).toHaveBeenCalledWith('acc-A');
+    expect(markAsForbidden).not.toHaveBeenCalled();
+    expect(markFromUpstreamError).toHaveBeenCalledWith(expect.objectContaining({ accountIdOrEmail: 'acc-A' }));
     expect(res.statusCode).toBe(200);
     expect(res.writableEnded).toBe(true);
   });

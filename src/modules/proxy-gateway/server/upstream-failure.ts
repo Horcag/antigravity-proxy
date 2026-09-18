@@ -184,7 +184,8 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
         buildSafeErrorMessage('quota', 'google.grpc.resource-exhausted', 'RESOURCE_EXHAUSTED', 429, errorInfoReason), errorText, true);
     }
     if (code === '9') {
-      const rule = lowerText.includes('location') ? 'google.location.unsupported-location' : 'google.grpc.failed-precondition';
+      const isLoc = /location.*not.*supported/i.test(lowerText) || lowerText.includes('user location is not supported');
+      const rule = isLoc ? 'google.location.unsupported-location' : 'google.grpc.failed-precondition';
       return makeEvidence('permission-denied', rule, 'grpc', 400, 'FAILED_PRECONDITION',
         buildSafeErrorMessage('permission-denied', rule, 'FAILED_PRECONDITION', 400, errorInfoReason), errorText, false, 'explicit');
     }
@@ -305,10 +306,9 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
   }
 
   // 8. Location / Precondition / Permission Denied
-  const isLocation =
-    rpcStatus === 'FAILED_PRECONDITION' ||
-    lowerText.includes('location is not supported') ||
-    errorInfoReason === 'LOCATION_NOT_SUPPORTED';
+  const isLocation = errorInfoReason === 'LOCATION_NOT_SUPPORTED' ||
+    ((rpcStatus === 'FAILED_PRECONDITION' || statusCode === 400) &&
+      (lowerText.includes('location is not supported') || lowerText.includes('user location is not supported') || /location.*not.*supported/i.test(errorText)));
   if (isLocation) {
     const rpc = rpcStatus || 'FAILED_PRECONDITION';
     return makeEvidence('permission-denied', 'google.location.unsupported-location', source, statusCode, rpc,
@@ -318,6 +318,10 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
     const rpc = rpcStatus || 'PERMISSION_DENIED';
     return makeEvidence('permission-denied', 'google.permission.denied', source, statusCode, rpc,
       buildSafeErrorMessage('permission-denied', 'google.permission.denied', rpc, statusCode, errorInfoReason), errorText, false);
+  }
+  if (rpcStatus === 'FAILED_PRECONDITION') {
+    return makeEvidence('invalid-request', 'google.precondition.failed', source, statusCode, 'FAILED_PRECONDITION',
+      buildSafeErrorMessage('invalid-request', 'google.precondition.failed', 'FAILED_PRECONDITION', statusCode, errorInfoReason), errorText, false);
   }
 
   // 9. Ambiguous 400 INVALID_ARGUMENT vs other 400 invalid-request

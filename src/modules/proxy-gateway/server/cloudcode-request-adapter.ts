@@ -3,12 +3,13 @@ import * as crypto from 'node:crypto';
 import type { IncomingHttpHeaders } from 'node:http';
 
 const REPLAY_SAFE_POST_ACTIONS = new Set([
-  ':streamGenerateContent', ':generateContent', ':predict', ':streamRawPredict', ':countTokens',
-  ':loadCodeAssist', ':fetchUserInfo', ':fetchAvailableModels', ':retrieveUserQuota',
-  ':retrieveUserQuotaSummary', ':fetchLicenses', ':fetchCredits', ':listAgents', ':listInstances',
-  ':listAuthorizedDevices', ':listRemoteRepositories', ':listCloudAICompanionProjects', ':listModelConfigs', ':listExperiments',
-  ':fetchCodeCustomizationState', ':fetchAdminControls', ':getCodeAssistGlobalUserSetting', ':loadModel',
-  ':fetchQuotaStatus', ':fetchConfig', ':fetchFromTrawlerCache',
+  ':streamGenerateContent', ':generateContent', ':predict', ':streamRawPredict', ':countTokens', ':loadCodeAssist',
+  ':fetchUserInfo', ':fetchAvailableModels', ':retrieveUserQuota', ':retrieveUserQuotaSummary', ':fetchLicenses', ':fetchCredits',
+  ':listAgents', ':listInstances', ':listAuthorizedDevices', ':listRemoteRepositories', ':listCloudAICompanionProjects',
+  ':listModelConfigs', ':listExperiments', ':fetchCodeCustomizationState', ':fetchAdminControls', ':getCodeAssistGlobalUserSetting',
+  ':loadModel', ':fetchQuotaStatus', ':fetchConfig', ':fetchFromTrawlerCache', ':recordTrajectoryAnalytics', ':writeTrajectoryAcls',
+  ':recordCodeAssistMetrics', ':recordClientEvent', ':recordSmartchoicesFeedback', ':rewriteUri', ':completeCode',
+  ':generateChat', ':streamGenerateChat', ':generateCode', ':transformCode', ':searchSnippets',
 ]);
 
 export interface ComposeAttemptOptions {

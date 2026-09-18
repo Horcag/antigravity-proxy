@@ -230,10 +230,10 @@ export class CloudCodeFailoverGateway {
       bufferedBody?: Buffer;
     } | null = null;
     const sessionKey = this.extractSessionKey(req, parsedBody);
-    const requestId = crypto.randomUUID(); // 3. Failover retry loop (ResponseCommitGate)
-    const attemptedAccountIds = new Set<string>();
-    const maxAttempts = 5;
-    let transientRetriesUsed = 0;
+    const requestId = crypto.randomUUID(); const attemptedAccountIds = new Set<string>();
+    const anyLeaseService = this.accountLeaseService as any;
+    const totalPoolAccounts = typeof anyLeaseService?.getAccountCount === 'function' ? anyLeaseService.getAccountCount() : (typeof anyLeaseService?.getUsableAccountCount === 'function' ? anyLeaseService.getUsableAccountCount() : (anyLeaseService?.getQuotaDiagnostics?.()?.accounts?.length ?? 5));
+    const poolCapacity = Math.max(totalPoolAccounts || 0, 5); const maxAttempts = poolCapacity * 2 + 2; let transientRetriesUsed = 0;
     let migrationAuthorization: MigrationAuthorization | undefined;
     const issueMigrationAuthorization = (reason: MigrationAuthorizationReason, expectedGen?: number, expectedInc?: number): void => {
       const binding = this.accountLeaseService?.getSessionBinding?.(sessionKey);
@@ -257,7 +257,7 @@ export class CloudCodeFailoverGateway {
     let migrationCapability: MigrationCapability | null = null;
     let attemptGeneration = 1;
     let attemptTableIncarnation: number | undefined;
-    let leaseRetainedForSameAccount = false;
+    let leaseRetainedForSameAccount = false, currentAttemptAccount: CloudAccount | null = null;
 
     const releaseActiveLease = () => {
       leaseRetainedForSameAccount = false;
@@ -268,8 +268,7 @@ export class CloudCodeFailoverGateway {
     };
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      currentUpstreamReq = null;
-      currentUpstreamRes = null;
+      currentUpstreamReq = null; currentUpstreamRes = null; currentAttemptAccount = null;
       if (clientAborted || affinityOwnerExpired || res.destroyed) {
         releaseActiveLease();
         return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
@@ -329,7 +328,7 @@ export class CloudCodeFailoverGateway {
       }
 
       try {
-        activeReleaseReservation = activeLease?.releaseReservation;
+        currentAttemptAccount = activeLease?.account ?? null; activeReleaseReservation = activeLease?.releaseReservation;
         activeCompleteAffinityPlacement = activeLease?.completeAffinityPlacement;
         if (activeLease?.affinityAbortSignal?.aborted) { abortExpiredAffinityOwner(); return; }
         if (!leaseRetainedForSameAccount) {
@@ -1003,8 +1002,8 @@ export class CloudCodeFailoverGateway {
         releaseActiveLease();
         return;
       } catch (err) {
-        releaseActiveLease();
-        activeStopCandidateRenewal?.();
+        if (currentAttemptAccount) { attemptedAccountIds.add(currentAttemptAccount.id); issueMigrationAuthorization('upstream-transient', attemptGeneration, attemptTableIncarnation); }
+        releaseActiveLease(); activeStopCandidateRenewal?.();
         if (deadlineWriteFailure) throw deadlineWriteFailure;
         if (err instanceof GatewayReceiptTransferError) throw err;
         if (upstreamResponseSelected && !responseCommitted) throw new GatewayReceiptTransferError(receiptOwner, err);

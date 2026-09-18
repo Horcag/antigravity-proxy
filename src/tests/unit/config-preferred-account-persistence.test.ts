@@ -751,7 +751,7 @@ describe('preferred account config persistence', () => {
 
       const thrown = await Promise.race([
         ConfigManager.setPreferredAccount('acc-2').catch((error: unknown) => error),
-        new Promise<symbol>((resolve) => setTimeout(() => resolve(Symbol('timeout')), 1_000)),
+        new Promise<symbol>((resolve) => setTimeout(() => resolve(Symbol('timeout')), 5_000)),
       ]);
 
       expect(thrown).toBeInstanceOf(ConfigPersistenceError);

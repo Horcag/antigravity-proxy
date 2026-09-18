@@ -31,6 +31,18 @@ const ALLOWED_OPERATIONS = new Set([
   'fetchQuotaStatus',
   'fetchConfig',
   'fetchFromTrawlerCache',
+  'recordTrajectoryAnalytics',
+  'writeTrajectoryAcls',
+  'recordCodeAssistMetrics',
+  'recordClientEvent',
+  'recordSmartchoicesFeedback',
+  'rewriteUri',
+  'completeCode',
+  'generateChat',
+  'streamGenerateChat',
+  'generateCode',
+  'transformCode',
+  'searchSnippets',
 ]);
 
 export interface LogUpstreamFailureParams {
