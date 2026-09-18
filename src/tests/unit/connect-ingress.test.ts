@@ -400,5 +400,54 @@ describe('ConnectIngressService', () => {
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
+
+  it('connects to verified allowed IP when DNS returns mixed allowed and disallowed addresses', async () => {
+    const dns = await import('node:dns');
+    const lookupSpy = vi.spyOn(dns.default || dns, 'lookup').mockImplementation((_host: any, _options: any, callback: any) => {
+      callback(null, [
+        { address: '127.0.0.1', family: 4 },
+        { address: '93.184.216.34', family: 4 },
+      ]);
+    });
+
+    const originalConnect = net.connect;
+    let connectedHost = '';
+    const netConnectSpy = vi.spyOn(net, 'connect').mockImplementation((...args: any[]) => {
+      if (typeof args[0] === 'object' && args[0].port === 443) {
+        connectedHost = args[0].host;
+        const sock = new net.Socket();
+        const cb = typeof args[1] === 'function' ? args[1] : undefined;
+        if (cb) process.nextTick(cb);
+        return sock;
+      }
+      return (originalConnect as any)(...args);
+    });
+
+    const server = http.createServer();
+    const ingress = new ConnectIngressService();
+    ingress.attach(server);
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const port = (server.address() as net.AddressInfo).port;
+
+    const resp = await new Promise<string>((resolve) => {
+      const client = net.connect(port, '127.0.0.1', () => {
+        client.write('CONNECT mixed-dns.example.com:443 HTTP/1.1\r\nHost: mixed-dns.example.com:443\r\n\r\n');
+      });
+      client.on('data', (d) => {
+        client.destroy();
+        resolve(d.toString('utf-8'));
+      });
+    });
+
+    expect(resp).toContain('HTTP/1.1 200 Connection Established');
+    expect(connectedHost).toBe('93.184.216.34');
+
+    lookupSpy.mockRestore();
+    netConnectSpy.mockRestore();
+    ingress.close();
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
 });
 

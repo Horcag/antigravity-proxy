@@ -401,8 +401,8 @@ export class ConnectIngressService {
         return;
       }
 
-      const hasDisallowed = addresses.some((a) => isDisallowedIp(a.address));
-      if (hasDisallowed) {
+      const allowedAddresses = addresses.filter((a) => !isDisallowedIp(a.address));
+      if (allowedAddresses.length === 0) {
         logger.warn(`[ConnectIngress] Non-target destination resolved to disallowed address: ${parsed.hostname}`);
         if (!clientSocket.destroyed && !clientSocket.closed) {
           clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
@@ -415,7 +415,7 @@ export class ConnectIngressService {
         return;
       }
 
-      const verifiedIp = addresses[0].address;
+      const verifiedIp = allowedAddresses[0].address;
 
       const upstreamSocket = net.connect({ host: verifiedIp, port: parsed.port }, () => {
         if (this.isClosed || clientClosed || clientSocket.destroyed || clientSocket.closed) {
