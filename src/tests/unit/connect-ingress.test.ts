@@ -449,5 +449,32 @@ describe('ConnectIngressService', () => {
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
+
+  it('clears raw socket timeout when target host is intercepted', async () => {
+    const server = http.createServer();
+    const ingress = new ConnectIngressService();
+    ingress.attach(server);
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const port = (server.address() as net.AddressInfo).port;
+
+    const resp = await new Promise<string>((resolve) => {
+      const client = net.connect(port, '127.0.0.1', () => {
+        client.write('CONNECT daily-cloudcode-pa.googleapis.com:443 HTTP/1.1\r\nHost: daily-cloudcode-pa.googleapis.com:443\r\n\r\n');
+      });
+      client.on('data', (d) => {
+        client.destroy();
+        resolve(d.toString('utf-8'));
+      });
+    });
+
+    expect(resp).toContain('HTTP/1.1 200 Connection Established');
+    expect((ingress as any).h2Server.keepAliveTimeout).toBe(120000);
+    expect((ingress as any).h2Server.headersTimeout).toBe(125000);
+
+    ingress.close();
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
 });
 

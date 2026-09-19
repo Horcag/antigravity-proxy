@@ -264,6 +264,8 @@ export class ConnectIngressService {
       },
     );
 
+    (this.h2Server as any).keepAliveTimeout = 120000;
+    (this.h2Server as any).headersTimeout = 125000;
     this.h2Server.on('error', (err) => {
       logger.warn('[ConnectIngress] Internal TLS server error', err);
       ConnectIngressService.fatalError = true;
@@ -272,6 +274,10 @@ export class ConnectIngressService {
     this.h2Server.on('clientError', (err, socket) => {
       logger.debug(`[ConnectIngress] Client TLS error: ${err.message}`);
       socket.destroy();
+    });
+
+    this.h2Server.on('sessionError', (err) => {
+      logger.debug(`[ConnectIngress] Client H2 session error: ${err.message}`);
     });
 
     this.attachedServer = httpServer;
@@ -298,11 +304,8 @@ export class ConnectIngressService {
     }
 
     // Immediately enforce 60s timeout on client socket before any async operations
-    if (typeof clientSocket.setTimeout === 'function') {
-      clientSocket.setTimeout(60000, () => {
-        clientSocket.destroy();
-      });
-    }
+    const onTimeout = () => { clientSocket.destroy(); };
+    if (typeof clientSocket.setTimeout === 'function') clientSocket.setTimeout(60000, onTimeout);
 
     clientSocket.on('error', (err) => {
       logger.debug(`[ConnectIngress] Client socket error: ${err.message}`);
@@ -348,14 +351,13 @@ export class ConnectIngressService {
 
     // 2. If destination is Google CloudCode, terminate TLS and failover
     if (isTarget) {
+      if (typeof clientSocket.setTimeout === 'function') {
+        clientSocket.setTimeout(0);
+        clientSocket.removeListener('timeout', onTimeout);
+      }
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-      if (head && head.length > 0) {
-        clientSocket.unshift(head);
-      }
-
-      if (this.h2Server && !this.isClosed) {
-        this.h2Server.emit('connection', clientSocket);
-      }
+      if (head && head.length > 0) clientSocket.unshift(head);
+      if (this.h2Server && !this.isClosed) this.h2Server.emit('connection', clientSocket);
       return;
     }
 
