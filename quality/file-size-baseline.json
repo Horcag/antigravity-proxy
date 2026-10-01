@@ -8,7 +8,7 @@
   },
   "files": {
     "scripts/probe-models.ts": 827,
-    "scripts/release-lib.sh": 1546,
+    "scripts/release-lib.sh": 1480,
     "src/modules/cloud-account/services/GoogleAPIService.ts": 1071,
     "src/modules/config/ipc/manager.ts": 944,
     "src/modules/proxy-gateway/antigravity/ClaudeRequestMapper.ts": 949,

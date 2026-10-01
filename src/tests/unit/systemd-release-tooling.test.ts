@@ -111,7 +111,7 @@ function expectMigrationPublicationRolledBack(root: string) {
   expect(existsSync(join(root, 'opt/antigravity-proxy/current'))).toBe(false);
   const dataPath = join(root, 'var/lib/antigravity-proxy');
   const entries = existsSync(dataPath) ? readdirSync(dataPath).filter((entry) => !entry.startsWith('.migration-staging-')) : [];
-  expect(entries).toEqual([]);
+  expect(entries).toEqual([]); expect(readdirSync(join(root, 'var/lib')).filter((entry) => entry.startsWith('.migration-staging-'))).toEqual([]);
 }
 
 afterEach(() => {
@@ -292,7 +292,7 @@ describe('systemd release tooling', { timeout: 60_000 }, () => {
 
       expect(result.status).toBe(1);
       expect(result.stderr).toContain(`Migration failure was forced after ${checkpoint}`);
-      expectMigrationPublicationRolledBack(root);
+      expect(result.stderr).not.toContain("cleanup was incomplete"); expectMigrationPublicationRolledBack(root);
       expect(recordedActions(systemLog)).toEqual([]);
       expect(recordedActions(legacyLog)).toEqual(['stop antigravity-proxy.service', 'start antigravity-proxy.service']);
     }
@@ -336,7 +336,7 @@ describe('systemd release tooling', { timeout: 60_000 }, () => {
         RELEASE_TEST_MIGRATION_FAIL_AFTER: failure,
       });
 
-      expect(result.status, checkpoint).toBe(1);
+      expect(result.status, `${checkpoint}: ${result.stderr}`).toBe(1);
       expect(result.stderr).toContain('Refusing to');
       const targetPath = join(root, target);
       if (checkpoint === 'release') {
@@ -359,7 +359,7 @@ describe('systemd release tooling', { timeout: 60_000 }, () => {
 
     expect(failed.status).toBe(1);
     const installPath = join(root, 'opt/antigravity-proxy');
-    expect(existsSync(join(installPath, 'releases/retryable-release'))).toBe(false);
+    expect(existsSync(join(installPath, 'releases/retryable-release')), failed.stderr).toBe(false);
     expect(realpathSync(join(installPath, 'current'))).toBe(join(installPath, 'releases/before'));
     expect(existsSync(join(installPath, 'previous'))).toBe(false);
 
@@ -1047,12 +1047,12 @@ describe('systemd release tooling', { timeout: 60_000 }, () => {
       RELEASE_TEST_MIGRATION_FAIL_AFTER: 'environment',
       RELEASE_TEST_CLEANUP_SUBSTITUTE_AFTER: 'migration-state-staging',
     });
-    const stateStaging = readdirSync(join(stateRoot, 'var/lib/antigravity-proxy')).find((entry) =>
+    const stateStaging = readdirSync(join(stateRoot, 'var/lib')).find((entry) =>
       entry.startsWith('.migration-staging-state-substitution'),
     );
     expect(state.status).toBe(1);
     expect(state.stderr).toContain('Retained path after atomic cleanup detach');
-    expect(readFileSync(join(stateRoot, 'var/lib/antigravity-proxy', stateStaging!, 'replacement'), 'utf8')).toBe('substituted\n');
+    expect(readFileSync(join(stateRoot, 'var/lib', stateStaging!, 'replacement'), 'utf8')).toBe('substituted\n');
 
     const releaseRoot = createRoot();
     expect(runInstall(releaseRoot, 'before').status).toBe(0);
@@ -1084,7 +1084,7 @@ describe('systemd release tooling', { timeout: 60_000 }, () => {
           else
             printf '%s\\n' owned >"$ROOT_PREFIX/published-$TEST_KIND"
           fi
-          record_migration_publication "$ROOT_PREFIX/published-$TEST_KIND" "$TEST_KIND"
+          ownership_acquire published_token "$ROOT_PREFIX/published-$TEST_KIND" "$TEST_KIND"; record_migration_publication "$ROOT_PREFIX/published-$TEST_KIND" "$TEST_KIND" "$published_token"
           if rollback_migration_publication; then
             exit 9
           fi
@@ -1121,11 +1121,11 @@ describe('systemd release tooling', { timeout: 60_000 }, () => {
           if [ "$TEST_LABEL" = unit ]; then
             printf '%s\\n' owned >"$ROOT_PREFIX/$TEST_LABEL-backup"
             migration_unit_backup_fs="$ROOT_PREFIX/$TEST_LABEL-backup"
-            migration_unit_backup_identity="$(publication_identity "$migration_unit_backup_fs")"
+            ownership_acquire migration_unit_backup_identity "$migration_unit_backup_fs" file
           else
             ln -s /owned-backup "$ROOT_PREFIX/$TEST_LABEL-backup"
             migration_wants_backup_fs="$ROOT_PREFIX/$TEST_LABEL-backup"
-            migration_wants_backup_identity="$(publication_identity "$migration_wants_backup_fs")"
+            ownership_acquire migration_wants_backup_identity "$migration_wants_backup_fs" link
           fi
           if complete_migration_unit_rollback; then
             exit 9
@@ -1171,8 +1171,8 @@ describe('systemd release tooling', { timeout: 60_000 }, () => {
             printf '%s\\n' published >"$unit_fs"
             migration_unit_had_file=1
             migration_unit_rename_completed=1
-            migration_unit_backup_identity="$(publication_identity "$migration_unit_backup_fs")"
-            migration_unit_published_identity="$(publication_identity "$unit_fs")"
+            ownership_acquire migration_unit_backup_identity "$migration_unit_backup_fs" file
+            ownership_acquire migration_unit_published_identity "$unit_fs" file
             if restore_migration_unit_state; then
               exit 9
             fi
@@ -1182,8 +1182,8 @@ describe('systemd release tooling', { timeout: 60_000 }, () => {
             ln -s /original-wants "$migration_wants_backup_fs"
             ln -s /published-wants "$migration_wants_fs"
             migration_wants_had_entry=1
-            migration_wants_backup_identity="$(publication_identity "$migration_wants_backup_fs")"
-            migration_wants_published_identity="$(publication_identity "$migration_wants_fs")"
+            ownership_acquire migration_wants_backup_identity "$migration_wants_backup_fs" link
+            ownership_acquire migration_wants_published_identity "$migration_wants_fs" link
             if restore_migration_wants_state; then
               exit 9
             fi
@@ -1214,16 +1214,16 @@ describe('systemd release tooling', { timeout: 60_000 }, () => {
         release_init
         data_fs="$(root_path "$data_dir")"
         install -d -m 0700 "$data_fs"
-        migration_state_staging_fs="$data_fs/.migration-staging-$release_id"
+        migration_state_staging_fs="$(dirname "$data_fs")/.migration-staging-$release_id"
         mkdir -m 0700 "$migration_state_staging_fs"
-        migration_state_staging_identity="$(publication_identity "$migration_state_staging_fs")"
+        ownership_acquire migration_state_staging_identity "$migration_state_staging_fs" directory; ownership_seal "$migration_state_staging_identity" "$migration_state_staging_fs"
         if publish_staged_migration_set; then
           exit 9
         fi
       `,
       { RELEASE_TEST_CLEANUP_SUBSTITUTE_AFTER: 'migration-state-staging-success' },
     );
-    const staging = join(root, 'var/lib/antigravity-proxy/.migration-staging-successful-staging-cleanup');
+    const staging = join(root, 'var/lib/.migration-staging-successful-staging-cleanup');
 
     expect(result.status).toBe(0);
     expect(result.stderr).toContain('Retained path after atomic cleanup detach');
@@ -1647,7 +1647,7 @@ esac
           set -eu
           export ROOT_PREFIX="${root}"
           source scripts/release-lib.sh
-          root_prefix="$ROOT_PREFIX"
+          root_prefix="$ROOT_PREFIX"; ownership_init
 
           unit_file="/etc/systemd/system/antigravity-proxy.service"
           unit_fs="$(root_path "$unit_file")"
@@ -1656,7 +1656,7 @@ esac
 
           migration_unit_backup_fs="$ROOT_PREFIX/backup/unit.backup"
           printf "PRIOR_BACKUP\\n" > "$migration_unit_backup_fs"
-          migration_unit_backup_identity="$(publication_identity "$migration_unit_backup_fs")"
+          ownership_acquire migration_unit_backup_identity "$migration_unit_backup_fs" file
           migration_unit_published_identity="published-identity-123"
           migration_unit_had_file=1
           migration_unit_rename_completed=1
@@ -1697,7 +1697,7 @@ esac
           set -eu
           export ROOT_PREFIX="${root}"
           source scripts/release-lib.sh
-          root_prefix="$ROOT_PREFIX"
+          root_prefix="$ROOT_PREFIX"; ownership_init
 
           migration_wants_fs="$ROOT_PREFIX/etc/systemd/system/multi-user.target.wants/antigravity-proxy.service"
           mkdir -p "$(dirname "$migration_wants_fs")"
@@ -1705,7 +1705,7 @@ esac
 
           migration_wants_backup_fs="$ROOT_PREFIX/backup/wants.backup"
           ln -s "/prior/target" "$migration_wants_backup_fs"
-          migration_wants_backup_identity="$(publication_identity "$migration_wants_backup_fs")"
+          ownership_acquire migration_wants_backup_identity "$migration_wants_backup_fs" link
           migration_wants_published_identity="published-wants-id-123"
           migration_wants_had_entry=1
 
