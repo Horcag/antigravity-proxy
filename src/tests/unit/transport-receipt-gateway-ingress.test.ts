@@ -1,6 +1,12 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import tls from 'node:tls';
+import { ReleaseAdmission } from '../../server/release-admission';
+import { CaManager } from '../../modules/proxy-gateway/server/cert/ca-manager';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { logger } from '../../shared/logging/logger';
 import {
   CloudCodeFailoverGateway,
@@ -45,7 +51,26 @@ function pendingRequest(host: string): { req: any; release: () => void; reject: 
 }
 
 describe('transport receipt gateway and ingress terminal ownership', () => {
-  afterEach(() => vi.restoreAllMocks());
+  let gateDirectory: string;
+  let admission: ReleaseAdmission;
+  const ingresses = new Set<ConnectIngressService>();
+  const createIngress = () => {
+    const ingress = new ConnectIngressService(undefined, admission);
+    ingresses.add(ingress);
+    return ingress;
+  };
+  beforeEach(() => {
+    gateDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'transport-admission-test-'));
+    fs.chmodSync(gateDirectory, 0o750);
+    admission = new ReleaseAdmission(gateDirectory, process.getuid!());
+    vi.spyOn(CaManager, 'ensureCertificates').mockReturnValue(tls.createSecureContext());
+  });
+  afterEach(async () => {
+    for (const ingress of ingresses) await ingress.close();
+    ingresses.clear();
+    vi.restoreAllMocks();
+    fs.rmSync(gateDirectory, { recursive: true });
+  });
 
   it('emits one committed invalid-authority receipt only after gateway response finish', async () => {
     const gateway = new CloudCodeFailoverGateway();
@@ -89,7 +114,7 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
   });
 
   it('ingress logs only a safe gateway classification and waits for its own error response finish', async () => {
-    const ingress = new ConnectIngressService();
+    const ingress = createIngress();
     const server = new EventEmitter() as any;
     server.on = vi.fn(EventEmitter.prototype.on.bind(server));
     ingress.attach(server);
@@ -116,11 +141,11 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
     expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({
       receiptId: 'transferred', classification: 'internal_error', result: 'committed', downstreamCommitCount: 1,
     });
-    ingress.close();
+    await ingress.close();
   });
 
   it('transfers a validated upstream writeHead failure to ingress and terminates its receipt', async () => {
-    const ingress = new ConnectIngressService();
+    const ingress = createIngress();
     const server = new EventEmitter() as any;
     server.on = vi.fn(EventEmitter.prototype.on.bind(server));
     ingress.attach(server);
@@ -157,11 +182,11 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
     expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({
       classification: 'internal_error', result: 'committed', downstreamCommitCount: 1,
     });
-    ingress.close();
+    await ingress.close();
   });
 
   it('transfers a non-retriable 418 writeHead failure to ingress with the same receipt owner', async () => {
-    const ingress = new ConnectIngressService();
+    const ingress = createIngress();
     const server = new EventEmitter() as any;
     server.on = vi.fn(EventEmitter.prototype.on.bind(server));
     ingress.attach(server);
@@ -183,7 +208,7 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
     res.emit('finish');
     expect(info).toHaveBeenCalledTimes(1);
     expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({ classification: 'internal_error', result: 'committed', downstreamCommitCount: 1 });
-    ingress.close();
+    await ingress.close();
   });
 
   it.each(['write', 'end'])('rejects and destroys a validated streaming response when downstream %s throws', async (operation) => {
@@ -327,7 +352,7 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
   });
 
   it('emits one rejected receipt when the ingress fallback response write fails', async () => {
-    const ingress = new ConnectIngressService();
+    const ingress = createIngress();
     const server = new EventEmitter() as any;
     server.on = vi.fn(EventEmitter.prototype.on.bind(server));
     ingress.attach(server);
@@ -348,11 +373,11 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
     expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({
       receiptId: 'fallback-write-failure', classification: 'internal_error', result: 'rejected', downstreamCommitCount: 0,
     });
-    ingress.close();
+    await ingress.close();
   });
 
   it('terminates and rejects a transferred owner when headers are already sent', async () => {
-    const ingress = new ConnectIngressService();
+    const ingress = createIngress();
     const server = new EventEmitter() as any;
     server.on = vi.fn(EventEmitter.prototype.on.bind(server));
     ingress.attach(server);
@@ -374,11 +399,11 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
     expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({
       receiptId: 'headers-sent-transfer', classification: 'internal_error', result: 'rejected', downstreamCommitCount: 0,
     });
-    ingress.close();
+    await ingress.close();
   });
 
   it('terminates a headers-sent response that ended without finishing', async () => {
-    const ingress = new ConnectIngressService();
+    const ingress = createIngress();
     const server = new EventEmitter() as any;
     server.on = vi.fn(EventEmitter.prototype.on.bind(server));
     ingress.attach(server);
@@ -401,6 +426,6 @@ describe('transport receipt gateway and ingress terminal ownership', () => {
     expect(JSON.parse(String(info.mock.calls[0][0]))).toMatchObject({
       receiptId: 'headers-ended-unfinished-transfer', classification: 'internal_error', result: 'rejected', downstreamCommitCount: 0,
     });
-    ingress.close();
+    await ingress.close();
   });
 });

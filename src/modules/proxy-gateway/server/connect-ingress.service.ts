@@ -1,3 +1,4 @@
+import { releaseAdmission, ReleaseAdmission, awaitDrain } from '../../../server/release-admission';
 import dns from 'node:dns';
 import http from 'node:http';
 import http2 from 'node:http2';
@@ -8,18 +9,15 @@ import { CaManager } from './cert/ca-manager';
 import { CloudCodeFailoverGateway, GatewayReceiptTransferError } from './cloudcode-failover-gateway';
 import { AnonymousTransportReceiptOwner } from './anonymous-transport-receipt';
 import { AccountLeaseService } from './account-lease.service';
-
 export interface ParsedConnectAuthority {
   hostname: string;
   port: number;
 }
-
 export function parseConnectAuthority(destination: string | undefined): ParsedConnectAuthority | null {
   if (!destination || typeof destination !== 'string') return null;
   const trimmed = destination.trim();
   let hostname = '';
   let port = 0;
-
   const ipv6Match = /^\[([a-fA-F0-9:.%]+)\]:([0-9]{1,5})$/.exec(trimmed);
   if (ipv6Match) {
     hostname = ipv6Match[1].toLowerCase();
@@ -30,7 +28,6 @@ export function parseConnectAuthority(destination: string | undefined): ParsedCo
     hostname = standardMatch[1].toLowerCase();
     port = Number(standardMatch[2]);
   }
-
   if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
   if (!ipv6Match && (
     hostname.startsWith('.') ||
@@ -42,7 +39,6 @@ export function parseConnectAuthority(destination: string | undefined): ParsedCo
   }
   return { hostname, port };
 }
-
 export function parseIpToUint32(ipStr: string): number | null {
   if (/^\d+$/.test(ipStr)) {
     const n = Number(ipStr);
@@ -74,7 +70,6 @@ export function parseIpToUint32(ipStr: string): number | null {
   }
   return null;
 }
-
 function isDisallowedIpv4(uint: number): boolean {
   const b0 = (uint >>> 24) & 0xff;
   const b1 = (uint >>> 16) & 0xff;
@@ -85,13 +80,11 @@ function isDisallowedIpv4(uint: number): boolean {
   if (b0 === 100 && b1 >= 64 && b1 <= 127) return true;
   return false;
 }
-
 function parseIpv6(ipStr: string): number[] | null {
   let str = ipStr.trim().toLowerCase();
   if (str.startsWith('[') && str.endsWith(']')) str = str.slice(1, -1);
   const zoneIndex = str.indexOf('%');
   if (zoneIndex !== -1) str = str.slice(0, zoneIndex);
-
   const lastColon = str.lastIndexOf(':');
   if (lastColon !== -1) {
     const potentialIpv4 = str.slice(lastColon + 1);
@@ -101,10 +94,8 @@ function parseIpv6(ipStr: string): number[] | null {
       str = str.slice(0, lastColon) + ':' + ((v4Uint >>> 16) & 0xffff).toString(16) + ':' + (v4Uint & 0xffff).toString(16);
     }
   }
-
   const doubleColonCount = (str.match(/::/g) || []).length;
   if (doubleColonCount > 1) return null;
-
   let parts: string[];
   if (doubleColonCount === 1) {
     const [left, right] = str.split('::');
@@ -117,7 +108,6 @@ function parseIpv6(ipStr: string): number[] | null {
     parts = str.split(':');
     if (parts.length !== 8) return null;
   }
-
   const words: number[] = [];
   for (const part of parts) {
     if (!/^[0-9a-f]{1,4}$/i.test(part)) return null;
@@ -125,18 +115,15 @@ function parseIpv6(ipStr: string): number[] | null {
   }
   return words;
 }
-
 export function isDisallowedIp(ip: string): boolean {
   if (!ip) return true;
   let normalized = ip.toLowerCase().trim();
   if (normalized.startsWith('[') && normalized.endsWith(']')) {
     normalized = normalized.slice(1, -1);
   }
-
   // 1. Try IPv4
   const uint = parseIpToUint32(normalized);
   if (uint !== null) return isDisallowedIpv4(uint);
-
   // 2. Try IPv6
   const words = parseIpv6(normalized);
   if (words !== null) {
@@ -144,7 +131,6 @@ export function isDisallowedIp(ip: string): boolean {
     if (words.slice(0, 7).every((w) => w === 0) && words[7] === 1) return true;
     // Unspecified ::
     if (words.every((w) => w === 0)) return true;
-
     // IPv4-mapped (::ffff:x.x.x.x) or IPv4-compatible (::x.x.x.x) or NAT64 (64:ff9b::x.x.x.x)
     if (
       (words[0] === 0 && words[1] === 0 && words[2] === 0 && words[3] === 0 && words[4] === 0 && words[5] === 0xffff) ||
@@ -154,7 +140,6 @@ export function isDisallowedIp(ip: string): boolean {
       const v4Uint = ((words[6] << 16) | words[7]) >>> 0;
       return isDisallowedIpv4(v4Uint);
     }
-
     // ULA fc00::/7 (fc.. or fd..)
     if ((words[0] & 0xfe00) === 0xfc00) return true;
     // Link-local fe80::/10 (fe8.. to feb..)
@@ -163,19 +148,15 @@ export function isDisallowedIp(ip: string): boolean {
     if ((words[0] & 0xff00) === 0xff00) return true;
     // Discard prefix 100::/64
     if (words[0] === 0x0100 && words[1] === 0 && words[2] === 0 && words[3] === 0) return true;
-
     return false;
   }
-
   return false;
 }
-
 export function isSelfOrLoopback(hostname: string): boolean {
   const h = hostname.toLowerCase();
   if (h === 'localhost') return true;
   return isDisallowedIp(h);
 }
-
 export function isLocalPeer(remoteAddress: string | undefined): boolean {
   if (!remoteAddress) return false;
   let normalized = remoteAddress.toLowerCase().trim();
@@ -191,15 +172,12 @@ export function isLocalPeer(remoteAddress: string | undefined): boolean {
   }
   return false;
 }
-
 export class ConnectIngressService {
   private static instanceAttached = false;
   private static fatalError = false;
-
   static isReady(): boolean {
     return this.instanceAttached && !this.fatalError;
   }
-
   private h2Server: http2.Http2SecureServer | null = null;
   private failoverGateway: CloudCodeFailoverGateway;
   private activeSockets = new Set<net.Socket>();
@@ -207,16 +185,14 @@ export class ConnectIngressService {
   private connectListener: ((req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => void) | null = null;
   private readonly maxConcurrentSockets = 512;
   private reservedSockets = 0;
+  private pendingRequests = 0;
   private isClosed = false;
-
-  constructor(accountLeaseService?: AccountLeaseService) {
+  constructor(accountLeaseService?: AccountLeaseService, private readonly admission: ReleaseAdmission = releaseAdmission()) {
     this.failoverGateway = new CloudCodeFailoverGateway(accountLeaseService);
   }
-
   attach(httpServer: http.Server): void {
     this.isClosed = false;
     const secureContext = CaManager.ensureCertificates();
-
     this.h2Server = http2.createSecureServer(
       {
         allowHTTP1: true,
@@ -230,7 +206,8 @@ export class ConnectIngressService {
         },
       },
       (req, res) => {
-        this.failoverGateway.handleRequest(req, res).catch((err: unknown) => {
+        this.pendingRequests++;
+        const admitted = this.admission.runResponse(res, () => this.failoverGateway.handleRequest(req, res).catch((err: unknown) => {
           logger.error(formatSafeEvent('connect_ingress_gateway_failure', {
             classification: err instanceof GatewayReceiptTransferError ? 'receipt_transfer' : 'gateway_failure',
           }, ['classification']));
@@ -260,39 +237,38 @@ export class ConnectIngressService {
           } else if (!res.writableFinished) {
             rejectAndTerminate();
           }
-        });
+        }).finally(() => { this.pendingRequests--; }));
+        if (!admitted) {
+          this.pendingRequests--;
+          res.writeHead(503, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'release admission closed' }));
+        }
       },
     );
-
     (this.h2Server as any).keepAliveTimeout = 120000;
     (this.h2Server as any).headersTimeout = 125000;
     this.h2Server.on('error', (err) => {
       logger.warn('[ConnectIngress] Internal TLS server error', err);
       ConnectIngressService.fatalError = true;
     });
-
     this.h2Server.on('clientError', (err, socket) => {
       logger.debug(`[ConnectIngress] Client TLS error: ${err.message}`);
       socket.destroy();
     });
-
     this.h2Server.on('sessionError', (err) => {
       logger.debug(`[ConnectIngress] Client H2 session error: ${err.message}`);
     });
-
     this.attachedServer = httpServer;
     this.connectListener = (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
       this.handleConnect(req, clientSocket, head);
     };
     httpServer.on('connect', this.connectListener);
-
     logger.info(
       `[ConnectIngress] Transparent HTTPS failover attached. CA cert path: ${CaManager.getCaCertPath()}`,
     );
     ConnectIngressService.instanceAttached = true;
     ConnectIngressService.fatalError = false;
   }
-
   private handleConnect(
     req: http.IncomingMessage,
     clientSocket: net.Socket,
@@ -302,15 +278,12 @@ export class ConnectIngressService {
       clientSocket.destroy();
       return;
     }
-
     // Immediately enforce 60s timeout on client socket before any async operations
     const onTimeout = () => { clientSocket.destroy(); };
     if (typeof clientSocket.setTimeout === 'function') clientSocket.setTimeout(60000, onTimeout);
-
     clientSocket.on('error', (err) => {
       logger.debug(`[ConnectIngress] Client socket error: ${err.message}`);
     });
-
     // 1. Verify local peer trust model (CONNECT strictly restricted to loopback)
     if (!isLocalPeer(clientSocket.remoteAddress)) {
       logger.warn(`[ConnectIngress] Non-local peer rejected for CONNECT: ${clientSocket.remoteAddress}`);
@@ -318,7 +291,6 @@ export class ConnectIngressService {
       clientSocket.destroy();
       return;
     }
-
     const destination = req.url || '';
     const parsed = parseConnectAuthority(destination);
     if (!parsed) {
@@ -327,9 +299,7 @@ export class ConnectIngressService {
       clientSocket.destroy();
       return;
     }
-
     const isTarget = CaManager.isTargetHost(destination);
-
     // Enforce concurrency limit uniformly across both target and non-target requests
     // Target uses 1 socket (clientSocket). Non-target uses 2 sockets (clientSocket + upstreamSocket).
     const requiredSockets = isTarget ? 1 : 2;
@@ -341,14 +311,17 @@ export class ConnectIngressService {
       clientSocket.destroy();
       return;
     }
-
+    const releaseTunnel = this.admission.reserve('tunnel');
+    if (!releaseTunnel) {
+      clientSocket.end('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+      return;
+    }
     this.activeSockets.add(clientSocket);
     clientSocket.once('close', () => {
       this.activeSockets.delete(clientSocket);
+      releaseTunnel();
     });
-
     logger.info(`[ConnectIngress] CONNECT destination: ${destination} (intercepted=${isTarget})`);
-
     // 2. If destination is Google CloudCode, terminate TLS and failover
     if (isTarget) {
       if (typeof clientSocket.setTimeout === 'function') {
@@ -360,7 +333,6 @@ export class ConnectIngressService {
       if (this.h2Server && !this.isClosed) this.h2Server.emit('connection', clientSocket);
       return;
     }
-
     // 3. Standard TCP tunnel for non-target destinations
     if (isSelfOrLoopback(parsed.hostname) || (parsed.port !== 443 && parsed.port !== 8443)) {
       logger.warn(`[ConnectIngress] Non-target destination disallowed: ${destination}`);
@@ -368,32 +340,28 @@ export class ConnectIngressService {
       clientSocket.destroy();
       return;
     }
-
     // Reserve 1 socket slot for upstream during DNS lookup
     this.reservedSockets++;
+    const releaseDns = this.admission.reserve('tunnel', true)!;
     let hasReservation = true;
     const releaseReservation = () => {
       if (hasReservation) {
         this.reservedSockets = Math.max(0, this.reservedSockets - 1);
         hasReservation = false;
+        releaseDns();
       }
     };
-
     let clientClosed = clientSocket.destroyed || clientSocket.closed;
     const onEarlyClose = () => {
       clientClosed = true;
-      releaseReservation();
     };
     clientSocket.once('close', onEarlyClose);
-
     dns.lookup(parsed.hostname, { all: true }, (lookupErr, addresses) => {
       clientSocket.removeListener('close', onEarlyClose);
       releaseReservation();
-
       if (this.isClosed || clientClosed || clientSocket.destroyed || clientSocket.closed) {
         return;
       }
-
       if (lookupErr || !addresses || addresses.length === 0) {
         logger.warn(`[ConnectIngress] DNS lookup failed for ${parsed.hostname}: ${lookupErr?.message}`);
         if (!clientSocket.destroyed && !clientSocket.closed) {
@@ -402,7 +370,6 @@ export class ConnectIngressService {
         }
         return;
       }
-
       const allowedAddresses = addresses.filter((a) => !isDisallowedIp(a.address));
       if (allowedAddresses.length === 0) {
         logger.warn(`[ConnectIngress] Non-target destination resolved to disallowed address: ${parsed.hostname}`);
@@ -412,13 +379,10 @@ export class ConnectIngressService {
         }
         return;
       }
-
       if (this.isClosed || clientClosed || clientSocket.destroyed || clientSocket.closed) {
         return;
       }
-
       const verifiedIp = allowedAddresses[0].address;
-
       const upstreamSocket = net.connect({ host: verifiedIp, port: parsed.port }, () => {
         if (this.isClosed || clientClosed || clientSocket.destroyed || clientSocket.closed) {
           upstreamSocket.destroy();
@@ -431,63 +395,50 @@ export class ConnectIngressService {
         clientSocket.pipe(upstreamSocket);
         upstreamSocket.pipe(clientSocket);
       });
-
+      const releaseUpstream = this.admission.reserve('tunnel', true)!;
       this.activeSockets.add(upstreamSocket);
       upstreamSocket.once('close', () => {
         this.activeSockets.delete(upstreamSocket);
+        releaseUpstream();
       });
-
       clientSocket.once('close', () => {
         clientClosed = true;
         upstreamSocket.destroy();
       });
-
       upstreamSocket.once('close', () => {
         clientSocket.destroy();
       });
-
       upstreamSocket.setTimeout(60000, () => {
         upstreamSocket.destroy();
         clientSocket.destroy();
       });
-
       upstreamSocket.on('error', (err) => {
         logger.debug(`[ConnectIngress] Upstream tunnel error for ${destination}: ${err.message}`);
         clientSocket.destroy();
       });
     });
   }
-
   isAttached(): boolean {
     return this.h2Server !== null;
   }
-
-  close(): void {
+  async close(timeoutMs = 5000): Promise<void> {
     this.isClosed = true;
-    this.reservedSockets = 0;
     if (this.attachedServer && this.connectListener) {
       this.attachedServer.removeListener('connect', this.connectListener);
       this.connectListener = null;
       this.attachedServer = null;
     }
-
-    for (const socket of this.activeSockets) {
-      try {
-        socket.destroy();
-      } catch {
-        // ignore error
-      }
-    }
-    this.activeSockets.clear();
-
-    if (this.h2Server) {
-      try {
-        this.h2Server.close();
-      } catch {
-        // ignore close error
-      }
-      this.h2Server = null;
-    }
+    for (const socket of this.activeSockets) socket.destroy();
+    const server = this.h2Server;
+    let closed = !server;
+    let closeError: Error | undefined;
+    server?.close((error) => {
+      if (error && (error as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') closeError = error;
+      closed = true;
+    });
+    await awaitDrain(() => closed && this.activeSockets.size === 0 && this.reservedSockets === 0 && this.pendingRequests === 0, timeoutMs);
+    if (closeError) throw closeError;
+    this.h2Server = null;
     ConnectIngressService.instanceAttached = false;
     ConnectIngressService.fatalError = false;
   }
