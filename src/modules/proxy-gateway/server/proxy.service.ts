@@ -59,6 +59,8 @@ import {
 } from '../antigravity/function-call-args';
 import { preflightNativeGeminiRequest } from './native-gemini-request';
 import { extractCanonicalUserTurnText } from './cloudcode-failover-gateway';
+import { getUpstreamDiagnosticContext, logUpstreamTerminalDiagnostic } from './cloudcode-diagnostics';
+import { UPSTREAM_STREAM_STATUS_CODES } from './upstream-stream-status';
 
 interface StreamIdleTimer {
   reset: () => void;
@@ -93,15 +95,6 @@ interface OpenAIStreamUsage {
   completion_tokens: number;
   total_tokens: number;
 }
-
-const UPSTREAM_STREAM_STATUS_CODES: Readonly<Record<string, HttpStatus>> = {
-  DEADLINE_EXCEEDED: HttpStatus.REQUEST_TIMEOUT,
-  INTERNAL: HttpStatus.INTERNAL_SERVER_ERROR,
-  PERMISSION_DENIED: HttpStatus.FORBIDDEN,
-  RESOURCE_EXHAUSTED: HttpStatus.TOO_MANY_REQUESTS,
-  UNAUTHENTICATED: HttpStatus.UNAUTHORIZED,
-  UNAVAILABLE: HttpStatus.SERVICE_UNAVAILABLE,
-};
 
 @Injectable()
 export class ProxyService {
@@ -2085,6 +2078,7 @@ export class ProxyService {
           subscriber.error(new Error('Session affinity confirmation rejected'));
           return;
         }
+        logUpstreamTerminalDiagnostic(getUpstreamDiagnosticContext(upstreamStream), 'terminal', finishReason);
         for (const event of mapper.complete(finishReason)) {
           subscriber.next(event);
         }
@@ -2102,6 +2096,7 @@ export class ProxyService {
         if (!terminate()) {
           return;
         }
+        logUpstreamTerminalDiagnostic(getUpstreamDiagnosticContext(upstreamStream), 'failure');
         streamHealth?.recordFailure(error);
         for (const event of mapper.fail(message, code)) {
           subscriber.next(event);
@@ -2574,6 +2569,7 @@ export class ProxyService {
         if (!terminate()) {
           return;
         }
+        logUpstreamTerminalDiagnostic(getUpstreamDiagnosticContext(upstreamStream), 'failure');
         void error;
         const safeError = new Error('Upstream stream failed');
         this.logger.error('OpenAI-compatible stream error: operation=openai_stream reason=upstream_error');
@@ -2766,6 +2762,7 @@ export class ProxyService {
             if (groundingText) {
               pushChoice(this.buildOpenAIContentChoice(streamOptions.variant, groundingText));
             }
+            logUpstreamTerminalDiagnostic(getUpstreamDiagnosticContext(upstreamStream), 'terminal', candidate.finishReason);
             const mappedFinishReason = emittedToolCall
               ? 'tool_calls'
               : mapGeminiFinishReasonToOpenAI(candidate.finishReason);
@@ -2816,6 +2813,9 @@ export class ProxyService {
           // empty success. Terminate through the error path and emit no [DONE].
           failStream(new Error('Upstream stream ended without any usable content'));
           return;
+        }
+        if (!hasEmittedTerminalFinish) {
+          logUpstreamTerminalDiagnostic(getUpstreamDiagnosticContext(upstreamStream), 'terminal');
         }
         terminate();
         sendDone();
