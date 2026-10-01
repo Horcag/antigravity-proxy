@@ -149,3 +149,50 @@ export function logUpstreamFailure(params: LogUpstreamFailureParams): void {
     // Fail-safe: diagnostics should never interfere with request lifecycle
   }
 }
+
+// Retain transport metadata outside provider payloads and downstream wire objects.
+const upstreamDiagnosticContexts = new WeakMap<object, UpstreamDiagnosticContext>();
+export interface UpstreamDiagnosticContext {
+  requestId: string;
+  httpStatus?: number;
+}
+const TERMINAL_ENUMS = new Set([
+  'FINISH_REASON_UNSPECIFIED', 'STOP', 'MAX_TOKENS', 'SAFETY', 'RECITATION',
+  'LANGUAGE', 'OTHER', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII',
+  'MALFORMED_FUNCTION_CALL', 'UNEXPECTED_TOOL_CALL', 'TOO_MANY_TOOL_CALLS',
+  'IMAGE_SAFETY', 'IMAGE_PROHIBITED_CONTENT', 'IMAGE_RECITATION', 'IMAGE_OTHER',
+  'NO_IMAGE', 'MISSING_THOUGHT_SIGNATURE', 'MALFORMED_RESPONSE', 'ESCALATION',
+  'PUP_LIMITED_DISABLED',
+]);
+
+export function registerUpstreamDiagnosticContext(
+  payload: unknown, context: UpstreamDiagnosticContext,
+): void {
+  if (payload && typeof payload === 'object') upstreamDiagnosticContexts.set(payload, context);
+}
+
+export function getUpstreamDiagnosticContext(payload: object): UpstreamDiagnosticContext | undefined {
+  return upstreamDiagnosticContexts.get(payload);
+}
+
+export function logUpstreamTerminalDiagnostic(
+  context: UpstreamDiagnosticContext | undefined,
+  event: 'start' | 'http_response' | 'terminal' | 'failure',
+  finishReason?: unknown,
+): void {
+  if (!context) return;
+  try {
+    // Only server UUIDs and exact known enums enter diagnostics. Unknown strings may
+    // contain credentials or content, so neither their bytes nor derivatives are logged.
+    const requestId = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(context.requestId)
+      ? context.requestId : 'invalid_request_id';
+    const rawTerminalEnum = finishReason == null || finishReason === '' ? 'ABSENT'
+      : typeof finishReason === 'string' && TERMINAL_ENUMS.has(finishReason)
+        ? finishReason : 'UNKNOWN_TERMINAL';
+    const httpStatus = Number.isInteger(context.httpStatus) && context.httpStatus! >= 100 && context.httpStatus! <= 599
+      ? context.httpStatus : null;
+    logger.log(`[UpstreamTerminal] ${JSON.stringify({ event, requestId, httpStatus, rawTerminalEnum })}`);
+  } catch {
+    // Diagnostics must leave the request lifecycle and wire behavior unchanged.
+  }
+}

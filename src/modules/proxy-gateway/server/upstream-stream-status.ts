@@ -1,0 +1,10 @@
+import { HttpStatus } from '@nestjs/common';
+
+export const UPSTREAM_STREAM_STATUS_CODES: Readonly<Record<string, HttpStatus>> = {
+  DEADLINE_EXCEEDED: HttpStatus.REQUEST_TIMEOUT,
+  INTERNAL: HttpStatus.INTERNAL_SERVER_ERROR,
+  PERMISSION_DENIED: HttpStatus.FORBIDDEN,
+  RESOURCE_EXHAUSTED: HttpStatus.TOO_MANY_REQUESTS,
+  UNAUTHENTICATED: HttpStatus.UNAUTHORIZED,
+  UNAVAILABLE: HttpStatus.SERVICE_UNAVAILABLE,
+};
