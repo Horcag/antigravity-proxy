@@ -1,4 +1,6 @@
 import 'reflect-metadata';
+import { releaseAdmission, installReleaseHooks, awaitShutdown } from './release-admission';
+import type { FastifyInstance } from 'fastify';
 import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { AppModule } from './app.module';
@@ -51,11 +53,13 @@ function isTailscaleHost(host: string): boolean {
 }
 
 async function cleanupFailedServerStart() {
+  releaseAdmission().beginClose();
   if (connectIngress) {
     try {
-      connectIngress.close();
+      await connectIngress.close();
     } catch {
-      // ignore
+      logger.warn('CONNECT shutdown did not drain');
+      return;
     }
     connectIngress = null;
   }
@@ -65,20 +69,22 @@ async function cleanupFailedServerStart() {
   }
 
   try {
-    await app.close();
+    await awaitShutdown(app.close());
   } catch (closeError) {
     logger.warn('Failed to clean up NestJS server after startup failure', closeError);
-  } finally {
-    app = null;
-    currentPort = 0;
-    currentHost = '127.0.0.1';
+    return;
   }
+  app = null;
+  currentPort = 0;
+  currentHost = '127.0.0.1';
+  releaseAdmission().stop();
 }
 
 export async function bootstrapNestServer(config: ProxyConfig): Promise<NestServerStartResult> {
   const port = config.port || 8045;
   const host = config.host || '127.0.0.1';
   if (app) {
+    if (releaseAdmission().status().closing) return { success: false, reason: 'unknown', port, message: 'Previous service shutdown has not completed' };
     logger.info('NestJS server already running.');
     return {
       success: true,
@@ -129,10 +135,13 @@ export async function bootstrapNestServer(config: ProxyConfig): Promise<NestServ
   }
 
   try {
+    releaseAdmission().prepareStart();
     app = await NestFactory.create<NestFastifyApplication>(AppModule, new FastifyAdapter(), {
       logger: ['error', 'warn', 'log'],
     });
 
+    const admission = releaseAdmission();
+    installReleaseHooks(app.getHttpAdapter().getInstance() as unknown as FastifyInstance, admission);
     await app.listen(port, host);
     currentPort = port;
     currentHost = host;
@@ -144,6 +153,7 @@ export async function bootstrapNestServer(config: ProxyConfig): Promise<NestServ
     }
     connectIngress = new ConnectIngressService(accountLeaseService);
     connectIngress.attach(rawHttpServer);
+    admission.start();
 
     logger.info(`NestJS Proxy Server running on http://${host}:${port}`);
     return {
@@ -176,21 +186,24 @@ export async function bootstrapNestServer(config: ProxyConfig): Promise<NestServ
 }
 
 export async function stopNestServer(): Promise<boolean> {
+  releaseAdmission().beginClose();
   if (connectIngress) {
     try {
-      connectIngress.close();
+      await connectIngress.close();
     } catch {
-      // ignore
+      logger.warn('CONNECT shutdown did not drain');
+      return false;
     }
     connectIngress = null;
   }
 
   if (app) {
     try {
-      await app.close();
+      await awaitShutdown(app.close());
       app = null;
       currentPort = 0;
       currentHost = '127.0.0.1';
+      releaseAdmission().stop();
       logger.info('NestJS server stopped.');
       return true;
     } catch (e) {

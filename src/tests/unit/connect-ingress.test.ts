@@ -1,7 +1,9 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CaManager } from '../../modules/proxy-gateway/server/cert/ca-manager';
 import { CloudCodeFailoverGateway } from '../../modules/proxy-gateway/server/cloudcode-failover-gateway';
 import { ConnectIngressService } from '../../modules/proxy-gateway/server/connect-ingress.service';
+import { ReleaseAdmission } from '../../server/release-admission';
+import tls from 'node:tls';
 import http from 'node:http';
 import net from 'node:net';
 import fs from 'node:fs';
@@ -234,17 +236,29 @@ describe('CloudCodeFailoverGateway', () => {
 });
 
 describe('ConnectIngressService', () => {
-  it('attaches to http.Server and closes cleanly', () => {
+  let gateDirectory: string;
+  let admission: ReleaseAdmission;
+  beforeEach(() => {
+    gateDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'connect-admission-test-'));
+    fs.chmodSync(gateDirectory, 0o750);
+    admission = new ReleaseAdmission(gateDirectory, process.getuid!());
+    vi.spyOn(CaManager, 'ensureCertificates').mockReturnValue(tls.createSecureContext());
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(gateDirectory, { recursive: true });
+  });
+  it('attaches to http.Server and closes cleanly', async () => {
     const server = http.createServer();
-    const ingress = new ConnectIngressService();
+    const ingress = new ConnectIngressService(undefined, admission);
 
     expect(() => ingress.attach(server)).not.toThrow();
-    expect(() => ingress.close()).not.toThrow();
+    await expect(ingress.close()).resolves.toBeUndefined();
   });
 
   it('handles CONNECT request for target host and non-target tunnel', async () => {
     const server = http.createServer();
-    const ingress = new ConnectIngressService();
+    const ingress = new ConnectIngressService(undefined, admission);
     ingress.attach(server);
 
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
@@ -265,14 +279,14 @@ describe('ConnectIngressService', () => {
 
     expect(response).toContain('HTTP/1.1 200 Connection Established');
 
-    ingress.close();
+    await ingress.close();
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
   it('rejects disallowed destinations with HTTP 403 (RFC1918, loopback, cloud metadata, bracketed IPv6)', async () => {
     const server = http.createServer();
-    const ingress = new ConnectIngressService();
+    const ingress = new ConnectIngressService(undefined, admission);
     ingress.attach(server);
 
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
@@ -311,24 +325,24 @@ describe('ConnectIngressService', () => {
       expect(resp).toContain('HTTP/1.1 403 Forbidden');
     }
 
-    ingress.close();
+    await ingress.close();
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
-  it('removes connect listener and cleans up active sockets on close()', () => {
+  it('removes connect listener and cleans up active sockets on close()', async () => {
     const server = http.createServer();
-    const ingress = new ConnectIngressService();
+    const ingress = new ConnectIngressService(undefined, admission);
     ingress.attach(server);
 
     expect(server.listenerCount('connect')).toBe(1);
-    ingress.close();
+    await ingress.close();
     expect(server.listenerCount('connect')).toBe(0);
   });
 
   it('handles client disconnect during DNS lookup without leaking sockets or throwing', async () => {
     const server = http.createServer();
-    const ingress = new ConnectIngressService();
+    const ingress = new ConnectIngressService(undefined, admission);
     ingress.attach(server);
 
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
@@ -343,20 +357,21 @@ describe('ConnectIngressService', () => {
       });
     });
 
-    ingress.close();
+    await ingress.close();
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
   it('enforces concurrency limit on target requests with HTTP 503', async () => {
     const server = http.createServer();
-    const ingress = new ConnectIngressService();
+    const ingress = new ConnectIngressService(undefined, admission);
     ingress.attach(server);
 
     // Simulate saturated socket pool
     const fakeSockets = Array.from({ length: 512 }, () => new net.Socket());
     for (const s of fakeSockets) {
       (ingress as any).activeSockets.add(s);
+      s.once('close', () => { (ingress as any).activeSockets.delete(s); });
     }
 
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
@@ -374,14 +389,14 @@ describe('ConnectIngressService', () => {
 
     expect(resp).toContain('HTTP/1.1 503 Service Unavailable');
 
-    ingress.close();
+    await ingress.close();
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
   it('ensures ingress.close() during DNS lookup does not create late upstream sockets', async () => {
     const server = http.createServer();
-    const ingress = new ConnectIngressService();
+    const ingress = new ConnectIngressService(undefined, admission);
     ingress.attach(server);
 
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
@@ -391,7 +406,7 @@ describe('ConnectIngressService', () => {
       const client = net.connect(port, '127.0.0.1', () => {
         client.write('CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n');
         // Close ingress immediately while DNS lookup is executing
-        ingress.close();
+        void ingress.close();
         setTimeout(resolve, 100);
       });
     });
@@ -424,7 +439,7 @@ describe('ConnectIngressService', () => {
     });
 
     const server = http.createServer();
-    const ingress = new ConnectIngressService();
+    const ingress = new ConnectIngressService(undefined, admission);
     ingress.attach(server);
 
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
@@ -445,14 +460,14 @@ describe('ConnectIngressService', () => {
 
     lookupSpy.mockRestore();
     netConnectSpy.mockRestore();
-    ingress.close();
+    await ingress.close();
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
   it('clears raw socket timeout when target host is intercepted', async () => {
     const server = http.createServer();
-    const ingress = new ConnectIngressService();
+    const ingress = new ConnectIngressService(undefined, admission);
     ingress.attach(server);
 
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
@@ -472,7 +487,7 @@ describe('ConnectIngressService', () => {
     expect((ingress as any).h2Server.keepAliveTimeout).toBe(120000);
     expect((ingress as any).h2Server.headersTimeout).toBe(125000);
 
-    ingress.close();
+    await ingress.close();
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });

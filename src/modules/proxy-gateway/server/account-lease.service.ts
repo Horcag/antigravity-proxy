@@ -1,3 +1,4 @@
+import { runReleaseBackground } from '../../../server/release-admission';
 import { randomInt } from 'node:crypto';
 import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit, Optional } from '@nestjs/common';
 import { CloudAccount } from '@/modules/cloud-account/types';
@@ -231,7 +232,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   async onModuleInit() {
     await ProductionOwnerGate.acquireExclusiveOwnership();
     await this.loadAccounts();
-    void this.refreshQuotaCatalog({ force: true }).catch((err) => this.logger.warn('Startup quota refresh failed', err));
+    void runReleaseBackground(() => this.refreshQuotaCatalog({ force: true })).catch((err) => this.logger.warn('Startup quota refresh failed', err));
     this.startQuotaCatalogRefreshTimer();
   }
   async onModuleDestroy() {
@@ -1047,11 +1048,10 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   private startQuotaCatalogRefreshTimer(): void {
     this.stopQuotaCatalogRefreshTimer();
     this.quotaCatalogRefreshTimer = setInterval(() => {
-      try {
-        CaManager.ensureAgyLauncher();
-      } catch { /* empty */
-      }
-      void this.refreshQuotaCatalog({ force: true }).catch((error: unknown) => {
+      void runReleaseBackground(async () => {
+        try { CaManager.ensureAgyLauncher(); } catch { /* empty */ }
+        return this.refreshQuotaCatalog({ force: true });
+      }).catch((error: unknown) => {
         this.logger.warn('Scheduled quota catalog refresh failed', error);
       });
     }, this.quotaCatalogRefreshIntervalMs);
