@@ -42,7 +42,7 @@ migration_topology=''
 migration_release_switched=0
 restore_stopped_legacy_service() {
   if [ "$mode" = migrate ] && [ "$legacy_stopped" = 1 ] && [ "$migration_topology" = legacy-only ]; then
-    legacy_user_systemd start || die "Failed to restore the legacy user service after migration failure"
+    legacy_user_systemd start || { printf '%s\n' "Failed to restore the legacy user service after migration failure" >&2; return 1; }
     legacy_stopped=0
   fi
 }
@@ -63,7 +63,8 @@ restore_migration_cutover() {
       if [ -n "$restored_current_id" ]; then
         systemd daemon-reload
         if ! systemd restart antigravity-proxy.service || ! smoke_check; then
-          die "The restored system release failed recovery smoke checks"
+          printf '%s\n' "The restored system release failed recovery smoke checks" >&2
+          return 1
         fi
       else
         systemd disable --now antigravity-proxy.service
@@ -72,10 +73,10 @@ restore_migration_cutover() {
     legacy-only|neither)
       systemd disable --now antigravity-proxy.service
       ;;
-    *) die "Migration topology was not captured" ;;
+    *) printf '%s\n' "Migration topology was not captured" >&2; return 1 ;;
   esac
   restore_migration_wants_state || rollback_failed=1
-  restore_stopped_legacy_service
+  restore_stopped_legacy_service || rollback_failed=1
   return "$rollback_failed"
 }
 restore_after_failed_migration() {
@@ -84,7 +85,7 @@ restore_after_failed_migration() {
   if [ "$exit_code" -ne 0 ]; then
     if [ "$migration_release_switched" = 1 ]; then
       migration_release_switched=0
-      if (restore_migration_cutover "$previous_id" "$previous_previous_id"); then
+      if restore_migration_cutover "$previous_id" "$previous_previous_id"; then
         legacy_stopped=0
       else
         printf '%s\n' 'Migration release topology rollback was incomplete' >&2
@@ -101,6 +102,7 @@ restore_after_failed_migration() {
   if [ "$exit_code" -ne 0 ]; then
     restore_stopped_legacy_service || printf '%s\n' 'Failed to restore the legacy user service after migration failure' >&2
   fi
+  ownership_release_all || printf '%s\n' 'Ownership reference cleanup was incomplete' >&2
   exit "$exit_code"
 }
 trap restore_after_failed_migration EXIT

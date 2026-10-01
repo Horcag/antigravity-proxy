@@ -23,5 +23,6 @@ stage_prebuilt_release() {
   require_regular_file "$candidate_staging_fs/package-lock.json" "prebuilt package-lock.json"
   require_regular_file "$candidate_staging_fs/bin/node" "prebuilt Node runtime"
   chmod 0755 "$candidate_staging_fs/bin/node"
-  candidate_staging_identity="$(publication_identity "$candidate_staging_fs")"
+  chown_root "$candidate_staging_fs"
+  ownership_seal "$candidate_staging_identity" "$candidate_staging_fs" || die "Could not seal prebuilt subtree"
 }

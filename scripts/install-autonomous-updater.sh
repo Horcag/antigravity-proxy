@@ -17,6 +17,7 @@ install -o root -g root -m 0755 "$script_dir/install-systemd.sh" "$libexec_dir/i
 install -o root -g root -m 0644 "$script_dir/release-lib.sh" "$libexec_dir/release-lib.sh"
 install -o root -g root -m 0644 "$script_dir/release-runtime-lib.sh" "$libexec_dir/release-runtime-lib.sh"
 install -o root -g root -m 0644 "$script_dir/release-prebuilt-lib.sh" "$libexec_dir/release-prebuilt-lib.sh"
+install -o root -g root -m 0644 "$script_dir/release-ownership-lib.sh" "$libexec_dir/release-ownership-lib.sh"
 install -o root -g root -m 0755 "$script_dir/import-accounts-stdin.sh" "$libexec_dir/import-accounts-stdin.sh"
 printf 'PROJECT_DIR=%q\nRELEASE_OPERATOR=%q\n' "$project_dir" "$release_operator" >"$config_dir/updater.conf"
 chown root:root "$config_dir/updater.conf"

@@ -6,6 +6,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$script_dir/release-lib.sh"
 release_init
 require_live_root
+trap 'ownership_release_all' EXIT
 
 target_id="${1:-}"
 if [ -z "$target_id" ]; then

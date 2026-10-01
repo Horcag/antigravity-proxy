@@ -3,7 +3,10 @@
 # shellcheck source=scripts/release-runtime-lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/release-runtime-lib.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/release-prebuilt-lib.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/release-ownership-lib.sh"
 release_init() {
+  ownership_init
+  declare -gA release_link_tokens=() migration_staged_file_tokens=()
   project_dir="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
   root_prefix="${ROOT_PREFIX:-}"
   install_root="${INSTALL_ROOT:-${INSTALL_DIR:-/opt/antigravity-proxy}}"
@@ -136,131 +139,6 @@ validate_existing_parent_directories() {
   done
 }
 
-file_identity() {
-  stat -c '%d:%i:%F:%s' -- "$1"
-}
-
-matches_identity() {
-  local path="$1" expected_identity="$2"
-  if ! { [ -e "$path" ] || [ -L "$path" ]; }; then
-    return 1
-  fi
-  [ "$(file_identity "$path")" = "$expected_identity" ]
-}
-
-publication_identity() {
-  stat -c '%d:%i:%F:%s@%z' -- "$1"
-}
-
-matches_publication_identity() {
-  local path="$1" expected_identity="$2"
-  if ! { [ -e "$path" ] || [ -L "$path" ]; }; then
-    return 1
-  fi
-  [ "$(publication_identity "$path")" = "$expected_identity" ]
-}
-
-# publication_identity includes ctime to detect in-place replacement. ctime changes on
-# rename, so a quarantined object is compared to the stable inode portion recorded
-# before publication rather than re-observing the newly published pathname.
-matches_detached_publication_identity() {
-  local path="$1" expected_identity="$2"
-  if ! { [ -e "$path" ] || [ -L "$path" ]; }; then
-    return 1
-  fi
-  [ "$(file_identity "$path")" = "${expected_identity%%@*}" ]
-}
-
-fsync_directory() {
-  sync -f -- "$1"
-}
-
-matches_owned_kind() {
-  local path="$1" kind="$2"
-  case "$kind" in
-    directory) [ -d "$path" ] && [ ! -L "$path" ] ;;
-    file) [ -f "$path" ] && [ ! -L "$path" ] ;;
-    link) [ -L "$path" ] ;;
-    *) die "Unknown owned path kind: $kind" ;;
-  esac
-}
-
-# The quarantine directory is private and on the source filesystem. Once rename has
-# detached the object, cleanup never traverses the attacker-visible original pathname.
-quarantine_owned_path() {
-  local path="$1" expected_identity="$2" kind="$3" label="$4" test_checkpoint="${5:-}"
-  local parent base
-  owned_quarantine_path=''
-  owned_quarantine_dir=''
-  if ! { [ -e "$path" ] || [ -L "$path" ]; }; then
-    return 2
-  fi
-  parent="$(dirname "$path")"
-  base="$(basename "$path")"
-  owned_quarantine_dir="$(umask 077 && mktemp -d "$parent/.${base}.quarantine.XXXXXX")" || {
-    printf '%s\n' "Refusing to create a private cleanup quarantine for $label: $path" >&2
-    return 1
-  }
-  owned_quarantine_path="$owned_quarantine_dir/object"
-  if ! mv -Tn -- "$path" "$owned_quarantine_path"; then
-    rmdir -- "$owned_quarantine_dir" 2>/dev/null || true
-    printf '%s\n' "Refusing to atomically detach $label for cleanup: $path" >&2
-    return 1
-  fi
-  if [ -n "$test_checkpoint" ]; then
-    substitute_cleanup_test_entry "$test_checkpoint" "$path"
-  fi
-  if { [ -e "$path" ] || [ -L "$path" ]; }; then
-    printf '%s\n' "Retained path after atomic cleanup detach: $path (quarantine: $owned_quarantine_dir)" >&2
-    return 1
-  fi
-  if ! { matches_owned_kind "$owned_quarantine_path" "$kind" && matches_detached_publication_identity "$owned_quarantine_path" "$expected_identity"; }; then
-    if mv -Tn -- "$owned_quarantine_path" "$path" && ! { [ -e "$owned_quarantine_path" ] || [ -L "$owned_quarantine_path" ]; }; then
-      rmdir -- "$owned_quarantine_dir" 2>/dev/null || true
-      printf '%s\n' "Refusing to clean a substituted $label; restored it without overwriting: $path" >&2
-    else
-      printf '%s\n' "Refusing to clean a substituted $label; retained quarantine: $owned_quarantine_dir" >&2
-    fi
-    return 1
-  fi
-  return 0
-}
-
-discard_owned_quarantine() {
-  local expected_identity="$1" kind="$2" label="$3"
-  if ! { [ -n "$owned_quarantine_path" ] && matches_owned_kind "$owned_quarantine_path" "$kind" && matches_detached_publication_identity "$owned_quarantine_path" "$expected_identity"; }; then
-    printf '%s\n' "Refusing to delete a substituted detached $label: ${owned_quarantine_path:-missing}" >&2
-    return 1
-  fi
-  case "$kind" in
-    directory) rm -rf -- "$owned_quarantine_path" ;;
-    file|link) rm -- "$owned_quarantine_path" ;;
-    *) die "Unknown owned path kind: $kind" ;;
-  esac
-  if { [ -e "$owned_quarantine_path" ] || [ -L "$owned_quarantine_path" ]; } || ! rmdir -- "$owned_quarantine_dir"; then
-    printf '%s\n' "Refusing to leave an unverified cleanup quarantine for $label: $owned_quarantine_dir" >&2
-    return 1
-  fi
-  owned_quarantine_path=''
-  owned_quarantine_dir=''
-  return 0
-}
-
-safe_cleanup_owned_path() {
-  local path="$1" expected_identity="$2" kind="$3" label="$4" test_checkpoint="$5" status
-  if ! { [ -e "$path" ] || [ -L "$path" ]; }; then
-    return 0
-  fi
-  if quarantine_owned_path "$path" "$expected_identity" "$kind" "$label" "$test_checkpoint"; then
-    discard_owned_quarantine "$expected_identity" "$kind" "$label"
-    return $?
-  else
-    status=$?
-  fi
-  [ "$status" -eq 2 ] && return 0
-  return "$status"
-}
-
 migration_state_entries() {
   printf '%s\n' accounts.db accounts.db-wal accounts.db-shm .master-key config.json
 }
@@ -290,9 +168,7 @@ copy_regular_file() {
   cp --no-dereference -- "$source" "$temporary"
   require_regular_file "$temporary" "$label staged copy"
   chmod "$mode" "$temporary"
-  if ! is_simulated; then
-    chown --no-dereference "$user_name:$service_group" "$temporary"
-  fi
+  # Staging remains installer-owned until exact-pin publication hands it off.
   mv -Tf -- "$temporary" "$target"
   require_regular_file "$target" "$label target"
 }
@@ -333,14 +209,25 @@ cleanup_candidate_staging() {
 }
 
 cleanup_migration_state_staging() {
-  local data_fs
+  local data_fs file staged_token cleanup_failed=0
   [ -n "$migration_state_staging_fs" ] || return 0
   data_fs="$(root_path "$data_dir")"
   case "$migration_state_staging_fs" in
-    "$data_fs"/.migration-staging-*) ;;
+    "$(dirname "$data_fs")"/.migration-staging-*) ;;
     *) die "Refusing to clean an invalid migration state staging path" ;;
   esac
   if [ -e "$migration_state_staging_fs" ] || [ -L "$migration_state_staging_fs" ]; then
+    while IFS= read -r file; do
+      staged_token="${migration_staged_file_tokens[$file]:-}"
+      [ -n "$staged_token" ] || continue
+      if [ -e "$migration_state_staging_fs/$file" ] || [ -L "$migration_state_staging_fs/$file" ]; then
+        safe_cleanup_owned_path "$migration_state_staging_fs/$file" "$staged_token" file "remaining migration staging $file" '' || cleanup_failed=1
+      fi
+    done < <(migration_state_entries)
+    [ "$cleanup_failed" = 0 ] || return 1
+    ownership_expect_empty "$migration_state_staging_identity" "$migration_state_staging_fs" || {
+      printf 'Refusing to delete unexpected migration staging children: %s\n' "$migration_state_staging_fs" >&2; return 1;
+    }
     safe_cleanup_owned_path "$migration_state_staging_fs" "$migration_state_staging_identity" directory "migration state staging directory" migration-state-staging || return
   fi
   migration_state_staging_fs=''
@@ -365,7 +252,8 @@ cleanup_migration_environment_staging() {
 }
 
 record_migration_publication() {
-  local path="$1" kind="${2:-file}"
+  local path="$1" kind="${2:-file}" token="${3:-}"
+  ownership_matches "$path" "$token" "$kind" || die "Missing retained migration publication proof"
   case "$kind" in
     file) require_regular_file "$path" "migration publication" ;;
     directory)
@@ -381,7 +269,7 @@ record_migration_publication() {
     *) die "Unknown migration publication kind: $kind" ;;
   esac
   migration_published_paths+=("$path")
-  migration_published_identities+=("$(publication_identity "$path")")
+  migration_published_identities+=("$token")
   migration_published_kinds+=("$kind")
   migration_publication_open=1
   fsync_directory "$(dirname "$path")"
@@ -511,7 +399,7 @@ snapshot_migration_environment_metadata() {
   if [ -e "$env_fs" ] || [ -L "$env_fs" ]; then
     require_regular_file "$env_fs" "target environment file"
     migration_environment_had_file=1
-    migration_environment_identity="$(file_identity "$env_fs")"
+    ownership_acquire migration_environment_identity "$env_fs" file "$(dirname "$env_fs")" || die "Could not adopt environment behind protected parent"
     migration_environment_metadata="$(stat -c '%u:%g:%a' -- "$env_fs")"
   fi
 }
@@ -520,7 +408,7 @@ restore_migration_environment_metadata() {
   local env_fs uid gid file_mode
   [ "$migration_environment_had_file" = 1 ] || return 0
   env_fs="$(root_path "$env_file")"
-  if ! { [ -f "$env_fs" ] && [ ! -L "$env_fs" ] && matches_identity "$env_fs" "$migration_environment_identity"; }; then
+  if ! { [ -f "$env_fs" ] && [ ! -L "$env_fs" ] && ownership_matches "$env_fs" "$migration_environment_identity" file; }; then
     printf '%s\n' "Refusing to restore metadata on substituted migration environment file: $env_fs" >&2
     return 1
   fi
@@ -600,7 +488,8 @@ create_release() {
 
   mkdir -m 0755 "$staging_fs"
   candidate_staging_fs="$staging_fs"
-  candidate_staging_identity="$(publication_identity "$staging_fs")"
+  ownership_acquire candidate_staging_identity "$staging_fs" directory "$(dirname "$staging_fs")" || die "Could not pin candidate staging"
+  ownership_seal "$candidate_staging_identity" "$staging_fs" || die "Could not seal empty candidate"
   if [ -n "$prebuilt_release_archive" ]; then stage_prebuilt_release; return; fi
   cp -a "$project_dir/dist" "$staging_fs/dist"
   install -m 0644 "$project_dir/package.json" "$staging_fs/package.json"
@@ -617,11 +506,12 @@ create_release() {
   if [ "$bundle_node" = 1 ]; then
     install -D -m 0755 "$node_binary" "$staging_fs/bin/node"
   fi
-  candidate_staging_identity="$(publication_identity "$staging_fs")"
+  chown_root "$staging_fs"
+  ownership_seal "$candidate_staging_identity" "$staging_fs" || die "Could not seal candidate subtree"
 }
 
 commit_candidate_release() {
-  local release_fs
+  local release_fs candidate_token="$candidate_staging_identity"
   release_fs="$(root_path "$release_dir")"
   [ -n "$candidate_staging_fs" ] || die "No candidate release is staged"
   if ! { [ -d "$candidate_staging_fs" ] && [ ! -L "$candidate_staging_fs" ] && matches_publication_identity "$candidate_staging_fs" "$candidate_staging_identity"; }; then
@@ -635,7 +525,8 @@ commit_candidate_release() {
   candidate_staging_identity=''
   chown_root "$release_fs"
   if [ "${mode:-}" = migrate ]; then
-    record_migration_publication "$release_fs" directory
+    ownership_transfer "$candidate_token" "$release_fs" || die "Lost candidate release pin"
+    record_migration_publication "$release_fs" directory "$candidate_token"
     substitute_migration_test_entry release "$release_fs"
     migration_checkpoint release
   fi
@@ -672,24 +563,49 @@ remove_recorded_release_link() {
   if [ ! -L "$link_fs" ]; then
     die "Refusing to remove a non-link $label: $link_fs"
   fi
-  expected_identity="$(publication_identity "$link_fs")"
+  expected_identity="${release_link_tokens[$link_fs]:-}"
+  if [ -z "$expected_identity" ]; then
+    ownership_acquire expected_identity "$link_fs" link "$(dirname "$link_fs")" || die "Could not explicitly adopt release link behind protected parent"
+  fi
   safe_cleanup_owned_path "$link_fs" "$expected_identity" link "$label" "$test_checkpoint"
 }
 
-set_release_link() {
-  local link_fs="$1" target_id="${2:-}" label="${3:-release link}" test_checkpoint="${4:-release-link-removal}" next_fs
-  next_fs="${link_fs}.next"
-  if [ -e "$next_fs" ] || [ -L "$next_fs" ]; then
-    die "Refusing to overwrite pending switch: $next_fs"
+publish_owned_link() {
+  local link_fs="$1" target="$2" token_name="$3" private_dir staged published_token container_token
+  private_dir="$(umask 077 && mktemp -d "$(dirname "$link_fs")/.link-staging.XXXXXX")" || return 1
+  if ! ownership_acquire container_token "$private_dir" directory "$(dirname "$private_dir")"; then
+    rmdir -- "$private_dir" 2>/dev/null || true; return 1
   fi
+  staged="$private_dir/object"
+  if ! ln -s -- "$target" "$staged" || ! ownership_acquire published_token "$staged" link "$private_dir"; then
+    # The only writer of this unpublished 0700 container is this function.
+    # Its held directory pin + protected subtree manifest authorize disposal.
+    ownership_seal "$container_token" "$private_dir" && ownership_discard_private "$container_token" "$private_dir" directory || {
+      printf 'Retained unproven private link staging: %s\n' "$private_dir" >&2; return 1;
+    }
+    return 1
+  fi
+  ownership_containers[$published_token]="$private_dir"
+  if ! mv -Tf -- "$staged" "$link_fs"; then
+    ownership_discard_private "$published_token" "$staged" link || return 1
+    ownership_drop "$container_token"
+    return 1
+  fi
+  ownership_transfer "$published_token" "$link_fs" || return 1
+  ownership_drop "$container_token" || return 1
+  printf -v "$token_name" '%s' "$published_token"
+}
+
+set_release_link() {
+  local link_fs="$1" target_id="${2:-}" label="${3:-release link}" test_checkpoint="${4:-release-link-removal}" link_token
   if [ -z "$target_id" ]; then
     remove_recorded_release_link "$link_fs" "$label" "$test_checkpoint"
     return
   fi
   validate_release_id "$target_id"
   [ -d "$(root_path "$releases_dir/$target_id")" ] || die "Release does not exist: $target_id"
-  ln -s "releases/$target_id" "$next_fs"
-  mv -Tf "$next_fs" "$link_fs"
+  publish_owned_link "$link_fs" "releases/$target_id" link_token || die "Could not publish pinned release link"
+  release_link_tokens[$link_fs]="$link_token"
 }
 
 record_migration_link_publication() {
@@ -701,7 +617,7 @@ record_migration_link_publication() {
     die "Migration release link was not published: $link_fs"
   fi
   migration_link_paths+=("$link_fs")
-  migration_link_identities+=("$(publication_identity "$link_fs")")
+  migration_link_identities+=("${release_link_tokens[$link_fs]:-}")
   migration_link_previous_ids+=("$prior_id")
 }
 
@@ -815,18 +731,19 @@ prepare_migration_unit_rollback() {
     fi
     cp -p --no-dereference -- "$unit_fs" "$migration_unit_backup_fs"
     require_regular_file "$migration_unit_backup_fs" "migration system unit backup"
-    migration_unit_backup_identity="$(publication_identity "$migration_unit_backup_fs")"
+    ownership_acquire migration_unit_backup_identity "$migration_unit_backup_fs" file "$(dirname "$migration_unit_backup_fs")" || die "Could not acquire migration_unit_backup_identity"
   fi
   migration_wants_fs="$(root_path "/etc/systemd/system/multi-user.target.wants/antigravity-proxy.service")"
   wants_dir="$(dirname "$migration_wants_fs")"
   if [ -e "$migration_wants_fs" ] || [ -L "$migration_wants_fs" ]; then
     migration_wants_had_entry=1
+    ownership_acquire migration_wants_published_identity "$migration_wants_fs" link "$wants_dir" || die "Could not adopt protected wants link"
     migration_wants_backup_fs="$wants_dir/.antigravity-proxy.service.migration-backup-${release_id}.$$"
     if [ -e "$migration_wants_backup_fs" ] || [ -L "$migration_wants_backup_fs" ]; then
       die "Migration system wants backup path already exists"
     fi
     cp -a --no-dereference -- "$migration_wants_fs" "$migration_wants_backup_fs"
-    migration_wants_backup_identity="$(publication_identity "$migration_wants_backup_fs")"
+    ownership_acquire migration_wants_backup_identity "$migration_wants_backup_fs" link "$(dirname "$migration_wants_backup_fs")" || die "Could not acquire migration_wants_backup_identity"
   fi
 }
 
@@ -896,7 +813,7 @@ restore_migration_unit_state() {
 record_migration_wants_publication() {
   [ "${mode:-}" = migrate ] || return 0
   [ -L "$migration_wants_fs" ] || return 0
-  migration_wants_published_identity="$(publication_identity "$migration_wants_fs")"
+  ownership_matches "$migration_wants_fs" "$migration_wants_published_identity" link || die "Missing retained wants publication proof"
   substitute_migration_test_entry wants "$migration_wants_fs"
   migration_checkpoint wants
 }
@@ -1062,7 +979,7 @@ WantedBy=multi-user.target
 EOF
   chmod 0644 "$migration_unit_staging_fs"
   require_regular_file "$migration_unit_staging_fs" "migration system unit staging file"
-  migration_unit_staging_identity="$(publication_identity "$migration_unit_staging_fs")"
+  ownership_acquire migration_unit_staging_identity "$migration_unit_staging_fs" file "$(dirname "$migration_unit_staging_fs")" || die "Could not acquire migration_unit_staging_identity"
   if [ "${mode:-}" = migrate ]; then
     # Record this exact inode before rename so rollback never needs a post-publication observation.
     migration_unit_published_identity="$migration_unit_staging_identity"
@@ -1155,9 +1072,9 @@ write_unit_for_release() {
 
 run_release_probe_command() {
   if is_simulated; then
-    "$@"
+    ownership_without_references "$@"
   else
-    runuser -u "$user_name" -- "$@"
+    ownership_without_references runuser -u "$user_name" -- "$@"
   fi
 }
 
@@ -1222,7 +1139,7 @@ systemd() {
   if is_simulated && [ "${RELEASE_TEST_SMOKE:-pass}" != real ] && [ "${RELEASE_TEST_SYSTEMCTL:-0}" != 1 ]; then
     return 0
   fi
-  systemctl "$@"
+  ownership_without_references systemctl "$@"
 }
 
 smoke_check() {
@@ -1328,6 +1245,10 @@ activate_release() {
   local action="$1"
   systemd daemon-reload || return 1
   if [ "$action" = start ]; then
+    if [ "${mode:-}" = migrate ] && [ ! -e "$migration_wants_fs" ] && [ ! -L "$migration_wants_fs" ]; then
+      require_safe_directory "$(dirname "$migration_wants_fs")" "system wants directory" 0755
+      publish_owned_link "$migration_wants_fs" ../antigravity-proxy.service migration_wants_published_identity || die "Could not stage pinned wants link"
+    fi
     systemd enable --now antigravity-proxy.service || return 1
     record_migration_wants_publication
   else
@@ -1429,20 +1350,25 @@ stage_legacy_migration_set() {
   legacy_fs="$(root_path "$legacy_dir")"
   data_fs="$(root_path "$data_dir")"
   env_fs="$(root_path "$env_file")"
-  stage_fs="$data_fs/.migration-staging-${release_id}.$$"
+  stage_fs="$(dirname "$data_fs")/.migration-staging-${release_id}.$$"
   if [ -e "$stage_fs" ] || [ -L "$stage_fs" ]; then
     die "Migration state staging path already exists"
   fi
+  [ "$(stat -c %d -- "$(dirname "$stage_fs")")" = "$(stat -c %d -- "$data_fs")" ] || die "Migration staging and target must share a filesystem"
   mkdir -m 0700 "$stage_fs"
   migration_state_staging_fs="$stage_fs"
-  migration_state_staging_identity="$(publication_identity "$stage_fs")"
+  ownership_acquire migration_state_staging_identity "$stage_fs" directory "$(dirname "$stage_fs")" || die "Could not pin state staging"
+  ownership_seal "$migration_state_staging_identity" "$stage_fs" || die "Could not seal empty state staging"
   while IFS= read -r file; do
     if [ -e "$legacy_fs/$file" ]; then
       copy_regular_file "$legacy_fs/$file" "$stage_fs/$file" 0600 "legacy migration $file"
+      local staged_token
+      ownership_acquire staged_token "$stage_fs/$file" file "$stage_fs" || die "Could not pin staged migration $file"
+      migration_staged_file_tokens[$file]="$staged_token"
     fi
   done < <(migration_state_entries)
   validate_state_topology "$stage_fs" "staged migration state"
-  migration_state_staging_identity="$(publication_identity "$stage_fs")"
+  ownership_seal "$migration_state_staging_identity" "$stage_fs" || die "Could not seal state staging"
   if ! { [ -e "$env_fs" ] || [ -L "$env_fs" ]; }; then
     migration_environment_staging_fs="${env_fs}.migration-staging-${release_id}.$$"
     if [ -e "$migration_environment_staging_fs" ] || [ -L "$migration_environment_staging_fs" ]; then
@@ -1450,7 +1376,7 @@ stage_legacy_migration_set() {
     fi
     copy_regular_file "$(root_path "$legacy_env")" "$migration_environment_staging_fs" 0640 "legacy environment"
     validate_environment_contract "$migration_environment_staging_fs"
-    migration_environment_staging_identity="$(publication_identity "$migration_environment_staging_fs")"
+    ownership_acquire migration_environment_staging_identity "$migration_environment_staging_fs" file "$(dirname "$migration_environment_staging_fs")" || die "Could not acquire migration_environment_staging_identity"
   fi
 }
 
@@ -1491,16 +1417,24 @@ substitute_cleanup_test_entry() {
 }
 
 publish_staged_migration_file() {
-  local stage_fs="$1" target_fs="$2" label="$3"
+  local stage_fs="$1" target_fs="$2" label="$3" token
+  [ "$(stat -c %d -- "$stage_fs")" = "$(stat -c %d -- "$(dirname "$target_fs")")" ] || die "Refusing cross-filesystem migration publication"
+  token="${migration_staged_file_tokens[$(basename "$stage_fs")]:-}"
+  if [ -z "$token" ]; then
+    ownership_acquire token "$stage_fs" file "$(dirname "$stage_fs")" || die "Could not pin migration file"
+  fi
+  ownership_matches "$stage_fs" "$token" file || die "Lost staged migration pin"
   if [ -e "$target_fs" ] || [ -L "$target_fs" ]; then
     die "$label target already exists"
   fi
-  mv -n -- "$stage_fs" "$target_fs"
+  mv -Tn -- "$stage_fs" "$target_fs"
   if [ -e "$stage_fs" ] || [ -L "$stage_fs" ]; then
     die "Could not publish staged $label without overwriting a target"
   fi
   require_regular_file "$target_fs" "$label target"
-  record_migration_publication "$target_fs"
+  ownership_transfer "$token" "$target_fs" || die "Lost migration file pin"
+  if ! is_simulated; then chown "$user_name:$service_group" "/proc/$ownership_holder_pid/fd/${ownership_fds[$token]}"; fi
+  record_migration_publication "$target_fs" file "$token"
 }
 
 publish_staged_migration_set() {
@@ -1520,7 +1454,7 @@ publish_staged_migration_set() {
       migration_checkpoint "state-$file"
     fi
   done < <(migration_state_entries)
-  migration_state_staging_identity="$(publication_identity "$migration_state_staging_fs")"
+  ownership_expect_empty "$migration_state_staging_identity" "$migration_state_staging_fs" || die "Migration staging has unexpected remaining children"
   safe_cleanup_owned_path "$migration_state_staging_fs" "$migration_state_staging_identity" directory "successful migration state staging directory" migration-state-staging-success || return
   migration_state_staging_fs=''
   migration_state_staging_identity=''
@@ -1542,5 +1476,5 @@ legacy_user_systemd() {
   uid="$(id -u "$legacy_user")"
   runtime_dir="/run/user/$uid"
   [ -d "$runtime_dir" ] || die "Legacy user runtime directory is unavailable: $runtime_dir"
-  runuser -u "$legacy_user" -- env XDG_RUNTIME_DIR="$runtime_dir" systemctl --user "$@" "$legacy_unit"
+  ownership_without_references runuser -u "$legacy_user" -- env XDG_RUNTIME_DIR="$runtime_dir" systemctl --user "$@" "$legacy_unit"
 }
