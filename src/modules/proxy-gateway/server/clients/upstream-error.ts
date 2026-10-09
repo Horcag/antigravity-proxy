@@ -1,4 +1,14 @@
 import { isNumber, isObjectLike, isString } from 'lodash-es';
+import axios, { AxiosRequestConfig } from 'axios';
+
+export function throwIfUpstreamRequestCanceled(error: unknown, signal?: AxiosRequestConfig['signal']): void {
+  if (signal?.aborted || axios.isCancel(error)) {
+    // Axios errors retain request headers and credentials; preserve only cancellation identity.
+    const canceled = new Error('Upstream request canceled');
+    canceled.name = 'AbortError';
+    throw canceled;
+  }
+}
 
 export interface UpstreamErrorHeaders {
   retryAfter?: string;

@@ -8,7 +8,7 @@ import { GeminiRequest, GeminiResponse } from '../interfaces/request-interfaces'
 import { GeminiInternalRequest } from '../../antigravity/types';
 import { getServerConfig } from '../../../../server/server-config';
 import { resolveRequestUserAgent } from '../request-user-agent';
-import { UpstreamRequestError } from './upstream-error';
+import { throwIfUpstreamRequestCanceled, UpstreamRequestError } from './upstream-error';
 import {
   getUpstreamDiagnosticContext,
   logUpstreamTerminalDiagnostic,
@@ -64,6 +64,7 @@ export class GeminiClient {
       });
       return response.data;
     } catch (error) {
+      throwIfUpstreamRequestCanceled(error, signal);
       if (axios.isAxiosError(error)) {
         const upstreamError = this.toUpstreamRequestError(error);
         this.logUpstreamFailure('stream_generate', upstreamError);
@@ -93,6 +94,7 @@ export class GeminiClient {
       });
       return response.data;
     } catch (error) {
+      throwIfUpstreamRequestCanceled(error, signal);
       if (axios.isAxiosError(error)) {
         const upstreamError = this.toUpstreamRequestError(error);
         this.logUpstreamFailure('generate', upstreamError);
@@ -101,9 +103,7 @@ export class GeminiClient {
       this.throwAsCleanError(error);
     }
   }
-
   // --- Internal Gateway API Support ---
-
   async streamGenerateInternal(
     body: GeminiInternalRequest,
     accessToken: string,
@@ -301,6 +301,7 @@ export class GeminiClient {
           }
           return response;
         } catch (error) {
+          throwIfUpstreamRequestCanceled(error, signal ?? config.signal);
           diagnostics.httpStatus = axios.isAxiosError(error) ? error.response?.status : undefined;
           logUpstreamTerminalDiagnostic(diagnostics, 'failure');
           lastError = error;
@@ -499,7 +500,6 @@ export class GeminiClient {
     }
     return undefined;
   }
-
   private throwAsCleanError(_error: unknown): never {
     throw new UpstreamRequestError({ reason: 'transport' });
   }

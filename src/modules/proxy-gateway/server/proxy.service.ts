@@ -1378,7 +1378,7 @@ export class ProxyService {
                 streamHealth,
               );
             } catch (streamError) {
-              if (this.retryPolicy.shouldFailoverImmediately(streamError)) {
+              if ((streamError instanceof Error && streamError.name === 'AbortError') || this.retryPolicy.shouldFailoverImmediately(streamError)) {
                 throw streamError;
               }
               this.logger.warn(
