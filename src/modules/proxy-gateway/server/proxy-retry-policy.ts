@@ -366,6 +366,10 @@ export class ProxyRetryPolicy {
       this.stopMigrationRenewal(retryState);
       this.releaseReservation(retryState);
     }
+    if (error instanceof Error && error.name === 'AbortError') {
+      if (retryState) this.abortAffinityPlacement(retryState);
+      return false;
+    }
     if (
       retryState?.migrationCapability &&
       typeof this.accountLeaseService.failSessionMigrationCandidate === 'function'
@@ -429,9 +433,7 @@ export class ProxyRetryPolicy {
       }
       return retryable;
     }
-    if (!(error instanceof Error)) {
-      return false;
-    }
+    if (!(error instanceof Error)) return false;
     this.logger.warn(
       `Upstream request failed: operation=proxy_request reason=${
         isStrictAuthenticationFailure(error) ? 'authentication' : 'generic_failure'
@@ -448,9 +450,7 @@ export class ProxyRetryPolicy {
       return true;
     }
     const penaltyDecision = this.classifyUpstreamFailure(error.message);
-    if (!penaltyDecision.retry) {
-      return false;
-    }
+    if (!penaltyDecision.retry) return false;
     if (penaltyDecision.markAsForbidden) {
       this.accountLeaseService.markAsForbidden(accountId);
       return true;

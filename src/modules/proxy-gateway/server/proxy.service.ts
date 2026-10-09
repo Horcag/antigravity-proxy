@@ -3,7 +3,7 @@ import { BadRequestException, HttpException, HttpStatus, Injectable, Logger, Inj
 import { isEmpty, isFunction, isNil, isNumber, isPlainObject, isString } from 'lodash-es';
 import { AccountLeaseService, type AffinityCommitResult } from './account-lease.service';
 import { GeminiClient, unwrapInternalGeminiResponse } from './clients/gemini.client';
-import { UpstreamRequestError } from './clients/upstream-error';
+import { getUpstreamRequestCancellation, UpstreamRequestError } from './clients/upstream-error';
 import { AccountPoolUnavailableException, OpenAIProtocolException } from './openai-protocol-error';
 import { v4 as uuidv4 } from 'uuid';
 import { Observable } from 'rxjs';
@@ -234,7 +234,7 @@ export class ProxyService {
       },
       recordFailure: (error: unknown) => {
         cleanup();
-        if (hasRecordedFailure) {
+        if (getUpstreamRequestCancellation(error) || hasRecordedFailure) {
           return;
         }
         hasRecordedFailure = true;
@@ -303,6 +303,8 @@ export class ProxyService {
   }
 
   private recordBoundedStreamPenalty(accountId: string, model: string, error: unknown): void {
+    // Caller cancellation ends this request without marking the upstream account unhealthy.
+    if (getUpstreamRequestCancellation(error)) return;
     const penaltyError =
       error instanceof UpstreamRequestError
         ? error
@@ -617,12 +619,12 @@ export class ProxyService {
         }
         terminated = true;
         cleanup();
-        if (destroyUpstream) {
+        const canceled = getUpstreamRequestCancellation(error);
+        if (destroyUpstream || canceled) {
           this.destroyUpstreamStream(upstreamStream);
         }
-        streamHealth.recordFailure(error);
-        void error;
-        subscriber.error(new Error('Upstream stream failed'));
+        streamHealth.recordFailure(canceled ?? error);
+        subscriber.error(canceled ?? new Error('Upstream stream failed'));
       };
 
       const processLine = (line: string): void => {
@@ -740,9 +742,9 @@ export class ProxyService {
       };
 
       const onError = (err: unknown): void => {
-        void err;
-        this.logger.error('Stream error: operation=anthropic_stream reason=upstream_error');
-        failStream(new Error('Upstream stream failed'));
+        const canceled = getUpstreamRequestCancellation(err);
+        if (!canceled) this.logger.error('Stream error: operation=anthropic_stream reason=upstream_error');
+        failStream(canceled ?? new Error('Upstream stream failed'));
       };
 
       const idleTimer = this.createStreamIdleTimer(upstreamStream, 'Claude-SSE', () => {
@@ -1014,15 +1016,8 @@ export class ProxyService {
         if (!terminate()) {
           return;
         }
-        const safeError = new Error('Upstream stream failed');
-        streamHealth.recordFailure(
-          error instanceof UpstreamRequestError
-            ? error
-            : new UpstreamRequestError({
-                status: HttpStatus.SERVICE_UNAVAILABLE,
-                reason: 'upstream_error',
-              }),
-        );
+        const safeError = getUpstreamRequestCancellation(error) ?? new Error('Upstream stream failed');
+        streamHealth.recordFailure(error instanceof UpstreamRequestError ? error : safeError);
         subscriber.error(safeError);
       };
       const idleTimer = this.createStreamIdleTimer(upstreamStream, 'Gemini-SSE', () => {
@@ -1111,8 +1106,7 @@ export class ProxyService {
       };
 
       const onError = (err: unknown): void => {
-        void err;
-        failStream(new Error('Upstream stream failed'));
+        failStream(getUpstreamRequestCancellation(err) ?? new Error('Upstream stream failed'));
       };
 
       upstreamStream.on('data', onData);
@@ -1378,7 +1372,7 @@ export class ProxyService {
                 streamHealth,
               );
             } catch (streamError) {
-              if (this.retryPolicy.shouldFailoverImmediately(streamError)) {
+              if ((streamError instanceof Error && streamError.name === 'AbortError') || this.retryPolicy.shouldFailoverImmediately(streamError)) {
                 throw streamError;
               }
               this.logger.warn(
@@ -1783,10 +1777,13 @@ export class ProxyService {
       };
 
       const onError = (error: unknown): void => {
+        const canceled = getUpstreamRequestCancellation(error);
         rejectOnce(
-          error instanceof UpstreamRequestError
-            ? error
-            : new UpstreamRequestError({ reason: 'transport' }),
+          canceled ??
+            (error instanceof UpstreamRequestError
+              ? error
+              : new UpstreamRequestError({ reason: 'transport' })),
+          Boolean(canceled),
         );
       };
 
@@ -2088,7 +2085,7 @@ export class ProxyService {
       const fail = (
         message: string,
         code = 'upstream_error',
-        error: UpstreamRequestError = new UpstreamRequestError({
+        error: Error = new UpstreamRequestError({
           status: HttpStatus.SERVICE_UNAVAILABLE,
           reason: 'upstream_error',
         }),
@@ -2096,6 +2093,8 @@ export class ProxyService {
         if (!terminate()) {
           return;
         }
+        const canceled = getUpstreamRequestCancellation(error);
+        if (canceled) return subscriber.error(canceled);
         logUpstreamTerminalDiagnostic(getUpstreamDiagnosticContext(upstreamStream), 'failure');
         streamHealth?.recordFailure(error);
         for (const event of mapper.fail(message, code)) {
@@ -2255,9 +2254,9 @@ export class ProxyService {
         if (completed) {
           return;
         }
-        void error;
-        this.logger.error('OpenAI Responses stream error: operation=responses_stream reason=upstream_error');
-        fail('Upstream Responses stream failed', 'upstream_error');
+        const canceled = getUpstreamRequestCancellation(error);
+        if (!canceled) this.logger.error('OpenAI Responses stream error: operation=responses_stream reason=upstream_error');
+        fail('Upstream Responses stream failed', 'upstream_error', canceled);
       };
 
       upstreamStream.on('data', onData);
@@ -2565,14 +2564,16 @@ export class ProxyService {
         hasSentDone = true;
       };
 
-      const failStream = (error: Error): void => {
+      const failStream = (error: unknown): void => {
         if (!terminate()) {
           return;
         }
-        logUpstreamTerminalDiagnostic(getUpstreamDiagnosticContext(upstreamStream), 'failure');
-        void error;
-        const safeError = new Error('Upstream stream failed');
-        this.logger.error('OpenAI-compatible stream error: operation=openai_stream reason=upstream_error');
+        const canceled = getUpstreamRequestCancellation(error);
+        const safeError = canceled ?? new Error('Upstream stream failed');
+        if (!canceled) {
+          logUpstreamTerminalDiagnostic(getUpstreamDiagnosticContext(upstreamStream), 'failure');
+          this.logger.error('OpenAI-compatible stream error: operation=openai_stream reason=upstream_error');
+        }
         streamHealth?.recordFailure(safeError);
         subscriber.error(safeError);
       };
@@ -2823,8 +2824,7 @@ export class ProxyService {
       };
 
       const onError = (err: unknown): void => {
-        void err;
-        failStream(new Error('Upstream stream failed'));
+        failStream(getUpstreamRequestCancellation(err) ?? new Error('Upstream stream failed'));
       };
 
       upstreamStream.on('data', onData);
