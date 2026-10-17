@@ -226,7 +226,17 @@ Antigravity client version, then restart the service. Google filters the availab
 model catalog by client version; refreshing quotas with an outdated version can
 still return an older catalog. Keep this deployment setting aligned with the client
 used to validate upstream access. It does not create model aliases or bypass
-account capability checks.
+account capability checks. An explicit value must be exactly `major.minor.patch`
+and is authoritative even when it is older than the fallback or the newest remote release.
+Pinned deployments skip remote version discovery. Use the version for the corresponding upstream
+client; CLI and desktop version numbers are separate and should not be substituted blindly.
+
+CONNECT forwarding removes local `x-ag-proxy-*` routing metadata, proxy authentication,
+forwarding addresses (`Forwarded`, `Via`, `X-Forwarded-*`, `X-Real-IP`), and hop-by-hop
+headers, including names nominated by `Connection`, regardless of header-name case.
+Native client metadata such as `User-Agent` and `x-goog-api-client` is preserved.
+These measures prevent local metadata leakage and inconsistent version declarations;
+they do not establish indistinguishability from the native client or guarantee against account suspension.
 
 OpenAI-compatible request:
 

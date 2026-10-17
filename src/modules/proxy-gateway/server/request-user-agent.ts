@@ -104,7 +104,10 @@ export function resolveLocalInstalledVersion(): string | null {
   if (!configuredVersion) {
     return null;
   }
-  return extractHighestSemver(configuredVersion);
+  if (!/^\d+\.\d+\.\d+$/.test(configuredVersion)) {
+    throw new Error('AG_PROXY_UPSTREAM_VERSION must be an exact major.minor.patch version');
+  }
+  return configuredVersion;
 }
 
 async function fetchTextPayload(url: string): Promise<string | null> {
@@ -168,9 +171,9 @@ async function resolveDefaultUserAgentResolution(): Promise<UserAgentResolution>
   let bestSource: UserAgentSource = 'fallback';
 
   const localVersion = resolveLocalInstalledVersion();
-  if (localVersion && compareSemverVersions(localVersion, bestVersion) > 0) {
-    bestVersion = localVersion;
-    bestSource = 'local';
+  // An explicit deployment pin is authoritative, including older validated clients.
+  if (localVersion) {
+    return { source: 'local', version: localVersion, userAgent: buildUserAgent(localVersion) };
   }
 
   const remoteVersion = await resolveRemoteVersion();

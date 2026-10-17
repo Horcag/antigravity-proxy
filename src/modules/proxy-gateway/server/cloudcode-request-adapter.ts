@@ -1,6 +1,7 @@
 import * as zlib from 'node:zlib';
 import * as crypto from 'node:crypto';
 import type { IncomingHttpHeaders } from 'node:http';
+import { isolateUpstreamHeaders } from './upstream-request-headers';
 
 const REPLAY_SAFE_POST_ACTIONS = new Set([
   ':streamGenerateContent', ':generateContent', ':predict', ':streamRawPredict', ':countTokens', ':loadCodeAssist',
@@ -246,31 +247,8 @@ export function composeAttemptRequest(options: ComposeAttemptOptions): {
     }
   }
 
-  const upstreamHeaders: Record<string, string> = {};
-  for (const [key, value] of Object.entries(reqHeaders)) {
-    if (!key.startsWith(':') && key.toLowerCase() !== 'host') {
-      if (Array.isArray(value)) upstreamHeaders[key] = value.join(', ');
-      else if (value !== undefined) upstreamHeaders[key] = String(value);
-    }
-  }
-
+  const upstreamHeaders = isolateUpstreamHeaders(reqHeaders);
   upstreamHeaders['host'] = targetHost;
-  delete upstreamHeaders['transfer-encoding'];
-  delete upstreamHeaders['connection'];
-  delete upstreamHeaders['proxy-connection'];
-  delete upstreamHeaders['proxy-authorization'];
-  delete upstreamHeaders['te'];
-  delete upstreamHeaders['keep-alive'];
-  delete upstreamHeaders['upgrade'];
-  delete upstreamHeaders['x-ag-proxy-session-id'];
-  delete upstreamHeaders['x-goog-session-id'];
-
-  const connHeader = reqHeaders['connection'];
-  if (typeof connHeader === 'string') {
-    for (const h of connHeader.split(',').map((s) => s.trim().toLowerCase())) {
-      delete upstreamHeaders[h];
-    }
-  }
 
   const upperMethod = method.toUpperCase();
   if (payloadToSend.length > 0 || upperMethod === 'POST' || upperMethod === 'PUT' || upperMethod === 'PATCH') {
