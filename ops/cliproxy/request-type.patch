@@ -1,0 +1,73 @@
+--- a/ops/linux/arina-cliproxy-router.mjs
++++ b/ops/linux/arina-cliproxy-router.mjs
+@@ -208,6 +208,15 @@
+       !root.request || typeof root.request !== 'object' || Array.isArray(root.request)) {
+       fail(res, 400, 'CloudCode requires model and request object'); return;
+     }
++    // CPA rebuilds this envelope as agent; other native request types would lose their semantics.
++    if (Object.hasOwn(root, 'requestType')) {
++      if (typeof root.requestType !== 'string' || !root.requestType.trim()) {
++        fail(res, 400, 'CloudCode requestType must be a non-empty string'); return;
++      }
++      if (root.requestType !== 'agent') {
++        fail(res, 501, 'CloudCode requestType is not supported by this generation route'); return;
++      }
++    }
+     if (!Object.hasOwn(root.request, 'sessionId') && typeof root.sessionId === 'string') {
+       root.request.sessionId = root.sessionId;
+     }
+--- a/test/cliproxy-router.test.mjs
++++ b/test/cliproxy-router.test.mjs
+@@ -66,6 +66,52 @@
+     assert.deepEqual(seen.body, envelope.request); assert.equal(seen.url, '/v1beta/models/gemini-test:generateContent');
+     assert.equal(seen.headers.authorization, 'Bearer core-key'); assert.equal(seen.headers['x-goog-api-key'], undefined); assert.equal(seen.headers['x-goog-user-project'], undefined);
+   }
++});
++
++test('CloudCode rejects malformed and unsupported requestType before core invocation', async t => {
++  let calls = 0;
++  const router = createCliproxyRouter({
++    env: { ARINA_CPA_CORE_URL: 'http://127.0.0.1:1', ARINA_CPA_CORE_API_KEY: 'key' },
++    request() { calls++; assert.fail('rejected requestType must not reach core'); },
++  });
++  const gateway = await server(t, router.handleCloudCode);
++  for (const action of ['generateContent', 'streamGenerateContent']) {
++    for (const requestType of [null, false, 0, {}, [], '', ' ', 'web_search', 'image_gen', 'unknown', ' agent ']) {
++      const response = await cloudFetch(gateway + `/v1internal:${action}`, {
++        method: 'POST', headers: cloudHeaders, body: JSON.stringify({ ...envelope, requestType }),
++      });
++      const malformed = typeof requestType !== 'string' || !requestType.trim();
++      assert.equal(response.status, malformed ? 400 : 501);
++      assert.deepEqual(await response.json(), { error: {
++        code: malformed ? 400 : 501,
++        message: malformed ? 'CloudCode requestType must be a non-empty string' :
++          'CloudCode requestType is not supported by this generation route',
++      } });
++    }
++  }
++  assert.equal(calls, 0);
++});
++
++test('CloudCode omitted and agent requestType preserve generation payload and target', async t => {
++  const seen = [];
++  const core = await server(t, async (req, res) => {
++    seen.push({ url: req.url, body: JSON.parse((await body(req)).toString()) }); res.end('{}');
++  });
++  const router = createCliproxyRouter({ env: { ARINA_CPA_CORE_URL: core, ARINA_CPA_CORE_API_KEY: 'key' } });
++  const gateway = await server(t, router.handleCloudCode);
++  for (const action of ['generateContent', 'streamGenerateContent']) {
++    for (const requestType of [undefined, 'agent']) {
++      const response = await cloudFetch(gateway + `/v1internal:${action}`, {
++        method: 'POST', headers: cloudHeaders, body: JSON.stringify({ ...envelope, requestType }),
++      });
++      assert.equal(response.status, 200); assert.deepEqual(await response.json(), { response: {} });
++      assert.deepEqual(seen.at(-1), {
++        url: `/v1beta/models/gemini-test:${action}${action === 'streamGenerateContent' ? '?alt=sse' : ''}`,
++        body: envelope.request,
++      });
++    }
++  }
++  assert.equal(seen.length, 4);
+ });
+ 
+ test('CloudCode SSE handles split UTF8/frame boundaries, tool parts and compressed streaming', async t => {
