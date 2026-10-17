@@ -17,6 +17,7 @@ import {
 } from './account-lease-quota-refresh-policy';
 import type { AccountLeaseQuotaCatalogRefreshResult } from './account-lease-quota-refresh-policy';
 import { AccountLeaseTokenCache } from './account-lease-token-cache';
+import { AccountSuspensionFence, loadAccountLeaseSnapshot } from './account-suspension-fence';
 import { AccountLeaseHydrationPolicy } from './account-lease-hydration-policy';
 import { AccountLeaseFulfillmentPolicy } from './account-lease-fulfillment-policy';
 import { ProductionOwnerGate } from '@/modules/cloud-account/persistence/production-owner-gate';
@@ -161,6 +162,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   private readonly activeReservations = new Map<string, string>();
   private readonly accountReservations = new Map<string, Set<string>>();
   private readonly accountBreakerGenerations = new Map<string, number>();
+  private readonly suspensionFence = new AccountSuspensionFence();
   private readonly performancePolicy = new AccountPerformancePolicy();
   constructor(
     @Optional()
@@ -241,19 +243,8 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     await ProductionOwnerGate.releaseExclusiveOwnership();
   }
   async loadAccounts(): Promise<number> {
-    const generation = this.quotaRefreshPolicy.beginSnapshotReload();
-    try {
-      const snapshot = await this.tokenCache.loadAccounts();
-      if (!snapshot || !this.quotaRefreshPolicy.canInstallSnapshot(generation)) {
-        return 0;
-      }
-      this.tokens = snapshot.tokens;
-      this.selectionPolicy.clearSessionBindingsForUnavailableAccounts(new Set(this.tokens.keys()));
-      this.performancePolicy.resetAccounts(new Set(this.tokens.keys()));
-      return snapshot.count;
-    } finally {
-      this.quotaRefreshPolicy.finishSnapshotReload(generation);
-    }
+    return loadAccountLeaseSnapshot(this.tokenCache, this.quotaRefreshPolicy, this.suspensionFence,
+      this.selectionPolicy, this.performancePolicy, (tokens) => { this.tokens = tokens; });
   }
   async reloadAllAccounts(): Promise<number> {
     const count = await this.loadAccounts();
@@ -443,6 +434,12 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   }
   markAsForbidden(accountIdOrEmail: string) {
     this.limitPolicy.markAsForbidden(accountIdOrEmail);
+  }
+  suspendAccount(accountId: string): Promise<void> {
+    return this.suspensionFence.suspend(accountId, this.tokens, this.accountStore, () => {
+      this.selectionPolicy.clearSessionBindingsForUnavailableAccounts(new Set(this.tokens.keys()));
+      this.performancePolicy.resetAccounts(new Set(this.tokens.keys()));
+    });
   }
   public getBreakerGeneration(accountId: string): number {
     return this.accountBreakerGenerations.get(accountId) ?? 0;

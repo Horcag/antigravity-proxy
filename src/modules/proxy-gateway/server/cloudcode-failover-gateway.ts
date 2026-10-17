@@ -1,3 +1,4 @@
+import { recordAccountFailureHealth } from './cloudcode-account-health';
 import http from 'node:http';
 import http2 from 'node:http2';
 import https from 'node:https';
@@ -8,7 +9,6 @@ import { logger } from '../../../shared/logging/logger';
 import { getServerConfig } from '../../../server/server-config';
 import { AccountLeaseService } from './account-lease.service';
 import { CloudAccount } from '../../cloud-account/types';
-import { RateLimitReason } from './rate-limit-tracker';
 import { parseTargetAuthority } from './cert/ca-manager';
 import { type MigrationCapability, isVerifiedSessionKey, isHintSessionKey } from './account-lease-selection-policy';
 import { AnonymousTransportReceiptOwner } from './anonymous-transport-receipt';
@@ -428,25 +428,8 @@ export class CloudCodeFailoverGateway {
             evidence: failureEvidence, action: decision.action, downstreamCommitted: responseCommitted,
           });
 
-          if (account && this.accountLeaseService) {
-            try {
-              if (decision.healthEffect.kind === 'rate-limited') {
-                void this.accountLeaseService.markFromUpstreamError({
-                  accountIdOrEmail: account.id, status: status >= 400 ? status : 429,
-                  model: effectiveModel, body: failureEvidence.rawErrorText, headers: responseHeaders,
-                  reason: decision.healthEffect.isQuota ? RateLimitReason.QuotaExhausted : RateLimitReason.RateLimitExceeded,
-                }).catch(() => {
-                  logger.warn('[CloudCodeGateway] Failed to record account error health effect: health_effect_failed');
-                });
-              } else if (decision.healthEffect.kind === 'credential-rejected') {
-                this.accountLeaseService.markAsForbidden?.(account.id);
-              } else if (decision.healthEffect.kind === 'model-unrequestable') {
-                this.accountLeaseService.markModelUnrequestable?.(account.id, decision.healthEffect.effectiveModel);
-              }
-            } catch {
-              logger.warn('[CloudCodeGateway] Failed to record account error health effect: health_effect_failed');
-            }
-          }
+          if (account && this.accountLeaseService) await recordAccountFailureHealth({ service: this.accountLeaseService, accountId: account.id,
+            health: decision.healthEffect, evidence: failureEvidence, status, headers: responseHeaders, model: effectiveModel });
 
           if (decision.action.kind === 'retry-same-account') {
             if (decision.action.repair === 'project-context') {

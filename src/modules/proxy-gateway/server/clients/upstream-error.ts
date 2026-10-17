@@ -22,6 +22,7 @@ export interface UpstreamErrorHeaders {
 
 export const UPSTREAM_FAILURE_REASONS = [
   'authentication',
+  'account_suspended',
   'model_not_found',
   'quota_exhausted',
   'rate_limited',

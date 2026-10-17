@@ -11,6 +11,7 @@ export const ACCOUNT_LEASE_UPSTREAM = Symbol('ACCOUNT_LEASE_UPSTREAM');
 export interface AccountLeaseAccountStore {
   getAccounts(): Promise<CloudAccount[]>;
   getAccount(accountId: string): Promise<CloudAccount | undefined>;
+  suspendAccount?(accountId: string): Promise<void>;
   updateToken(accountId: string, token: CloudAccount['token']): Promise<void>;
   updateTokenIfCurrent(
     accountId: string,
@@ -48,6 +49,7 @@ export interface AccountLeaseUpstream {
 export const cloudAccountStoreAdapter: AccountLeaseAccountStore = {
   getAccounts: () => CloudAccountRepo.getAccounts(),
   getAccount: (accountId) => CloudAccountRepo.getAccount(accountId),
+  suspendAccount: (accountId) => CloudAccountRepo.suspendAccount(accountId),
   updateToken: (accountId, token) => CloudAccountRepo.updateToken(accountId, token),
   updateTokenIfCurrent: (accountId, token, isCurrent) =>
     CloudAccountRepo.updateTokenIfCurrent(accountId, token, isCurrent),

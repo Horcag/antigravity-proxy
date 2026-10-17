@@ -29,6 +29,7 @@ export interface ProxyRetryAccountLeaseService {
   getNextToken(options?: RetryTokenOptions): Promise<CloudAccount | null>;
   recordParityError(): void;
   markAsForbidden(accountIdOrEmail: string): void;
+  suspendAccount?(accountId: string): Promise<void>;
   markAsRateLimited(accountIdOrEmail: string): void;
   markFromUpstreamError(params: {
     accountIdOrEmail: string;

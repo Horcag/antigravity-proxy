@@ -40,6 +40,7 @@ function deriveTerminalHealthEffect(evidence: FailureEvidence, effectiveModel?: 
   switch (evidence.category) {
     case 'quota':
       return { kind: 'rate-limited', isQuota: evidence.isQuota };
+    case 'account-suspended':
     case 'authentication':
       return { kind: 'credential-rejected' };
     case 'model-capability':
@@ -98,6 +99,9 @@ export function evaluateRetryDecision(params: EvaluateRetryParams): RetryDecisio
   }
 
   switch (evidence.category) {
+    case 'account-suspended':
+      return { action: { kind: 'commit-error' }, healthEffect: { kind: 'credential-rejected' } };
+
     case 'quota':
       return {
         action: hasAlternativeAccounts

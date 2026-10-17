@@ -1,3 +1,4 @@
+import { classifyRetryableUpstreamFailure } from './proxy-retry-classification';
 import crypto from 'node:crypto';
 import { CloudAccount } from '@/modules/cloud-account/types';
 import { calculateRetryDelay, sleep } from '../antigravity/retry-utils';
@@ -284,7 +285,7 @@ export class ProxyRetryPolicy {
   }
   shouldFailoverImmediately(error: unknown): boolean {
     return (
-      error instanceof UpstreamRequestError &&
+      error instanceof UpstreamRequestError && error.reason !== 'account_suspended' &&
       (error.status === 401 || error.status === 403 || error.status === 429)
     );
   } markUpstreamSuccess(
@@ -386,6 +387,14 @@ export class ProxyRetryPolicy {
     this.accountLeaseService.recordParityError();
     if (error instanceof UpstreamRequestError) {
       const status = error.status;
+      if (error.reason === 'account_suspended') {
+        if (retryState) retryState.migrationAuthorization = undefined;
+        try {
+          if (!this.accountLeaseService.suspendAccount) throw new Error('Suspension persistence unavailable');
+          await this.accountLeaseService.suspendAccount(accountId);
+        } catch { this.logger.warn('Account suspension persistence failed; terminal request requires operator review'); }
+        return false;
+      }
       if (retryState) {
         const reason = this.migrationReasonForUpstreamError(error);
         retryState.migrationAuthorization = reason
@@ -491,46 +500,6 @@ export class ProxyRetryPolicy {
     return error.status === 429 ? RateLimitReason.Unknown : RateLimitReason.ServerError;
   }
   classifyUpstreamFailure(errorMessage: string): ProxyUpstreamFailureClassification {
-    const normalizedErrorMessage = errorMessage.toLowerCase();
-    if (isStrictAuthenticationFailure(errorMessage)) {
-      return {
-        retry: true,
-        markAsForbidden: true,
-        markAsRateLimited: false,
-      };
-    }
-    const isRateLimitedSignal =
-      normalizedErrorMessage.includes('429') ||
-      normalizedErrorMessage.includes('resource_exhausted') ||
-      normalizedErrorMessage.includes('quota') ||
-      normalizedErrorMessage.includes('rate_limit') ||
-      normalizedErrorMessage.includes('rate limit');
-    const shouldRetryByStatus =
-      normalizedErrorMessage.includes('408') ||
-      normalizedErrorMessage.includes('429') ||
-      normalizedErrorMessage.includes('500') ||
-      normalizedErrorMessage.includes('502') ||
-      normalizedErrorMessage.includes('503') ||
-      normalizedErrorMessage.includes('504');
-    const shouldRetryByKeyword =
-      normalizedErrorMessage.includes('resource_exhausted') ||
-      normalizedErrorMessage.includes('quota') ||
-      normalizedErrorMessage.includes('rate_limit') ||
-      normalizedErrorMessage.includes('timeout') ||
-      normalizedErrorMessage.includes('socket hang up') ||
-      normalizedErrorMessage.includes('empty response stream') ||
-      normalizedErrorMessage.includes('connection reset');
-    if (shouldRetryByStatus || shouldRetryByKeyword) {
-      return {
-        retry: true,
-        markAsForbidden: false,
-        markAsRateLimited: isRateLimitedSignal,
-      };
-    }
-    return {
-      retry: false,
-      markAsForbidden: false,
-      markAsRateLimited: false,
-    };
+    return classifyRetryableUpstreamFailure(errorMessage);
   }
 }

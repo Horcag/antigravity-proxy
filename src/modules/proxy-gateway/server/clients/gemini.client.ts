@@ -2,13 +2,14 @@ import { randomUUID } from 'node:crypto';
 import { UserProjectCapabilityCache } from './user-project-capability-cache';
 import { Injectable, Logger } from '@nestjs/common';
 import axios, { AxiosError, AxiosProxyConfig, AxiosRequestConfig, AxiosResponse } from 'axios';
-import { isObjectLike, isString } from 'lodash-es';
+import { isObjectLike } from 'lodash-es';
 import { Readable } from 'node:stream';
 import { GeminiRequest, GeminiResponse } from '../interfaces/request-interfaces';
 import { GeminiInternalRequest } from '../../antigravity/types';
 import { getServerConfig } from '../../../../server/server-config';
 import { resolveRequestUserAgent } from '../request-user-agent';
 import { throwIfUpstreamRequestCanceled, UpstreamRequestError } from './upstream-error';
+import { inspectSuspensionResponse, isSuspendedAxiosResponse, toGeminiUpstreamError } from './gemini-upstream-error';
 import {
   getUpstreamDiagnosticContext,
   logUpstreamTerminalDiagnostic,
@@ -65,6 +66,7 @@ export class GeminiClient {
       return response.data;
     } catch (error) {
       throwIfUpstreamRequestCanceled(error, signal);
+      await inspectSuspensionResponse(error, signal);
       if (axios.isAxiosError(error)) {
         const upstreamError = this.toUpstreamRequestError(error);
         this.logUpstreamFailure('stream_generate', upstreamError);
@@ -95,6 +97,7 @@ export class GeminiClient {
       return response.data;
     } catch (error) {
       throwIfUpstreamRequestCanceled(error, signal);
+      await inspectSuspensionResponse(error, signal);
       if (axios.isAxiosError(error)) {
         const upstreamError = this.toUpstreamRequestError(error);
         this.logUpstreamFailure('generate', upstreamError);
@@ -302,6 +305,7 @@ export class GeminiClient {
           return response;
         } catch (error) {
           throwIfUpstreamRequestCanceled(error, signal ?? config.signal);
+          await inspectSuspensionResponse(error, signal ?? config.signal);
           diagnostics.httpStatus = axios.isAxiosError(error) ? error.response?.status : undefined;
           logUpstreamTerminalDiagnostic(diagnostics, 'failure');
           lastError = error;
@@ -373,6 +377,7 @@ export class GeminiClient {
     return (
       axios.isAxiosError(error) &&
       error.response?.status === 403 &&
+      !isSuspendedAxiosResponse(error) &&
       Boolean(projectHeaders['x-goog-user-project'])
     );
   }
@@ -387,54 +392,7 @@ export class GeminiClient {
   }
 
   private toUpstreamRequestError(error: AxiosError): UpstreamRequestError {
-    const status = error.response?.status;
-    return new UpstreamRequestError({
-      status,
-      headers: { retryAfter: this.extractRetryAfterHeader(error.response?.headers) },
-      reason: this.classifyAxiosFailure(status, error.response?.data, error.message),
-    });
-  }
-
-  private classifyAxiosFailure(
-    status: number | undefined,
-    responseData: unknown,
-    transportMessage: string,
-  ): UpstreamRequestError['reason'] {
-    if (status === 401 || status === 403) {
-      return 'authentication';
-    }
-    if (status === 404) {
-      return 'model_not_found';
-    }
-
-    const classificationText = this.toClassificationText(responseData).toLowerCase();
-    if (classificationText.includes('quota')) {
-      return 'quota_exhausted';
-    }
-    if (status === 429 || classificationText.includes('resource_exhausted')) {
-      return 'rate_limited';
-    }
-    if (status === undefined && /timeout|socket|connect|network|reset/i.test(transportMessage)) {
-      return 'transport';
-    }
-    return 'upstream_error';
-  }
-
-  private toClassificationText(value: unknown): string {
-    if (isString(value)) {
-      return value;
-    }
-    if (Buffer.isBuffer(value)) {
-      return value.toString('utf-8');
-    }
-    if (!isObjectLike(value)) {
-      return '';
-    }
-    try {
-      return JSON.stringify(value);
-    } catch {
-      return '';
-    }
+    return toGeminiUpstreamError(error);
   }
 
   private logUpstreamFailure(operation: string, error: UpstreamRequestError): void {
@@ -481,25 +439,6 @@ export class GeminiClient {
     }
   }
 
-  private extractRetryAfterHeader(headers: unknown): string | undefined {
-    if (!isObjectLike(headers)) {
-      return undefined;
-    }
-
-    const retryAfter = Object.entries(headers as Record<string, unknown>).find(
-      ([name]) => name.toLowerCase() === 'retry-after',
-    )?.[1];
-    if (isString(retryAfter)) {
-      return retryAfter.trim();
-    }
-    if (Array.isArray(retryAfter) && retryAfter.length > 0) {
-      const first = retryAfter[0];
-      if (isString(first)) {
-        return first.trim();
-      }
-    }
-    return undefined;
-  }
   private throwAsCleanError(_error: unknown): never {
     throw new UpstreamRequestError({ reason: 'transport' });
   }

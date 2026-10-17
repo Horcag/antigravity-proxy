@@ -1,8 +1,9 @@
 import * as zlib from 'node:zlib';
 import type { IncomingHttpHeaders } from 'node:http';
+import { isAccountSuspended } from './account-suspension.js';
 
 export type FailureCategory =
-  | 'quota' | 'authentication' | 'permission-denied' | 'model-capability'
+  | 'account-suspended' | 'quota' | 'authentication' | 'permission-denied' | 'model-capability'
   | 'project-context' | 'invalid-request' | 'ambiguous-invalid-argument'
   | 'transient' | 'unknown';
 
@@ -112,6 +113,7 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
   }
 
   let rpcStatus: string | undefined;
+  let embeddedCode: number | undefined;
   let errorInfoReason: string | undefined;
   let errorInfoDomain: string | undefined;
   let hasFieldViolations = false;
@@ -124,7 +126,10 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
       isValidJson = true;
       if (parsed?.error && typeof parsed.error === 'object') {
         if (typeof parsed.error.status === 'string') rpcStatus = parsed.error.status;
-        if (typeof parsed.error.code === 'number' && statusCode < 400) statusCode = parsed.error.code;
+        if (typeof parsed.error.code === 'number') {
+          embeddedCode = parsed.error.code;
+          if (statusCode < 400) statusCode = parsed.error.code;
+        }
         if (Array.isArray(parsed.error.details)) {
           for (const d of parsed.error.details) {
             const type = d['@type'] || '';
@@ -141,6 +146,13 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
   } catch { /* Non-JSON or incomplete body */ }
 
   const lowerText = errorText.toLowerCase();
+  const grpcCode = String(headers['grpc-status'] ?? '');
+  const suspensionStatus = statusCode === 403 || embeddedCode === 403 || grpcCode === '7' || embeddedCode === 7 ? 403 : statusCode;
+  if (isAccountSuspended(suspensionStatus, errorText)) {
+    const rule = 'google.account.suspended';
+    return makeEvidence('account-suspended', rule, grpcCode === '7' ? 'grpc' : source, 403, 'PERMISSION_DENIED',
+      buildSafeErrorMessage('account-suspended', rule, 'PERMISSION_DENIED', 403), errorText);
+  }
 
   // 1. gRPC status header / trailers
   const grpcHeader = headers['grpc-status'];

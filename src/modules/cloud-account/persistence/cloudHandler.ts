@@ -143,6 +143,15 @@ export class CloudAccountRepo {
     this.getDatabase().prepare('DELETE FROM accounts WHERE id = ?').run(accountId);
   }
 
+  static async suspendAccount(accountId: string): Promise<void> {
+    const result = this.getDatabase()
+      .prepare("UPDATE accounts SET status = 'expired', status_reason = 'upstream_tos_suspended', is_active = 0 WHERE id = ?")
+      .run(accountId);
+    if (result.changes !== 1) {
+      throw new Error('Account suspension did not update exactly one existing account');
+    }
+  }
+
   static async updateToken(accountId: string, token: CloudAccount['token']): Promise<void> {
     this.getDatabase()
       .prepare('UPDATE accounts SET token_json = ? WHERE id = ?')
