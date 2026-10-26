@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AdminService } from '@/admin/admin.service';
 import { CloudAccountRepo } from '@/modules/cloud-account/persistence/cloudHandler';
 import type { CloudAccount } from '@/modules/cloud-account/types';
 import { AccountLeaseService } from '@/modules/proxy-gateway/server/account-lease.service';
@@ -35,7 +36,7 @@ describe('AccountLeaseService cache affinity fences', () => {
         id: token.account_id,
         provider: 'google',
         email: token.email,
-        token,
+        token: { ...token, session_id: undefined },
         created_at: 1,
         last_used: 1,
         status: 'active',
@@ -66,10 +67,80 @@ describe('AccountLeaseService cache affinity fences', () => {
       expect(service.getSessionBinding('session:healthy')).toEqual(healthyBinding);
       expect(service.getSessionBinding('session:unavailable')).toBeNull();
       expect((service as any).tokens.get('acc-2').access_token).toBe('updated-access');
+      expect((service as any).tokens.get('acc-2').session_id).toBe('session-acc-2');
       expect((service as any).accountCooldowns.get('acc-2')).toBe(cooldownUntil);
       expect(tracker.getRemainingWaitSeconds('acc-2', 'gemini-2.5-pro')).toBeGreaterThan(0);
     },
   );
+
+  it.each([undefined, '-1234567890123456789'])(
+    'keeps runtime session IDs across import unless the import supplies %s',
+    async (persistedSessionId) => {
+      const accounts: CloudAccount[] = [...(service as any).tokens.values()].map((token) => ({
+        id: token.account_id,
+        provider: 'google',
+        email: token.email,
+        token: { ...token, session_id: undefined },
+        created_at: 1,
+        last_used: 1,
+        status: 'active',
+      }));
+      vi.spyOn(CloudAccountRepo, 'getAccounts').mockImplementation(async () => accounts);
+      vi.spyOn(CloudAccountRepo, 'getAccountByEmail').mockImplementation(async (email) =>
+        accounts.find((account) => account.email === email));
+      vi.spyOn(CloudAccountRepo, 'addAccount').mockImplementation(async (account) => {
+        const index = accounts.findIndex((existing) => existing.id === account.id);
+        if (index === -1) accounts.push(account);
+        else accounts[index] = account;
+      });
+      await service.loadAccounts();
+      service.bindSession('session:import', 'acc-1');
+      const binding = service.getSessionBinding('session:import');
+
+      const result = await new AdminService(service).importAccounts({
+        accounts: [{
+          provider: 'google',
+          email: accounts[0].email,
+          token: { ...accounts[0].token, access_token: 'imported-access', session_id: persistedSessionId },
+        }],
+      });
+
+      expect(result.imported).toBe(1);
+      expect((service as any).tokens.get('acc-1')).toMatchObject({
+        access_token: 'imported-access',
+        session_id: persistedSessionId ?? 'session-acc-1',
+      });
+      expect((service as any).tokens.get('acc-2').session_id).toBe('session-acc-2');
+      expect(service.getSessionBinding('session:import')).toEqual(binding);
+      await service.loadAccounts();
+      expect((service as any).tokens.get('acc-1').session_id)
+        .toBe(persistedSessionId ?? 'session-acc-1');
+    },
+  );
+
+  it('generates separate valid IDs for new accounts and reuses them on later snapshots', async () => {
+    const accounts: CloudAccount[] = ['new-1', 'new-2'].map((id) => ({
+      id,
+      provider: 'google',
+      email: 'acc-1@test.dev',
+      token: { ...(service as any).tokens.get('acc-1'), session_id: undefined },
+      created_at: 1,
+      last_used: 1,
+      status: 'active',
+    }));
+    vi.spyOn(CloudAccountRepo, 'getAccounts').mockImplementation(async () => accounts);
+
+    await expect(service.loadAccounts()).resolves.toBe(2);
+    const sessionIds = accounts.map(({ id }) => (service as any).tokens.get(id).session_id);
+    for (const sessionId of sessionIds) {
+      expect(sessionId).toMatch(/^-[1-8]\d{18}$/);
+      expect(sessionId).not.toBe('session-acc-1');
+    }
+    expect(new Set(sessionIds).size).toBe(2);
+
+    await service.loadAccounts();
+    expect(accounts.map(({ id }) => (service as any).tokens.get(id).session_id)).toEqual(sessionIds);
+  });
 
   it('rejects a stale migration authorization before reserving or dispatching', async () => {
     const sessionKey = 'session:stale-authorization-canary';

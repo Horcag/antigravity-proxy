@@ -243,7 +243,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   async loadAccounts(): Promise<number> {
     const generation = this.quotaRefreshPolicy.beginSnapshotReload();
     try {
-      const snapshot = await this.tokenCache.loadAccounts();
+      const snapshot = await this.tokenCache.loadAccounts(this.tokens);
       if (!snapshot || !this.quotaRefreshPolicy.canInstallSnapshot(generation)) {
         return 0;
       }
