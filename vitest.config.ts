@@ -8,6 +8,7 @@ export default defineConfig({
     },
   },
   test: {
+    maxWorkers: 4,
     environment: 'node',
     include: ['src/tests/**/*.test.ts', 'scripts/**/*.test.ts'],
     env: {
