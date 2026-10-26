@@ -1,7 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { CloudAccountRepo } from '@/modules/cloud-account/persistence/cloudHandler';
+import type { CloudAccount } from '@/modules/cloud-account/types';
 import { AccountLeaseService } from '@/modules/proxy-gateway/server/account-lease.service';
 import { createMigrationAuthorization } from '@/modules/proxy-gateway/server/cache-affinity-coordinator';
-import { RateLimitReason } from '@/modules/proxy-gateway/server/rate-limit-tracker';
+import { RateLimitReason, type RateLimitTracker } from '@/modules/proxy-gateway/server/rate-limit-tracker';
 
 describe('AccountLeaseService cache affinity fences', () => {
   let service: AccountLeaseService;
@@ -21,6 +23,53 @@ describe('AccountLeaseService cache affinity fences', () => {
       session_id: `session-${id}`,
     }]));
   });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each(['removed', 'disabled'] as const)(
+    'preserves live affinity and limits while invalidating a %s account on snapshot reload',
+    async (unavailable) => {
+      const accounts: CloudAccount[] = [...(service as any).tokens.values()].map((token) => ({
+        id: token.account_id,
+        provider: 'google',
+        email: token.email,
+        token,
+        created_at: 1,
+        last_used: 1,
+        status: 'active',
+        is_active: false,
+      }));
+      vi.spyOn(CloudAccountRepo, 'getAccounts').mockImplementation(async () => accounts);
+      await service.loadAccounts();
+      service.bindSession('session:unavailable', 'acc-1');
+      service.bindSession('session:healthy', 'acc-2');
+      const healthyBinding = service.getSessionBinding('session:healthy');
+      expect(healthyBinding).toMatchObject({ accountId: 'acc-2' });
+      expect(service.getSessionBinding('session:unavailable')).toMatchObject({ accountId: 'acc-1' });
+      const cooldownUntil = Date.now() + 60_000;
+      (service as any).accountCooldowns.set('acc-2', cooldownUntil);
+      const tracker = (service as any).rateLimitTracker as RateLimitTracker;
+      tracker.setLockoutUntilIso(
+        'acc-2', new Date(cooldownUntil).toISOString(), RateLimitReason.RateLimitExceeded,
+        'gemini-2.5-pro',
+      );
+      const rateLimitBefore = tracker.getRemainingWaitSeconds('acc-2', 'gemini-2.5-pro');
+      expect(rateLimitBefore).toBeGreaterThan(0);
+      accounts[1].token.access_token = 'updated-access';
+      if (unavailable === 'removed') accounts.splice(0, 1);
+      else accounts[0].status = 'expired';
+
+      await expect(service.loadAccounts()).resolves.toBe(1);
+
+      expect(service.getSessionBinding('session:healthy')).toEqual(healthyBinding);
+      expect(service.getSessionBinding('session:unavailable')).toBeNull();
+      expect((service as any).tokens.get('acc-2').access_token).toBe('updated-access');
+      expect((service as any).accountCooldowns.get('acc-2')).toBe(cooldownUntil);
+      expect(tracker.getRemainingWaitSeconds('acc-2', 'gemini-2.5-pro')).toBeGreaterThan(0);
+    },
+  );
 
   it('rejects a stale migration authorization before reserving or dispatching', async () => {
     const sessionKey = 'session:stale-authorization-canary';
