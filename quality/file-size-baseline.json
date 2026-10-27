@@ -18,7 +18,7 @@
     "src/modules/proxy-gateway/server/account-lease-selection-policy.ts": 960,
     "src/modules/proxy-gateway/server/account-lease.service.ts": 1068,
     "src/modules/proxy-gateway/server/clients/gemini.client.ts": 506,
-    "src/modules/proxy-gateway/server/cloudcode-failover-gateway.ts": 1633,
+    "src/modules/proxy-gateway/server/cloudcode-failover-gateway.ts": 1605,
     "src/modules/proxy-gateway/server/native-gemini-request.ts": 506,
     "src/modules/proxy-gateway/server/proxy-retry-policy.ts": 536,
     "src/modules/proxy-gateway/server/proxy.controller.ts": 3416,

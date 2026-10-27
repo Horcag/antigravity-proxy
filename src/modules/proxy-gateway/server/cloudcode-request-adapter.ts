@@ -18,13 +18,7 @@ export interface ComposeAttemptOptions {
   targetHost: string;
   method: string;
   urlPath: string;
-  requestedModel?: string;
-  effectiveModel?: string;
-  routingProject?: string;
-  quotaHeaderMode: 'with-quota-header' | 'without-quota-header';
   accessToken?: string;
-  attempt: number;
-  isProjectless?: boolean;
 }
 
 export function isReplaySafeOperation(
@@ -184,7 +178,7 @@ export function rewriteJsonPayloadLossless(
 
 export function composeAttemptRequest(options: ComposeAttemptOptions): {
   urlPath: string;
-  headers: Record<string, string>;
+  headers: Record<string, string | string[]>;
   payloadToSend: Buffer;
 } {
   const {
@@ -193,113 +187,36 @@ export function composeAttemptRequest(options: ComposeAttemptOptions): {
     targetHost,
     method,
     urlPath,
-    requestedModel,
-    effectiveModel,
-    routingProject,
-    quotaHeaderMode,
     accessToken,
-    attempt,
-    isProjectless,
   } = options;
 
-  let resolvedUrlPath = urlPath;
-  if (effectiveModel && effectiveModel !== requestedModel && resolvedUrlPath.includes('/models/')) {
-    resolvedUrlPath = resolvedUrlPath.replace(/\/models\/([^/:]+)/, `/models/${effectiveModel}`);
+  // Native CONNECT is credential substitution, never an API translation. In particular,
+  // do not decode/re-encode compressed bodies or repair account-specific projects/models.
+  const upstreamHeaders: Record<string, string | string[]> = {};
+  const hopByHop = new Set([
+    'connection', 'proxy-connection', 'proxy-authorization', 'proxy-authenticate',
+    'transfer-encoding', 'te', 'trailer', 'keep-alive', 'upgrade',
+  ]);
+  const connection = reqHeaders['connection'];
+  for (const value of Array.isArray(connection) ? connection : [connection || '']) {
+    for (const name of value.split(',')) hopByHop.add(name.trim().toLowerCase());
   }
-
-  let payloadToSend = rawBody;
-  const contentEncoding = (Array.isArray(reqHeaders['content-encoding'])
-    ? reqHeaders['content-encoding'][0]
-    : reqHeaders['content-encoding'] || '').toLowerCase();
-
-  const needsModelEdit = Boolean(effectiveModel && effectiveModel !== requestedModel);
-  const needsProjectEdit = Boolean(routingProject || isProjectless);
-
-  const rawContentType = (Array.isArray(reqHeaders['content-type'])
-    ? reqHeaders['content-type'][0]
-    : reqHeaders['content-type'] || '').toLowerCase();
-  const isJson = rawContentType.includes('application/json') || (!rawContentType && (urlPath.includes(':') || urlPath.includes('/models/')));
-
-  if (isJson && (needsModelEdit || needsProjectEdit) && rawBody.length > 0) {
-    const decomp = decompressBody(rawBody, contentEncoding);
-    if (!decomp.error && decomp.text) {
-      try {
-        const rewritten = rewriteJsonPayloadLossless(decomp.text, {
-          model: needsModelEdit ? effectiveModel : undefined,
-          routingProject: isProjectless ? undefined : routingProject,
-          isProjectless,
-        });
-
-        const utfBuf = Buffer.from(rewritten, 'utf-8');
-        if (contentEncoding.includes('gzip')) {
-          payloadToSend = zlib.gzipSync(utfBuf);
-        } else if (contentEncoding.includes('deflate')) {
-          payloadToSend = zlib.deflateSync(utfBuf);
-        } else if (contentEncoding.includes('br')) {
-          payloadToSend = zlib.brotliCompressSync(utfBuf);
-        } else {
-          payloadToSend = utfBuf;
-        }
-      } catch {
-        payloadToSend = rawBody;
-      }
-    }
-  }
-
-  const upstreamHeaders: Record<string, string> = {};
   for (const [key, value] of Object.entries(reqHeaders)) {
-    if (!key.startsWith(':') && key.toLowerCase() !== 'host') {
-      if (Array.isArray(value)) upstreamHeaders[key] = value.join(', ');
-      else if (value !== undefined) upstreamHeaders[key] = String(value);
+    const lower = key.toLowerCase();
+    if (!key.startsWith(':') && !hopByHop.has(lower) && value !== undefined) {
+      upstreamHeaders[lower] = Array.isArray(value) ? [...value] : String(value);
     }
   }
-
-  upstreamHeaders['host'] = targetHost;
-  delete upstreamHeaders['transfer-encoding'];
-  delete upstreamHeaders['connection'];
-  delete upstreamHeaders['proxy-connection'];
-  delete upstreamHeaders['proxy-authorization'];
-  delete upstreamHeaders['te'];
-  delete upstreamHeaders['keep-alive'];
-  delete upstreamHeaders['upgrade'];
-  delete upstreamHeaders['x-ag-proxy-session-id'];
-  delete upstreamHeaders['x-goog-session-id'];
-
-  const connHeader = reqHeaders['connection'];
-  if (typeof connHeader === 'string') {
-    for (const h of connHeader.split(',').map((s) => s.trim().toLowerCase())) {
-      delete upstreamHeaders[h];
-    }
+  // HTTP/2 authority is represented by Host on the upstream HTTP/1.1 connection.
+  upstreamHeaders['host'] = reqHeaders[':authority'] || reqHeaders['host'] || targetHost;
+  if (rawBody.length > 0 || ['POST', 'PUT', 'PATCH'].includes(method.toUpperCase())) {
+    upstreamHeaders['content-length'] = String(rawBody.length);
   }
-
-  const upperMethod = method.toUpperCase();
-  if (payloadToSend.length > 0 || upperMethod === 'POST' || upperMethod === 'PUT' || upperMethod === 'PATCH') {
-    upstreamHeaders['content-length'] = String(payloadToSend.length);
-  }
-
   if (accessToken) {
-    for (const key of Object.keys(upstreamHeaders)) {
-      const lower = key.toLowerCase();
-      if (lower === 'x-goog-api-key' || lower === 'authorization') {
-        delete upstreamHeaders[key];
-      }
-    }
+    delete upstreamHeaders['x-goog-api-key'];
     upstreamHeaders['authorization'] = `Bearer ${accessToken}`;
-  } else if (attempt === 1 && reqHeaders['authorization']) {
-    upstreamHeaders['authorization'] = String(reqHeaders['authorization']);
   }
-
-  if (quotaHeaderMode === 'with-quota-header' && routingProject) {
-    upstreamHeaders['x-goog-user-project'] = routingProject;
-  } else {
-    delete upstreamHeaders['x-goog-user-project'];
-  }
-
-  return {
-    urlPath: resolvedUrlPath,
-    headers: upstreamHeaders,
-    payloadToSend,
-  };
+  return { urlPath, headers: upstreamHeaders, payloadToSend: rawBody };
 }
 
 export function extractCanonicalUserTurnText(turn: unknown): string | null {

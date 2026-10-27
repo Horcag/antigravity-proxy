@@ -215,8 +215,8 @@ describe('Oracle Round 3 Recovery Acceptance Tests', () => {
     expect(ambiguousError.category).toBe('ambiguous-invalid-argument');
   });
 
-  // Requirement 3 / R1/R7: Bound A -> quota failure -> migrate to B -> project rejection on B -> repair on B -> fenced confirmation on B
-  it('R1/R7: Migration from A to B followed by same-account repair on B retains migration capability, generation, and reservation', async () => {
+  // Requirement 3 / R1/R7: Bound A -> quota failure -> migrate to B -> transient rejection on B -> retry on B -> fenced confirmation on B
+  it('R1/R7: Migration from A to B followed by transient retry on B retains migration capability, generation, and reservation', async () => {
     const sessionKey = 'session:r1-r7-acceptance-test';
     const accA = createMockAccount('acc-A', 'a@test.com');
     const accB = createMockAccount('acc-B', 'b@test.com');
@@ -253,9 +253,9 @@ describe('Oracle Round 3 Recovery Acceptance Tests', () => {
       }
       if (upstreamCalls === 2) {
         return {
-          statusCode: 403,
+          statusCode: 503,
           headers: { 'content-type': 'application/json' },
-          bufferedBody: Buffer.from('{"error":{"code":403,"status":"PERMISSION_DENIED","message":"serviceusage.services.use permission denied on project-acc-B"}}'),
+          bufferedBody: Buffer.from('{"error":{"code":503,"status":"UNAVAILABLE","message":"Temporarily unavailable"}}'),
           bodyStream: createMockStream(),
         };
       }
@@ -280,8 +280,8 @@ describe('Oracle Round 3 Recovery Acceptance Tests', () => {
     expect(mockLeaseService.startSessionMigration).toHaveBeenCalledTimes(1);
     expect(mockLeaseService.confirmOrBindSession).toHaveBeenCalledWith(sessionKey, 'acc-B', 2, expect.any(String), undefined, 1);
     expect(executedProjects[0]).toBe('project-acc-A');
-    expect(executedProjects[1]).toBe('project-acc-B');
-    expect(executedProjects[2]).toBeUndefined();
+    expect(executedProjects[1]).toBe('project-acc-A');
+    expect(executedProjects[2]).toBe('project-acc-A');
   });
 
   // Requirement 4 / B3 & Requirement 5 / P2: Gateway sanitization and transient retry reachability
@@ -319,13 +319,10 @@ describe('Oracle Round 3 Recovery Acceptance Tests', () => {
       };
     });
 
-    // On attempt 2, resolveDynamicModelForAccount throws during preparation before dispatch
-    mockLeaseService.resolveDynamicModelForAccount.mockImplementation((_accId: string, _model: string) => {
-      if (attemptNum === 2) {
-        throw new Error('Secret internal DB preparation connection string details');
-      }
-      return 'gemini-2.5-pro';
-    });
+    // Token access can fail during preparation; native dispatch never resolves model aliases.
+    Object.defineProperty(accB, 'token', { get() {
+      throw new Error('Secret internal DB preparation connection string details');
+    } });
 
     const req = createMockRequest();
     const res = createMockResponse();
@@ -383,7 +380,7 @@ describe('Oracle Round 3 Recovery Acceptance Tests', () => {
     expect(mockLeaseService.startSessionMigration).not.toHaveBeenCalled();
   });
 
-  it('B1: Gateway handles percent-encoded quota project denial in grpc-message with project repair and zero penalties', async () => {
+  it('B1: Gateway returns percent-encoded quota project denial without mutating context or penalties', async () => {
     const accA = createMockAccount('acc-A', 'a@test.com');
     mockLeaseService.acquireAttemptLease.mockResolvedValue({ account: accA, generation: 1, tableIncarnation: 1, releaseReservation: vi.fn() });
     mockLeaseService.getQuotaDiagnostics = vi.fn(() => ({ accounts: [{ id: 'acc-A' }] }));
@@ -412,11 +409,9 @@ describe('Oracle Round 3 Recovery Acceptance Tests', () => {
     const res = createMockResponse();
     await gateway.handleRequest(req, res);
 
-    expect(upstreamCalls).toBe(2);
-    expect(res.statusCode).toBe(200);
-    expect(res.body).toContain('Success after repair');
+    expect(upstreamCalls).toBe(1);
+    expect(res.statusCode).toBe(403);
     expect(executedProjects[0]).toBe('project-acc-A');
-    expect(executedProjects[1]).toBeUndefined();
     expect(mockLeaseService.acquireAttemptLease).toHaveBeenCalledTimes(1);
     expect(mockLeaseService.markFromUpstreamError).not.toHaveBeenCalled();
     expect(mockLeaseService.markAsForbidden).not.toHaveBeenCalled();
