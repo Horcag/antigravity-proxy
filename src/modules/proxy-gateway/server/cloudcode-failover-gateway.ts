@@ -304,6 +304,12 @@ export class CloudCodeFailoverGateway {
                 deferSessionBinding: true, migrationAuthorization: undefined, signal: requestAbortController.signal, requestId, affinityOwnerTimeoutMs,
               });
             }
+            if (!activeLease && sessionKey) {
+              activeLease = await this.accountLeaseService.acquireAttemptLease({
+                model: modelName, excludeAccountIds: Array.from(attemptedAccountIds),
+                signal: requestAbortController.signal, requestId,
+              });
+            }
           } else {
             const acc = await this.accountLeaseService.getNextToken({
               model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, deferSessionBinding: true,
@@ -334,31 +340,17 @@ export class CloudCodeFailoverGateway {
         if (activeLease?.affinityAbortSignal?.aborted) { abortExpiredAffinityOwner(); return; }
         if (!leaseRetainedForSameAccount) {
           activeLease?.affinityAbortSignal?.addEventListener('abort', abortExpiredAffinityOwner, { once: true });
-          const initialBinding =
-            sessionKey && typeof this.accountLeaseService?.getSessionBinding === 'function'
-              ? this.accountLeaseService.getSessionBinding(sessionKey)
-              : null;
+          const initialBinding = sessionKey && typeof this.accountLeaseService?.getSessionBinding === 'function' ? this.accountLeaseService.getSessionBinding(sessionKey) : null;
           attemptGeneration = activeLease?.generation ?? initialBinding?.generation ?? 1;
           attemptTableIncarnation = activeLease?.tableIncarnation ?? initialBinding?.tableIncarnation;
           migrationCapability = null;
-          const needsMigration = Boolean(
-            sessionKey && isVerifiedSessionKey(sessionKey) && activeLease?.account &&
-            initialBinding && initialBinding.accountId !== activeLease.account.id,
-          );
-          if (
-            authorizesMigration(migrationAuthorization, sessionKey, initialBinding, requestId) &&
-            needsMigration && sessionKey && isVerifiedSessionKey(sessionKey) && activeLease?.account &&
-            typeof this.accountLeaseService?.startSessionMigration === 'function'
-          ) {
-            migrationCapability = this.accountLeaseService.startSessionMigration(
-              sessionKey, attemptGeneration, activeLease.account.id, requestId, attemptTableIncarnation,
-            );
+          const needsMigration = Boolean(sessionKey && isVerifiedSessionKey(sessionKey) && activeLease?.account && initialBinding && initialBinding.accountId !== activeLease.account.id);
+          if (authorizesMigration(migrationAuthorization, sessionKey, initialBinding, requestId) && needsMigration && sessionKey && isVerifiedSessionKey(sessionKey) && activeLease?.account && typeof this.accountLeaseService?.startSessionMigration === 'function') {
+            migrationCapability = this.accountLeaseService.startSessionMigration(sessionKey, attemptGeneration, activeLease.account.id, requestId, attemptTableIncarnation);
             if (migrationCapability) {
               attemptGeneration = migrationCapability.generation;
               const cap = migrationCapability;
-              activeAbortMigration = () => {
-                this.accountLeaseService?.abortSessionMigration?.(cap.sessionKey, cap.generation, cap.ownerRequestId, cap.tableIncarnation);
-              };
+              activeAbortMigration = () => { this.accountLeaseService?.abortSessionMigration?.(cap.sessionKey, cap.generation, cap.ownerRequestId, cap.tableIncarnation); };
             }
           }
           if (needsMigration && !migrationCapability) {
@@ -893,12 +885,18 @@ export class CloudCodeFailoverGateway {
           } catch (err) { rejectAndTerminateDownstream(err); }
         };
         bodyStream.once('end', onStreamEnd);
+        let downstreamClosed = false;
         res.once('close', () => {
+          downstreamClosed = true;
           clearLogicalDeadline();
           bodyStream.destroy();
         });
-        res.once('error', rejectAndTerminateDownstream);
+        res.once('error', (err) => {
+          downstreamClosed = true;
+          rejectAndTerminateDownstream(err);
+        });
         bodyStream.once('error', (err) => {
+          if (downstreamClosed || (res as any).destroyed || res.writableEnded) return;
           logger.warn(
             '[CloudCodeGateway] Upstream streaming error: operation=upstream_stream reason=stream_error',
           );

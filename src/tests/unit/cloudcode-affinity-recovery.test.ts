@@ -124,4 +124,41 @@ describe('CloudCodeFailoverGateway affinity recovery', () => {
     expect(writtenChunk).toContain('Hello world');
     expect(res.writableEnded).toBe(true);
   });
+
+  it('falls back to pool-wide lease acquisition if affinity lease returns null', async () => {
+    const account2 = createMockAccount('acc-fallback', 'fallback@test.com');
+    // First call with sessionKey returns null; second call without sessionKey returns fallback lease
+    mockAccountLeaseService.acquireAttemptLease = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        account: account2,
+        generation: 1,
+        releaseReservation: vi.fn(),
+      });
+
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockResolvedValueOnce({
+      statusCode: 200,
+      headers: { 'content-type': 'application/json' },
+      bodyStream: createMockStream(['{"candidates": [{"content": {"parts": [{"text": "Fallback success"}]}}]}']),
+    });
+
+    const req = createMockRequest({
+      headers: {
+        'x-session-id': 'session-fallback-test',
+        host: 'daily-cloudcode-pa.googleapis.com',
+      },
+      body: JSON.stringify({ model: 'gemini-2.5-pro' }),
+    });
+    const res = createMockResponse();
+
+    await gateway.handleRequest(req, res);
+
+    expect(mockAccountLeaseService.acquireAttemptLease).toHaveBeenCalledTimes(2);
+    expect(res.writeHead).toHaveBeenCalledWith(200, expect.anything());
+    const writtenChunk = Buffer.isBuffer(res.write.mock.calls[0][0])
+      ? res.write.mock.calls[0][0].toString('utf-8')
+      : String(res.write.mock.calls[0][0]);
+    expect(writtenChunk).toContain('Fallback success');
+    expect(res.writableEnded).toBe(true);
+  });
 });

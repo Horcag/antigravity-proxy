@@ -493,21 +493,21 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
       this.rateLimitTracker.cleanupExpired();
       const stickyForWait = sessionKey ? this.getSessionBinding(sessionKey) : null;
       const needsPlacementCoordination = Boolean(
-        sessionKey &&
-        isVerifiedSessionKey(sessionKey) &&
-        !options?.skipAffinityCoordination &&
+        sessionKey && isVerifiedSessionKey(sessionKey) && !options?.skipAffinityCoordination &&
         (!stickyForWait || options?.migrationAuthorization),
       );
       if (needsPlacementCoordination) {
         const placement = await this.affinityCoordinator.acquire(sessionKey, { signal: options?.signal, ownerTimeoutMs: options?.affinityOwnerTimeoutMs });
-        if (placement.kind === 'rejected') return null;
-        if (placement.kind === 'follower') {
+        if (placement.kind === 'rejected') {
+          if (options?.signal?.aborted) return null;
+        } else if (placement.kind === 'follower') {
           return placement.outcome === 'committed'
             ? this.acquireAttemptLease({ ...options, excludeAccountIds: undefined, migrationAuthorization: undefined, skipAffinityCoordination: true })
             : this.acquireAttemptLease(options);
+        } else {
+          completeAffinityPlacement = placement.complete;
+          affinityAbortSignal = placement.signal;
         }
-        completeAffinityPlacement = placement.complete;
-        affinityAbortSignal = placement.signal;
       }
       if (stickyForWait && !excludedAccountIds.has(stickyForWait.accountId)) {
         const effectiveModel = model ? this.modelPolicy.resolveDynamicModelForAccount(stickyForWait.accountId, model, false) : undefined;
@@ -515,10 +515,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         const maxWaitMs = this.configPolicy.getSelectionConfig().maxWaitMs;
         if (waitMs > 0 && waitMs <= maxWaitMs) {
           await waitForAdmissionSlot(waitMs, options?.signal);
-          if (options?.signal?.aborted) {
-            abortAffinityPlacement();
-            return null;
-          }
+          if (options?.signal?.aborted) { abortAffinityPlacement(); return null; }
         }
       }
       let candidateAccountPool = await this.buildCurrentCandidatePool(model, excludedAccountIds);
@@ -529,78 +526,52 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         const targetId = isMigratingTargetAvailable ? stickyForWait.migratingToAccountId : isStickyAvailable ? stickyForWait.accountId : undefined;
         if (targetId) candidateAccountPool = candidateAccountPool.filter(([accountId]) => accountId === targetId);
       }
-      if (candidateAccountPool.length === 0) {
-        abortAffinityPlacement();
-        return null;
-      }
-      if (options?.signal?.aborted || affinityAbortSignal?.aborted) {
-        abortAffinityPlacement();
-        return null;
-      }
+      if (candidateAccountPool.length === 0) { abortAffinityPlacement(); return null; }
+      if (options?.signal?.aborted || affinityAbortSignal?.aborted) { abortAffinityPlacement(); return null; }
       const stickyBinding = sessionKey ? this.getSessionBinding(sessionKey) : null;
-      if (
-        stickyBinding &&
-        !excludedAccountIds.has(stickyBinding.accountId) &&
-        candidateAccountPool.some(([accountId]) => accountId === stickyBinding.accountId)
-      ) {
+      if (stickyBinding && !excludedAccountIds.has(stickyBinding.accountId) && candidateAccountPool.some(([accountId]) => accountId === stickyBinding.accountId)) {
         const maxWaitMs = this.configPolicy.getSelectionConfig().maxWaitMs;
         const maxConcurrency = this.configPolicy.getSelectionConfig().maxConcurrencyPerAccount ?? 8;
         const deadline = Date.now() + maxWaitMs;
         while (this.getInFlightWork(stickyBinding.accountId) >= maxConcurrency) {
-          if (options?.signal?.aborted || Date.now() >= deadline) {
-            abortAffinityPlacement();
-            return null;
-          }
+          if (options?.signal?.aborted) { abortAffinityPlacement(); return null; }
+          if (Date.now() >= deadline) break;
           await waitForAdmissionSlot(Math.min(25, Math.max(1, deadline - Date.now())), options?.signal);
-          if (options?.signal?.aborted) {
-            abortAffinityPlacement();
-            return null;
-          }
+          if (options?.signal?.aborted) { abortAffinityPlacement(); return null; }
           candidateAccountPool = await this.buildCurrentCandidatePool(model, excludedAccountIds);
-          if (!candidateAccountPool.some(([accountId]) => accountId === stickyBinding.accountId)) {
-            break;
-          }
+          if (!candidateAccountPool.some(([accountId]) => accountId === stickyBinding.accountId)) break;
+        }
+        if (this.getInFlightWork(stickyBinding.accountId) >= maxConcurrency) {
+          const fresh = await this.buildCurrentCandidatePool(model, excludedAccountIds);
+          const unsaturated = fresh.filter(([id]) => id !== stickyBinding.accountId);
+          if (unsaturated.length > 0) candidateAccountPool = unsaturated;
         }
       }
-      let accountId: string;
-      let tokenData: TokenData;
-      let releaseReservation: () => void;
-      let breakerGeneration = 0;
-      let generation = 1;
-      let admissionTableIncarnation = 1;
-      let selectedTokenEntry: TokenEntry | null = null;
+      let accountId: string, tokenData: TokenData, releaseReservation: () => void, breakerGeneration = 0, generation = 1, admissionTableIncarnation = 1, selectedTokenEntry: TokenEntry | null = null;
       const releaseMutex = await this.selectionMutex.acquire();
       try {
         const currentNow = Date.now();
         const currentBinding = sessionKey ? this.getSessionBinding(sessionKey) : null;
-        const currentMigrationAuthorized = authorizesMigration(
-          options?.migrationAuthorization,
-          sessionKey,
-          currentBinding,
-          options?.requestId,
-        );
-        if (options?.migrationAuthorization && !currentMigrationAuthorized) {
-          abortAffinityPlacement();
-          return null;
-        }
+        const currentMigrationAuthorized = authorizesMigration(options?.migrationAuthorization, sessionKey, currentBinding, options?.requestId);
+        if (options?.migrationAuthorization && !currentMigrationAuthorized) { abortAffinityPlacement(); return null; }
         const isCurrentStickyAvailable = currentBinding && candidateAccountPool.some(([id]) => id === currentBinding.accountId);
         const isCurrentMigratingAvailable = currentBinding?.state === 'migrating' && currentBinding.migratingToAccountId && candidateAccountPool.some(([id]) => id === currentBinding.migratingToAccountId);
         const effectiveStickyId = (currentBinding?.state === 'migrating' && isCurrentMigratingAvailable) ? currentBinding.migratingToAccountId : (isCurrentStickyAvailable ? currentBinding?.accountId : undefined);
+        const isStickySaturated = effectiveStickyId ? this.getInFlightWork(effectiveStickyId) >= (this.configPolicy.getSelectionConfig().maxConcurrencyPerAccount ?? 8) : false;
         if (currentBinding && options?.deferSessionBinding && !currentMigrationAuthorized) {
           const freshCandidates = await this.buildCurrentCandidatePool(model, excludedAccountIds);
-          candidateAccountPool = effectiveStickyId && freshCandidates.some(([id]) => id === effectiveStickyId) ? freshCandidates.filter(([accountId]) => accountId === effectiveStickyId) : freshCandidates;
+          if (effectiveStickyId && !isStickySaturated && freshCandidates.some(([id]) => id === effectiveStickyId)) {
+            candidateAccountPool = freshCandidates.filter(([accountId]) => accountId === effectiveStickyId);
+          } else {
+            const fallback = effectiveStickyId ? freshCandidates.filter(([accountId]) => accountId !== effectiveStickyId) : freshCandidates;
+            candidateAccountPool = fallback.length > 0 ? fallback : freshCandidates;
+          }
         }
-        const boundCandidate = effectiveStickyId && !currentMigrationAuthorized && !(
+        const boundCandidate = effectiveStickyId && !currentMigrationAuthorized && !isStickySaturated && !(
           (this.accountCooldowns.get(effectiveStickyId) ?? 0) > currentNow ||
           this.rateLimitTracker.isRateLimited(effectiveStickyId, model ? this.modelPolicy.resolveDynamicModelForAccount(effectiveStickyId, model, false) : undefined)
         ) ? candidateAccountPool.find(([accountId]) => accountId === effectiveStickyId) : undefined;
-        if (boundCandidate) {
-          if (this.getInFlightWork(effectiveStickyId!) >= (this.configPolicy.getSelectionConfig().maxConcurrencyPerAccount ?? 8)) {
-            abortAffinityPlacement();
-            return null;
-          }
-          candidateAccountPool = [boundCandidate];
-        }
+        if (boundCandidate) candidateAccountPool = [boundCandidate];
         selectedTokenEntry = await this.selectionPolicy.selectCandidate({
           allTokens: candidateAccountPool,
           getCurrentCandidates: () => this.buildCurrentCandidatePool(model, excludedAccountIds),
