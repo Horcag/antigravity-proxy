@@ -345,7 +345,9 @@ export class CloudCodeFailoverGateway {
           attemptTableIncarnation = activeLease?.tableIncarnation ?? initialBinding?.tableIncarnation;
           migrationCapability = null;
           const needsMigration = Boolean(sessionKey && isVerifiedSessionKey(sessionKey) && activeLease?.account && initialBinding && initialBinding.accountId !== activeLease.account.id);
-          if (authorizesMigration(migrationAuthorization, sessionKey, initialBinding, requestId) && needsMigration && sessionKey && isVerifiedSessionKey(sessionKey) && activeLease?.account && typeof this.accountLeaseService?.startSessionMigration === 'function') {
+          const canAttemptMigration = authorizesMigration(migrationAuthorization, sessionKey, initialBinding, requestId) ||
+            (!migrationAuthorization && typeof this.accountLeaseService?.startSessionMigration === 'function');
+          if (canAttemptMigration && needsMigration && sessionKey && isVerifiedSessionKey(sessionKey) && activeLease?.account && typeof this.accountLeaseService?.startSessionMigration === 'function') {
             migrationCapability = this.accountLeaseService.startSessionMigration(sessionKey, attemptGeneration, activeLease.account.id, requestId, attemptTableIncarnation);
             if (migrationCapability) {
               attemptGeneration = migrationCapability.generation;
@@ -353,7 +355,7 @@ export class CloudCodeFailoverGateway {
               activeAbortMigration = () => { this.accountLeaseService?.abortSessionMigration?.(cap.sessionKey, cap.generation, cap.ownerRequestId, cap.tableIncarnation); };
             }
           }
-          if (needsMigration && !migrationCapability) {
+          if (needsMigration && migrationAuthorization && !migrationCapability) {
             releaseActiveLease();
             if (!responseCommitted && !res.writableEnded) {
               writeDownstream('unavailable', 503, { 'content-type': 'application/json' },
@@ -382,7 +384,10 @@ export class CloudCodeFailoverGateway {
         }
 
         const account = activeLease?.account ?? null;
-        const effectiveModel = requestedModel;
+        const effectiveModel =
+          account && requestedModel && typeof this.accountLeaseService?.resolveDynamicModelForAccount === 'function'
+            ? this.accountLeaseService.resolveDynamicModelForAccount(account.id, requestedModel)
+            : requestedModel;
         const { urlPath: attemptUrlPath, headers: upstreamHeaders, payloadToSend } = composeAttemptRequest({
           rawBody, reqHeaders: req.headers, targetHost, method, urlPath,
           accessToken: account?.token?.access_token,
@@ -825,49 +830,34 @@ export class CloudCodeFailoverGateway {
                           attemptGeneration,
                           requestId,
                         );
-                  const isRejected =
-                    (typeof commitResult === 'boolean' && !commitResult) ||
-                    (typeof commitResult === 'object' &&
-                      commitResult !== null &&
-                      commitResult.kind === 'rejected');
+                  const isRejected = (typeof commitResult === 'boolean' && !commitResult) ||
+                    (typeof commitResult === 'object' && commitResult !== null && commitResult.kind === 'rejected');
                   if (isRejected) {
-                    logger.warn(
-                      `[CloudCodeGateway] Session confirmation not committed (${safeAffinityCommitRejectionReason(commitResult)}); proceeding with valid upstream response`,
-                    );
+                    if (!isReplaySafe) {
+                      releaseActiveLease(); bodyStream.destroy();
+                      const errBody = encodeErrorBody({ code: 502, status: 'BAD_GATEWAY', message: 'Bad Gateway: Session confirmation rejected on non-replayable operation', category: 'session-confirmation-rejected' });
+                      writeDownstream('bad_gateway', 502, { 'content-type': 'application/json' }, errBody);
+                      return;
+                    }
+                    logger.warn(`[CloudCodeGateway] Session confirmation not committed (${safeAffinityCommitRejectionReason(commitResult)}); proceeding with valid upstream response`);
                     const currentBinding = this.accountLeaseService.getSessionBinding?.(sessionKey);
                     if (!currentBinding || currentBinding.accountId !== account.id) {
-                      try {
-                        this.accountLeaseService.bindSession?.(sessionKey, account.id);
-                      } catch {
-                        // ignore
-                      }
+                      try { this.accountLeaseService.bindSession?.(sessionKey, account.id); } catch { /* ignore */ }
                     }
                   }
                 } else if (typeof this.accountLeaseService?.bindSession === 'function') {
-                  const bound =
-                    expectedIncarnation !== undefined
-                      ? this.accountLeaseService.bindSession(
-                          sessionKey,
-                          account.id,
-                          undefined,
-                          attemptGeneration,
-                          expectedIncarnation,
-                        )
-                      : this.accountLeaseService.bindSession(
-                          sessionKey,
-                          account.id,
-                          undefined,
-                          attemptGeneration,
-                        );
+                  const bound = expectedIncarnation !== undefined
+                    ? this.accountLeaseService.bindSession(sessionKey, account.id, undefined, attemptGeneration, expectedIncarnation)
+                    : this.accountLeaseService.bindSession(sessionKey, account.id, undefined, attemptGeneration);
                   if (bound === false) {
-                    logger.warn(
-                      '[CloudCodeGateway] Session binding race not won; proceeding with valid upstream response',
-                    );
-                    try {
-                      this.accountLeaseService.bindSession(sessionKey, account.id);
-                    } catch {
-                      // ignore
+                    if (!isReplaySafe) {
+                      releaseActiveLease(); bodyStream.destroy();
+                      const errBody = encodeErrorBody({ code: 502, status: 'BAD_GATEWAY', message: 'Bad Gateway: Session binding rejected on non-replayable operation', category: 'session-binding-rejected' });
+                      writeDownstream('bad_gateway', 502, { 'content-type': 'application/json' }, errBody);
+                      return;
                     }
+                    logger.warn('[CloudCodeGateway] Session binding race not won; proceeding with valid upstream response');
+                    try { this.accountLeaseService.bindSession(sessionKey, account.id); } catch { /* ignore */ }
                   }
                 }
               }

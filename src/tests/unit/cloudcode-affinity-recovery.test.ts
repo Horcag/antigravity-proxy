@@ -161,4 +161,48 @@ describe('CloudCodeFailoverGateway affinity recovery', () => {
     expect(writtenChunk).toContain('Fallback success');
     expect(res.writableEnded).toBe(true);
   });
+
+  it('delivers valid upstream response when pool fallback account differs from bound session account without prior migration authorization', async () => {
+    const accountFallback = createMockAccount('acc-fallback-2', 'fallback2@test.com');
+    // Bound session points to acc-bound-1
+    mockAccountLeaseService.getSessionBinding = vi.fn().mockReturnValue({
+      accountId: 'acc-bound-1',
+      generation: 1,
+      tableIncarnation: 1,
+    });
+    // First attempt with sessionKey returns null (concurrency saturation on acc-bound-1)
+    // Second attempt without sessionKey returns fallback lease on acc-fallback-2
+    mockAccountLeaseService.acquireAttemptLease = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        account: accountFallback,
+        generation: 1,
+        tableIncarnation: 1,
+        releaseReservation: vi.fn(),
+      });
+
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockResolvedValueOnce({
+      statusCode: 200,
+      headers: { 'content-type': 'application/json' },
+      bodyStream: createMockStream(['{"candidates": [{"content": {"parts": [{"text": "Alternative account success"}]}}]}']),
+    });
+
+    const req = createMockRequest({
+      headers: {
+        'x-session-id': 'session-saturated-bound-test',
+        host: 'daily-cloudcode-pa.googleapis.com',
+      },
+      body: JSON.stringify({ model: 'gemini-2.5-pro' }),
+    });
+    const res = createMockResponse();
+
+    await gateway.handleRequest(req, res);
+
+    expect(res.writeHead).toHaveBeenCalledWith(200, expect.anything());
+    const writtenChunk = Buffer.isBuffer(res.write.mock.calls[0][0])
+      ? res.write.mock.calls[0][0].toString('utf-8')
+      : String(res.write.mock.calls[0][0]);
+    expect(writtenChunk).toContain('Alternative account success');
+    expect(res.writableEnded).toBe(true);
+  });
 });

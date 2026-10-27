@@ -534,17 +534,11 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         const maxConcurrency = this.configPolicy.getSelectionConfig().maxConcurrencyPerAccount ?? 8;
         const deadline = Date.now() + maxWaitMs;
         while (this.getInFlightWork(stickyBinding.accountId) >= maxConcurrency) {
-          if (options?.signal?.aborted) { abortAffinityPlacement(); return null; }
-          if (Date.now() >= deadline) break;
+          if (options?.signal?.aborted || Date.now() >= deadline) { abortAffinityPlacement(); return null; }
           await waitForAdmissionSlot(Math.min(25, Math.max(1, deadline - Date.now())), options?.signal);
           if (options?.signal?.aborted) { abortAffinityPlacement(); return null; }
           candidateAccountPool = await this.buildCurrentCandidatePool(model, excludedAccountIds);
           if (!candidateAccountPool.some(([accountId]) => accountId === stickyBinding.accountId)) break;
-        }
-        if (this.getInFlightWork(stickyBinding.accountId) >= maxConcurrency) {
-          const fresh = await this.buildCurrentCandidatePool(model, excludedAccountIds);
-          const unsaturated = fresh.filter(([id]) => id !== stickyBinding.accountId);
-          if (unsaturated.length > 0) candidateAccountPool = unsaturated;
         }
       }
       let accountId: string, tokenData: TokenData, releaseReservation: () => void, breakerGeneration = 0, generation = 1, admissionTableIncarnation = 1, selectedTokenEntry: TokenEntry | null = null;
@@ -557,21 +551,21 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         const isCurrentStickyAvailable = currentBinding && candidateAccountPool.some(([id]) => id === currentBinding.accountId);
         const isCurrentMigratingAvailable = currentBinding?.state === 'migrating' && currentBinding.migratingToAccountId && candidateAccountPool.some(([id]) => id === currentBinding.migratingToAccountId);
         const effectiveStickyId = (currentBinding?.state === 'migrating' && isCurrentMigratingAvailable) ? currentBinding.migratingToAccountId : (isCurrentStickyAvailable ? currentBinding?.accountId : undefined);
-        const isStickySaturated = effectiveStickyId ? this.getInFlightWork(effectiveStickyId) >= (this.configPolicy.getSelectionConfig().maxConcurrencyPerAccount ?? 8) : false;
         if (currentBinding && options?.deferSessionBinding && !currentMigrationAuthorized) {
           const freshCandidates = await this.buildCurrentCandidatePool(model, excludedAccountIds);
-          if (effectiveStickyId && !isStickySaturated && freshCandidates.some(([id]) => id === effectiveStickyId)) {
-            candidateAccountPool = freshCandidates.filter(([accountId]) => accountId === effectiveStickyId);
-          } else {
-            const fallback = effectiveStickyId ? freshCandidates.filter(([accountId]) => accountId !== effectiveStickyId) : freshCandidates;
-            candidateAccountPool = fallback.length > 0 ? fallback : freshCandidates;
-          }
+          candidateAccountPool = effectiveStickyId && freshCandidates.some(([id]) => id === effectiveStickyId) ? freshCandidates.filter(([accountId]) => accountId === effectiveStickyId) : freshCandidates;
         }
-        const boundCandidate = effectiveStickyId && !currentMigrationAuthorized && !isStickySaturated && !(
+        const boundCandidate = effectiveStickyId && !currentMigrationAuthorized && !(
           (this.accountCooldowns.get(effectiveStickyId) ?? 0) > currentNow ||
           this.rateLimitTracker.isRateLimited(effectiveStickyId, model ? this.modelPolicy.resolveDynamicModelForAccount(effectiveStickyId, model, false) : undefined)
         ) ? candidateAccountPool.find(([accountId]) => accountId === effectiveStickyId) : undefined;
-        if (boundCandidate) candidateAccountPool = [boundCandidate];
+        if (boundCandidate) {
+          if (this.getInFlightWork(effectiveStickyId!) >= (this.configPolicy.getSelectionConfig().maxConcurrencyPerAccount ?? 8)) {
+            abortAffinityPlacement();
+            return null;
+          }
+          candidateAccountPool = [boundCandidate];
+        }
         selectedTokenEntry = await this.selectionPolicy.selectCandidate({
           allTokens: candidateAccountPool,
           getCurrentCandidates: () => this.buildCurrentCandidatePool(model, excludedAccountIds),
