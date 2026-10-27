@@ -92,10 +92,11 @@ describe('Oracle R1-R8 Architectural Verification', () => {
     gateway = new CloudCodeFailoverGateway(mockLeaseService);
   });
 
-  // R1 & R2: 1-account pool same-account project repair preserves routing project in body
-  it('R1 & R2: 1-account pool repairs project context on Account A without 503 and preserves body project', async () => {
+  // Native project rejection cannot be repaired by changing request context.
+  it('R1 & R2: 1-account pool returns project rejection without altering context', async () => {
     const accountA = createMockAccount('acc-A', 'acca@test.com');
     mockLeaseService.getNextToken.mockResolvedValue(accountA);
+    mockLeaseService.getUsableAccountCount = vi.fn(() => 1);
 
     const projectDeniedBody = Buffer.from(
       JSON.stringify({
@@ -137,16 +138,11 @@ describe('Oracle R1-R8 Architectural Verification', () => {
 
     await gateway.handleRequest(req, res);
 
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(1);
     // Call 1: had header
     expect(calls[0].headers['x-goog-user-project']).toBe('project-acc-A');
-    // Call 2: repaired on same account -> header stripped
-    expect(calls[1].headers['x-goog-user-project']).toBeUndefined();
-    // But Call 2 body STILL preserves routing project in body!
-    const call2Body = JSON.parse(calls[1].body.toString('utf-8'));
-    expect(call2Body.project).toBe('project-acc-A');
-    // Successful downstream 200 (never premature 503)
-    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(calls[0].body.toString('utf-8')).project).toBe('project-acc-A');
+    expect(res.statusCode).toBe(403);
   });
 
   // R3: Error classification boundaries

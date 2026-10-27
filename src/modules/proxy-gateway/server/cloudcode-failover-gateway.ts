@@ -82,12 +82,9 @@ export class CloudCodeFailoverGateway {
     const rawUrl = req.url || '/';
     let urlPath = rawUrl;
     if (urlPath.startsWith('http://') || urlPath.startsWith('https://')) {
-      try {
-        const parsed = new URL(urlPath);
-        urlPath = parsed.pathname + parsed.search;
-      } catch {
-        // preserve urlPath
-      }
+      // Convert absolute-form to origin-form without URL's path normalization.
+      const target = /^https?:\/\/[^/?#]+([^#]*)/.exec(urlPath)?.[1];
+      if (target !== undefined) urlPath = target.startsWith('/') ? target : `/${target}`;
     }
     const method = req.method || 'POST';
     // Determine upstream target host strictly from :authority or host header
@@ -222,8 +219,7 @@ export class CloudCodeFailoverGateway {
       hasAccountPinnedResources: preflight.hasAccountPinnedResources,
     });
     let ambiguityProbesUsed = 0;
-    let accountProjectCorrectionsUsed = 0;
-    let quotaHeaderMode: 'with-quota-header' | 'without-quota-header' = 'with-quota-header';
+    const quotaHeaderMode = 'with-quota-header' as const;
     let lastAmbiguousError: {
       statusCode: number;
       headers: http.IncomingHttpHeaders;
@@ -323,8 +319,6 @@ export class CloudCodeFailoverGateway {
           }
           return;
         }
-        quotaHeaderMode = 'with-quota-header';
-        accountProjectCorrectionsUsed = 0;
       }
 
       try {
@@ -389,22 +383,10 @@ export class CloudCodeFailoverGateway {
         }
 
         const account = activeLease?.account ?? null;
-        const effectiveModel =
-          account && requestedModel && typeof this.accountLeaseService?.resolveDynamicModelForAccount === 'function'
-            ? this.accountLeaseService.resolveDynamicModelForAccount(account.id, requestedModel)
-            : requestedModel;
+        const effectiveModel = requestedModel;
         const { urlPath: attemptUrlPath, headers: upstreamHeaders, payloadToSend } = composeAttemptRequest({
-          rawBody,
-          reqHeaders: req.headers,
-          targetHost,
-          method,
-          urlPath,
-          requestedModel,
-          effectiveModel,
-          routingProject: account?.token?.project_id,
-          quotaHeaderMode,
+          rawBody, reqHeaders: req.headers, targetHost, method, urlPath,
           accessToken: account?.token?.access_token,
-          attempt,
         });
         logger.debug(
           `[CloudCodeGateway] Attempt ${attempt} model=${sanitizeLogString(effectiveModel) || 'default'} operation=upstream_attempt`,
@@ -416,7 +398,7 @@ export class CloudCodeFailoverGateway {
           const decision = evaluateRetryDecision({
             evidence: failureEvidence, attempt, maxAttempts, downstreamCommitted: responseCommitted,
             isReplaySafe, ambiguityProbesUsed, maxAmbiguityProbes: 1,
-            projectCorrectionsUsed: accountProjectCorrectionsUsed, maxProjectCorrections: 1,
+            projectCorrectionsUsed: 0, maxProjectCorrections: 0,
             quotaHeaderMode,
             hasAlternativeAccounts: resolveHasAlternativeAccounts(this.accountLeaseService, account, attemptedAccountIds, attempt, maxAttempts),
             effectiveModel, transientRetriesUsed, maxTransientRetries: 1,
@@ -446,16 +428,6 @@ export class CloudCodeFailoverGateway {
             } catch {
               logger.warn('[CloudCodeGateway] Failed to record account error health effect: health_effect_failed');
             }
-          }
-
-          if (decision.action.kind === 'retry-same-account') {
-            if (decision.action.repair === 'project-context') {
-              accountProjectCorrectionsUsed++;
-              quotaHeaderMode = 'without-quota-header';
-              logger.warn(`[CloudCodeGateway] Upstream project rejected (attempt ${attempt}/${maxAttempts}). Retrying without x-goog-user-project header on same account...`);
-            }
-            leaseRetainedForSameAccount = true;
-            return 'continue';
           }
 
           if (decision.action.kind === 'retry-transient') {
@@ -1442,7 +1414,7 @@ export class CloudCodeFailoverGateway {
   private executeUpstreamCall(
     method: string,
     url: string,
-    headers: Record<string, string>,
+    headers: Record<string, string | string[]>,
     payload: Buffer,
     upstreamHost: string,
     onReqCreated?: (req: http.ClientRequest) => void,

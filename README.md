@@ -33,6 +33,23 @@ Current surface:
 - Graceful `SIGINT`/`SIGTERM`
 - Rotation tests for `429`, `RESOURCE_EXHAUSTED`, quota exhaustion, and retry exclusions
 
+## Native AGY CONNECT requests
+
+The CONNECT gateway relays Antigravity's native CloudCode protocol. It substitutes
+OAuth credentials in headers; it does not translate native requests through the
+API-compatible HTTP handlers. TLS is terminated and re-established by the gateway.
+
+Native request bodies retain their original bytes, including compression, model,
+project, session metadata, signatures and unknown fields. Origin paths and queries
+are preserved. End-to-end header values, including `x-goog-session-id` and
+`x-goog-user-project`, survive retries. Changes are limited to credentials and the
+HTTP transport fields needed for forwarding, including authority/Host representation,
+Content-Length and hop-by-hop header removal.
+
+Account rotation does not change the requested model or repair the project context.
+If another credential is not entitled to that original context, the gateway returns
+the upstream failure instead of silently rewriting the request.
+
 ## Build
 
 ```bash

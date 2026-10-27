@@ -290,7 +290,7 @@ describe('CloudCodeFailoverGateway Error Policy and Ambiguity Probe', () => {
     expect(res.statusCode).toBe(200);
   });
 
-  it('Scenario 6: Project context rejected retries on same account without quota header', async () => {
+  it('Scenario 6: Project context retry preserves the native quota header', async () => {
     const account1 = createMockAccount('acc-1', 'acc1@test.com');
     mockAccountLeaseService.getNextToken.mockResolvedValue(account1);
 
@@ -328,9 +328,9 @@ describe('CloudCodeFailoverGateway Error Policy and Ambiguity Probe', () => {
     await gateway.handleRequest(req, res);
 
     expect(executeSpy).toHaveBeenCalledTimes(2);
-    // Second attempt upstreamHeaders must NOT contain x-goog-user-project
+    // Native retries keep the caller quota context.
     const secondCallHeaders = executeSpy.mock.calls[1][2] as Record<string, string>;
-    expect(secondCallHeaders['x-goog-user-project']).toBeUndefined();
+    expect(secondCallHeaders['x-goog-user-project']).toBe('old-proj');
     expect(res.statusCode).toBe(200);
   });
 });

@@ -100,7 +100,7 @@ function createMockAccount(projectId: string): CloudAccount {
   };
 }
 
-describe('Cloud Code eligibility project-context repair', () => {
+describe('Cloud Code eligibility project-context handling', () => {
   let leaseService: any;
   let gateway: CloudCodeFailoverGateway;
 
@@ -184,10 +184,11 @@ describe('Cloud Code eligibility project-context repair', () => {
     });
   });
 
-  it('repairs fetchUserInfo by suppressing the first 403 and retrying same account without x-goog-user-project', async () => {
+  it('returns fetchUserInfo project rejection without modifying native request context', async () => {
     const account = createMockAccount('disabled-proj');
     const calls: Array<{ headers: Record<string, string>; body: Buffer }> = [];
     leaseService.getNextToken.mockResolvedValue(account);
+    leaseService.getUsableAccountCount = vi.fn(() => 1);
     vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async (...args: any[]) => {
       const headers = (args[2] || {}) as Record<string, string>;
       const body = args[3] as Buffer;
@@ -227,12 +228,11 @@ describe('Cloud Code eligibility project-context repair', () => {
 
     await gateway.handleRequest(req, res);
 
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(1);
     expect(calls[0].headers['x-goog-user-project']).toBe('disabled-proj');
-    expect(calls[1].headers['x-goog-user-project']).toBeUndefined();
-    expect(res.statusCode).toBe(200);
-    expect(res.body).toContain('"userTier":"PAID"');
-    expect(res.body).not.toContain('PERMISSION_DENIED');
+    expect(calls[0].body.equals(Buffer.from(JSON.stringify({ metadata: { ide: 'antigravity' } })))).toBe(true);
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toContain('PERMISSION_DENIED');
     expect(leaseService.markAsForbidden).not.toHaveBeenCalled();
     expect(leaseService.markFromUpstreamError).not.toHaveBeenCalled();
   });
