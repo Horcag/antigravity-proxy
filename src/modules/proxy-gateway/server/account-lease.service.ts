@@ -510,13 +510,8 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         affinityAbortSignal = placement.signal;
       }
       if (stickyForWait && !excludedAccountIds.has(stickyForWait.accountId)) {
-        const effectiveModel = model
-          ? this.modelPolicy.resolveDynamicModelForAccount(stickyForWait.accountId, model, false)
-          : undefined;
-        const waitMs = this.rateLimitTracker.getRemainingWaitSeconds(
-          stickyForWait.accountId,
-          effectiveModel,
-        ) * 1000;
+        const effectiveModel = model ? this.modelPolicy.resolveDynamicModelForAccount(stickyForWait.accountId, model, false) : undefined;
+        const waitMs = this.rateLimitTracker.getRemainingWaitSeconds(stickyForWait.accountId, effectiveModel) * 1000;
         const maxWaitMs = this.configPolicy.getSelectionConfig().maxWaitMs;
         if (waitMs > 0 && waitMs <= maxWaitMs) {
           await waitForAdmissionSlot(waitMs, options?.signal);
@@ -527,9 +522,12 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         }
       }
       let candidateAccountPool = await this.buildCurrentCandidatePool(model, excludedAccountIds);
+      const isStickyAvailable = stickyForWait && candidateAccountPool.some(([id]) => id === stickyForWait.accountId);
+      const isMigratingTargetAvailable = stickyForWait?.state === 'migrating' && stickyForWait.migratingToAccountId && candidateAccountPool.some(([id]) => id === stickyForWait.migratingToAccountId);
       const migrationAuthorized = authorizesMigration(options?.migrationAuthorization, sessionKey, stickyForWait, options?.requestId);
       if (stickyForWait && options?.deferSessionBinding && !migrationAuthorized) {
-        candidateAccountPool = candidateAccountPool.filter(([accountId]) => accountId === stickyForWait.accountId);
+        const targetId = isMigratingTargetAvailable ? stickyForWait.migratingToAccountId : isStickyAvailable ? stickyForWait.accountId : undefined;
+        if (targetId) candidateAccountPool = candidateAccountPool.filter(([accountId]) => accountId === targetId);
       }
       if (candidateAccountPool.length === 0) {
         abortAffinityPlacement();
@@ -585,18 +583,19 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
           abortAffinityPlacement();
           return null;
         }
+        const isCurrentStickyAvailable = currentBinding && candidateAccountPool.some(([id]) => id === currentBinding.accountId);
+        const isCurrentMigratingAvailable = currentBinding?.state === 'migrating' && currentBinding.migratingToAccountId && candidateAccountPool.some(([id]) => id === currentBinding.migratingToAccountId);
+        const effectiveStickyId = (currentBinding?.state === 'migrating' && isCurrentMigratingAvailable) ? currentBinding.migratingToAccountId : (isCurrentStickyAvailable ? currentBinding?.accountId : undefined);
         if (currentBinding && options?.deferSessionBinding && !currentMigrationAuthorized) {
-          candidateAccountPool = (await this.buildCurrentCandidatePool(model, excludedAccountIds))
-            .filter(([accountId]) => accountId === currentBinding.accountId);
+          const freshCandidates = await this.buildCurrentCandidatePool(model, excludedAccountIds);
+          candidateAccountPool = effectiveStickyId && freshCandidates.some(([id]) => id === effectiveStickyId) ? freshCandidates.filter(([accountId]) => accountId === effectiveStickyId) : freshCandidates;
         }
-        const boundCandidate = currentBinding && !currentMigrationAuthorized && !(
-          (this.accountCooldowns.get(currentBinding.accountId) ?? 0) > currentNow ||
-          this.rateLimitTracker.isRateLimited(currentBinding.accountId, model
-            ? this.modelPolicy.resolveDynamicModelForAccount(currentBinding.accountId, model, false) : undefined)
-          ) ? candidateAccountPool.find(([accountId]) => accountId === currentBinding.accountId) : undefined;
+        const boundCandidate = effectiveStickyId && !currentMigrationAuthorized && !(
+          (this.accountCooldowns.get(effectiveStickyId) ?? 0) > currentNow ||
+          this.rateLimitTracker.isRateLimited(effectiveStickyId, model ? this.modelPolicy.resolveDynamicModelForAccount(effectiveStickyId, model, false) : undefined)
+        ) ? candidateAccountPool.find(([accountId]) => accountId === effectiveStickyId) : undefined;
         if (boundCandidate) {
-          if (this.getInFlightWork(currentBinding!.accountId) >=
-            (this.configPolicy.getSelectionConfig().maxConcurrencyPerAccount ?? 8)) {
+          if (this.getInFlightWork(effectiveStickyId!) >= (this.configPolicy.getSelectionConfig().maxConcurrencyPerAccount ?? 8)) {
             abortAffinityPlacement();
             return null;
           }

@@ -50,6 +50,32 @@ Account rotation does not change the requested model or repair the project conte
 If another credential is not entitled to that original context, the gateway returns
 the upstream failure instead of silently rewriting the request.
 
+## Antigravity IDE / Language Server (WSL mode)
+
+When Antigravity runs in WSL mode, the desktop app launches `language_server` directly
+under `~/.antigravity-server/bin/<version>/language_server`.
+
+To route IDE traffic through the proxy and enable transparent account rotation:
+
+```bash
+# Check status of installed server versions
+antigravity-proxy ide status
+# Or use the helper script:
+./scripts/patch-antigravity-server.sh status
+
+# Patch all installed language_server binaries with managed transparent wrappers
+antigravity-proxy ide patch
+# Or:
+./scripts/patch-antigravity-server.sh patch
+
+# Revert wrappers back to native binaries
+antigravity-proxy ide unpatch
+```
+
+The wrapper routes CloudCode calls to `http://127.0.0.1:8045` and trusts the managed
+local CA (`agy-trust.pem`) while keeping Windows `host_bridge_url` on `127.0.0.1` direct
+via `NO_PROXY`.
+
 ## Build
 
 ```bash

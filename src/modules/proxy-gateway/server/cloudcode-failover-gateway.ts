@@ -297,6 +297,13 @@ export class CloudCodeFailoverGateway {
               model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey,
               deferSessionBinding: true, migrationAuthorization, signal: requestAbortController.signal, requestId, affinityOwnerTimeoutMs,
             });
+            if (!activeLease && migrationAuthorization) {
+              migrationAuthorization = undefined;
+              activeLease = await this.accountLeaseService.acquireAttemptLease({
+                model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey,
+                deferSessionBinding: true, migrationAuthorization: undefined, signal: requestAbortController.signal, requestId, affinityOwnerTimeoutMs,
+              });
+            }
           } else {
             const acc = await this.accountLeaseService.getNextToken({
               model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, deferSessionBinding: true,
@@ -413,7 +420,7 @@ export class CloudCodeFailoverGateway {
           if (account && this.accountLeaseService) {
             try {
               if (decision.healthEffect.kind === 'rate-limited') {
-                void this.accountLeaseService.markFromUpstreamError({
+                await this.accountLeaseService.markFromUpstreamError({
                   accountIdOrEmail: account.id, status: status >= 400 ? status : 429,
                   model: effectiveModel, body: failureEvidence.rawErrorText, headers: responseHeaders,
                   reason: decision.healthEffect.isQuota ? RateLimitReason.QuotaExhausted : RateLimitReason.RateLimitExceeded,
@@ -833,21 +840,16 @@ export class CloudCodeFailoverGateway {
                       commitResult.kind === 'rejected');
                   if (isRejected) {
                     logger.warn(
-                      `[CloudCodeGateway] Session confirmation rejected (${safeAffinityCommitRejectionReason(commitResult)}); suppressing output`,
+                      `[CloudCodeGateway] Session confirmation not committed (${safeAffinityCommitRejectionReason(commitResult)}); proceeding with valid upstream response`,
                     );
-                    releaseActiveLease();
-                    bodyStream.destroy();
-                    if (!isReplaySafe) {
-                      const errBody = encodeErrorBody({
-                        code: 502,
-                        status: 'BAD_GATEWAY',
-                        message: 'Bad Gateway: Session confirmation rejected on non-replayable operation',
-                        category: 'session-confirmation-rejected',
-                      });
-                      writeDownstream('bad_gateway', 502, { 'content-type': 'application/json' }, errBody);
-                      return;
+                    const currentBinding = this.accountLeaseService.getSessionBinding?.(sessionKey);
+                    if (!currentBinding || currentBinding.accountId !== account.id) {
+                      try {
+                        this.accountLeaseService.bindSession?.(sessionKey, account.id);
+                      } catch {
+                        // ignore
+                      }
                     }
-                    continue;
                   }
                 } else if (typeof this.accountLeaseService?.bindSession === 'function') {
                   const bound =
@@ -867,21 +869,13 @@ export class CloudCodeFailoverGateway {
                         );
                   if (bound === false) {
                     logger.warn(
-                      '[CloudCodeGateway] Session binding rejected (lost race); suppressing output',
+                      '[CloudCodeGateway] Session binding race not won; proceeding with valid upstream response',
                     );
-                    releaseActiveLease();
-                    bodyStream.destroy();
-                    if (!isReplaySafe) {
-                      const errBody = encodeErrorBody({
-                        code: 502,
-                        status: 'BAD_GATEWAY',
-                        message: 'Bad Gateway: Session binding rejected on non-replayable operation',
-                        category: 'session-binding-rejected',
-                      });
-                      writeDownstream('bad_gateway', 502, { 'content-type': 'application/json' }, errBody);
-                      return;
+                    try {
+                      this.accountLeaseService.bindSession(sessionKey, account.id);
+                    } catch {
+                      // ignore
                     }
-                    continue;
                   }
                 }
               }

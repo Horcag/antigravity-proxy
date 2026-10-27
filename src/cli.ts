@@ -301,6 +301,27 @@ async function run(parsed: ParsedArgs): Promise<void> {
     return;
   }
 
+  if (primary === 'ide' || primary === 'server') {
+    const action = secondary || 'status';
+    const serverDir = getStringOption(options, 'dir');
+    if (action === 'status') {
+      const { getAntigravityServerPatchStatus } = await import('@/modules/proxy-gateway/server/cert/server-launcher');
+      writeJson(getAntigravityServerPatchStatus(serverDir));
+      return;
+    }
+    if (action === 'patch') {
+      const { patchAntigravityServer } = await import('@/modules/proxy-gateway/server/cert/server-launcher');
+      writeJson(patchAntigravityServer(serverDir));
+      return;
+    }
+    if (action === 'unpatch') {
+      const { unpatchAntigravityServer } = await import('@/modules/proxy-gateway/server/cert/server-launcher');
+      writeJson(unpatchAntigravityServer(serverDir));
+      return;
+    }
+    throw new Error('Usage: antigravity-proxy ide status|patch|unpatch [--dir <path>]');
+  }
+
   throw new Error(
     [
       'Usage:',
@@ -310,6 +331,7 @@ async function run(parsed: ParsedArgs): Promise<void> {
       '  antigravity-proxy accounts list|import|export|remove|reload|refresh-quota|quota-diagnostics',
       '  antigravity-proxy accounts preferred get|set|clear',
       '  antigravity-proxy oauth url|exchange',
+      '  antigravity-proxy ide status|patch|unpatch [--dir <path>]',
     ].join('\n'),
   );
 }
