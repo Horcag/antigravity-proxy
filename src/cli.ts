@@ -319,7 +319,12 @@ async function run(parsed: ParsedArgs): Promise<void> {
       writeJson(unpatchAntigravityServer(serverDir));
       return;
     }
-    throw new Error('Usage: antigravity-proxy ide status|patch|unpatch [--dir <path>]');
+    if (action === 'watch') {
+      const { runLanguageServerWatchLoop } = await import('@/modules/proxy-gateway/server/cert/server-update-observer');
+      await runLanguageServerWatchLoop(serverDir);
+      return;
+    }
+    throw new Error('Usage: antigravity-proxy ide status|patch|unpatch|watch [--dir <path>]');
   }
 
   throw new Error(

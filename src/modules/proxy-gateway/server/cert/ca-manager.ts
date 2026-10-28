@@ -6,7 +6,7 @@ import path from 'node:path';
 import tls from 'node:tls';
 import { getCaCertPath, getCaKeyPath, getCertsDir } from '../../../../shared/paths';
 import { logger } from '../../../../shared/logging/logger';
-import { patchAntigravityServer } from './server-launcher';
+import { checkAndEnforceLanguageServer } from './server-update-observer';
 
 export const TARGET_CLOUDCODE_HOSTS = [
   'daily-cloudcode-pa.googleapis.com',
@@ -191,7 +191,7 @@ export class CaManager {
     logger.info(`Merged trust bundle ready at: ${trustBundlePath}`);
 
     this.ensureAgyLauncher();
-    patchAntigravityServer();
+    checkAndEnforceLanguageServer();
 
     return this.secureContext;
   }
