@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
@@ -50,8 +51,26 @@ describe('server-launcher', () => {
     expect(wrapper).toContain('TRUST_BUNDLE="/path/to/trust.pem"');
     expect(wrapper).toContain('export HTTPS_PROXY="$PROXY_URL"');
     expect(wrapper).toContain('export SSL_CERT_FILE="$TRUST_BUNDLE"');
-    expect(wrapper).toContain('NO_PROXY=\'localhost,127.0.0.1,::1\'');
+    expect(wrapper).toContain('localhost,127.0.0.1,::1,oauth2.googleapis.com,accounts.google.com');
     expect(wrapper).toContain('exec "$SERVER_REAL" "$@"');
+  });
+
+  it('keeps native OAuth independent of the proxy and preserves caller bypasses and arguments', () => {
+    const wrapperPath = path.join(tmpDir, 'language_server');
+    fs.writeFileSync(wrapperPath, generateServerWrapperContent('/missing/trust.pem', 'http://127.0.0.1:1'));
+    fs.writeFileSync(path.join(tmpDir, 'language_server.bin'),
+      '#!/bin/sh\nprintf "%s\\n" "$HTTPS_PROXY" "$NO_PROXY" "$no_proxy" "$@"\n', { mode: 0o755 });
+    const lines = execFileSync('/bin/sh', [wrapperPath, 'argument with spaces'], {
+      encoding: 'utf8', env: { ...process.env, NO_PROXY: 'internal.example', no_proxy: 'lower.example' },
+    }).trim().split('\n');
+    expect(lines[0]).toBe('http://127.0.0.1:1');
+    expect(lines[1].split(',')).toEqual(expect.arrayContaining([
+      'localhost', '127.0.0.1', '::1', 'oauth2.googleapis.com', 'accounts.google.com',
+      'internal.example', 'lower.example',
+    ]));
+    expect(lines[2]).toBe(lines[1]);
+    expect(lines[3]).toBe('argument with spaces');
+    expect(lines[1]).not.toContain('cloudcode-pa.googleapis.com');
   });
 
   it('patches unpatched language_server installations and reports status accurately', () => {

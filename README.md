@@ -74,7 +74,10 @@ antigravity-proxy ide unpatch
 
 The wrapper routes CloudCode calls to `http://127.0.0.1:8045` and trusts the managed
 local CA (`agy-trust.pem`) while keeping Windows `host_bridge_url` on `127.0.0.1` direct
-via `NO_PROXY`.
+via `NO_PROXY`. Native OAuth token exchange and Google sign-in also bypass the
+rotation proxy, and existing caller bypasses are preserved. The system service
+restarts after unexpected clean exits as well as failures; `systemctl stop` still
+stops it explicitly.
 
 ## Build
 
