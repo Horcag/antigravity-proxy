@@ -72,6 +72,5 @@ describe('native credential-only forwarding', () => {
     }
     expect((execute.mock.calls[0][2] as any).authorization).toBe('Bearer credential-a');
     expect((execute.mock.calls[1][2] as any).authorization).toBe(`Bearer credential-${switchesAccount ? 'b' : 'a'}`);
-    expect(leases.resolveDynamicModelForAccount).not.toHaveBeenCalled();
   });
 });

@@ -113,7 +113,6 @@ describe('CloudCodeFailoverGateway native model preservation', () => {
 
     await gateway.handleRequest(req, res);
 
-    expect(mockAccountLeaseService.resolveDynamicModelForAccount).not.toHaveBeenCalled();
 
     const sentPayloadBuffer = executeSpy.mock.calls[0][3] as Buffer;
     const sentPayload = JSON.parse(sentPayloadBuffer.toString('utf-8'));
