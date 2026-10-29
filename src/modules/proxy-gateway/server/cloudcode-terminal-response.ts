@@ -1,12 +1,27 @@
 import type * as http from 'node:http';
 import type * as http2 from 'node:http2';
 import * as zlib from 'node:zlib';
+import type { AccountPoolCapacityFailure } from './account-pool-capacity';
 
 export interface FormattedTerminalError {
   statusCode: number;
   headers: http.IncomingHttpHeaders;
   body: string | Buffer | undefined;
   trailers?: Record<string, string>;
+}
+
+export function formatPoolCapacityError(failure: AccountPoolCapacityFailure | undefined, model?: string): FormattedTerminalError {
+  const statusCode = failure ? 429 : 503;
+  const message = failure
+    ? `${failure.reason === 'quota_exhausted' ? 'Quota exhausted' : 'Rate limited'} for ${model ?? 'the requested model'} across all eligible accounts. Retry no earlier than ${failure.retryAt} (${failure.retryAfterSeconds}s).`
+    : 'No available upstream account capacity in managed pool';
+  return {
+    statusCode,
+    headers: { 'content-type': 'application/json', 'grpc-message': encodeURIComponent(message),
+      ...(failure ? { 'retry-after': String(failure.retryAfterSeconds) } : {}) },
+    body: JSON.stringify({ error: { code: statusCode, status: failure ? 'RESOURCE_EXHAUSTED' : 'UNAVAILABLE', message,
+      ...(failure ? { reason: failure.reason, retry_after_seconds: failure.retryAfterSeconds, retry_at: failure.retryAt } : {}) } }),
+  };
 }
 
 const HTTP_TO_GRPC_STATUS: Record<number, string> = {

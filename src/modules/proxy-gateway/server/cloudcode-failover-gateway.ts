@@ -17,7 +17,7 @@ import { extractModelName, extractSessionKey, isReplaySafeOperation, composeAtte
 import { classifyUpstreamFailure, safeDecodeGrpcMessage, type FailureEvidence } from './upstream-failure';
 import { evaluateRetryDecision } from './upstream-retry-decision';
 import { logUpstreamFailure, sanitizeLogString } from './cloudcode-diagnostics';
-import { formatTerminalDownstreamError, resolveHasAlternativeAccounts } from './cloudcode-terminal-response';
+import { formatPoolCapacityError, formatTerminalDownstreamError, resolveHasAlternativeAccounts } from './cloudcode-terminal-response';
 export { isVerifiedSessionKey, isHintSessionKey };
 export type ProtocolFailureCategory = 'inspection-limit' | 'unsupported-encoding' | 'malformed-upstream-message' | 'deadline-exceeded' | 'account-quota' | 'upstream-transient';
 export interface ProtocolFrameDecision {
@@ -240,7 +240,6 @@ export class CloudCodeFailoverGateway {
       migrationAuthorization = createMigrationAuthorization(reason, sessionKey, binding, requestId) ?? undefined;
     };
     migrationAuthorization = this.accountLeaseService?.authorizeBoundSessionMigration?.(sessionKey, modelName, requestId);
-
     let activeLease: {
       account: CloudAccount;
       sessionKey?: string;
@@ -327,13 +326,12 @@ export class CloudCodeFailoverGateway {
               writeDownstream('bad_gateway', ambiguous.statusCode, ambiguous.headers, ambiguous.bufferedBody);
               return;
             }
-            writeDownstream('unavailable', 503, { 'content-type': 'application/json' },
-              JSON.stringify({ error: { code: 503, message: 'No available upstream account capacity in managed pool', status: 'UNAVAILABLE' } }));
+            const failure = requestedModel ? this.accountLeaseService.getPoolCapacityFailure?.(requestedModel) : undefined, terminal = formatPoolCapacityError(failure, requestedModel);
+            writeDownstream(failure ? 'rate_limited' : 'unavailable', terminal.statusCode, terminal.headers, terminal.body);
           }
           return;
         }
       }
-
       try {
         currentAttemptAccount = activeLease?.account ?? null; activeReleaseReservation = activeLease?.releaseReservation;
         activeCompleteAffinityPlacement = activeLease?.completeAffinityPlacement;
@@ -1005,6 +1003,8 @@ export class CloudCodeFailoverGateway {
     }
     const anyRes = res as any;
     if (!anyRes.headersSent) {
+      const poolFailure = requestedModel ? this.accountLeaseService?.getPoolCapacityFailure?.(requestedModel) : undefined;
+      if (poolFailure) { const terminal = formatPoolCapacityError(poolFailure, requestedModel); writeDownstream('rate_limited', terminal.statusCode, terminal.headers, terminal.body); return; }
       const exhaustedClassification = exhaustedByUnavailable ? 'unavailable' : 'rate_limited';
       writeDownstream(exhaustedClassification, exhaustedByUnavailable ? 503 : 429, { 'content-type': 'application/json' },
         JSON.stringify({

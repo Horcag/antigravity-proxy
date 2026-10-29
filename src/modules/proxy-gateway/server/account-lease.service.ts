@@ -30,7 +30,9 @@ import {
 export type { MigrationCapability };
 export { isVerifiedSessionKey, isHintSessionKey };
 import { AccountLeaseModelPolicy } from './account-lease-model-policy';
-import { normalizeModelId, type AccountLeaseTokenData } from './account-lease-token-types';
+import { normalizeModelId, type AccountLeaseTokenData, type QuotaDiagnostics, type QuotaDiagnosticsTemporaryBlock } from './account-lease-token-types';
+export type { QuotaDiagnostics, QuotaDiagnosticsTemporaryBlock, AccountQuotaDiagnostics, AccountQuotaDiagnosticsModel } from './account-lease-token-types';
+import { resolveAccountPoolCapacityFailure } from './account-pool-capacity';
 import {
   AccountLeaseLimitPolicy,
   type AccountLeaseUpstreamErrorParams,
@@ -110,34 +112,6 @@ interface TemporaryBlockSource {
   reason: string;
   unavailableUntil: number;
   remainingSeconds: number;
-}
-export interface QuotaDiagnosticsTemporaryBlock {
-  reason: string;
-  unavailable_until: string;
-  remaining_seconds: number;
-}
-export interface AccountQuotaDiagnosticsModel {
-  public_model_id: string;
-  physical_model_id: string;
-  remaining_percentage: number | null;
-  reset_time: string | null;
-  availability: 'unknown' | 'available' | 'unavailable';
-  requestable: boolean;
-  temporary_block?: QuotaDiagnosticsTemporaryBlock;
-}
-export interface AccountQuotaDiagnostics {
-  /** Request-local ordinal only; it is not stable across diagnostic responses. */
-  account_label: string;
-  status: 'active' | 'rate_limited';
-  last_successful_refresh_at: string | null;
-  refresh_age_seconds: number | null;
-  refresh_state: 'fresh' | 'stale' | 'unknown';
-  account_cooldown?: QuotaDiagnosticsTemporaryBlock;
-  models: AccountQuotaDiagnosticsModel[];
-}
-export interface QuotaDiagnostics {
-  refresh_interval_seconds: number;
-  accounts: AccountQuotaDiagnostics[];
 }
 @Injectable()
 export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
@@ -263,6 +237,22 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   }
   refreshQuotaCatalog(options: { force?: boolean; model?: string } = {}): Promise<AccountLeaseQuotaCatalogRefreshResult> {
     return this.quotaRefreshPolicy.refreshQuotaCatalog(options);
+  }
+  getPoolCapacityFailure(model: string, now = Date.now()) {
+    const blocks = [...proxyModelAvailabilityStore.peekSnapshot(now),
+      ...this.rateLimitTracker.peekActiveLockouts(now), ...this.limitPolicy.peekActiveAccountCooldowns(now)];
+    return resolveAccountPoolCapacityFailure([...this.tokens.entries()]
+      .filter(([, token]) => token.status !== 'expired')
+      .map(([accountId]) => {
+        const requestable = this.modelPolicy.isModelRequestableForAccount(accountId, model, { now, readOnly: true });
+        const effectiveModel = this.modelPolicy.resolveDynamicModelForAccount(accountId, model, false, !requestable);
+        return {
+          availability: this.modelPolicy.getModelAvailabilityForAccount(accountId, model, { now, readOnly: true }),
+          blocks: blocks.filter((block) => block.accountId === accountId &&
+            (!('modelId' in block) || !block.modelId || block.modelId === effectiveModel || (!requestable && block.modelId === model)))
+            .map((block) => ({ ...block, reason: block.reason === 'rate_limit_exceeded' ? 'rate_limited' : block.reason })),
+        };
+      }), now);
   }
   getQuotaDiagnostics(now = Date.now()): QuotaDiagnostics {
     const availabilityEntries = proxyModelAvailabilityStore.peekSnapshot(now);
@@ -737,24 +727,22 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     model: string | undefined,
     excludedAccountIds: ReadonlySet<string>,
   ): Promise<TokenEntry[]> {
-    const usable = (entries: TokenEntry[]) => entries.filter(([accountId, token]) => token.status !== 'expired' &&
-      (this.accountCooldowns.get(accountId) ?? 0) <= Date.now() && !this.rateLimitTracker.isRateLimited(accountId, model ? this.modelPolicy.resolveDynamicModelForAccount(accountId, model, false) : undefined));
-    let modelCapableAccountPool = this.selectModelCapableAccounts(usable(Array.from(this.tokens.entries())), model);
+    const activeTokens = () => Array.from(this.tokens.entries()).filter(([, token]) => token.status !== 'expired');
+    let modelCapableAccountPool = this.selectModelCapableAccounts(activeTokens(), model);
     if (model && modelCapableAccountPool.length === 0) {
       await this.refreshQuotaCatalog({ force: true, model });
-      modelCapableAccountPool = this.selectModelCapableAccounts(usable(Array.from(this.tokens.entries())), model);
+      modelCapableAccountPool = this.selectModelCapableAccounts(activeTokens(), model);
     }
     if (modelCapableAccountPool.length === 0) {
       this.logger.warn(`No account advertises requested model: ${model ?? 'unknown'}`);
       return [];
     }
-    const requestableAccountPool = (model
-      ? modelCapableAccountPool.filter(([accountId]) =>
-          this.modelPolicy.isModelRequestableForAccount(accountId, model),
-        )
-      : modelCapableAccountPool);
+    const requestableAccountPool = this.selectModelCapableAccounts(activeTokens().filter(([accountId]) =>
+      (this.accountCooldowns.get(accountId) ?? 0) <= Date.now() &&
+      !this.rateLimitTracker.isRateLimited(accountId, model ? this.modelPolicy.resolveDynamicModelForAccount(accountId, model, false) : undefined) &&
+      (!model || this.modelPolicy.isModelRequestableForAccount(accountId, model))), model);
     if (requestableAccountPool.length === 0) {
-      this.logger.warn(`All compatible account/model pairs are temporarily unavailable: ${model}`);
+      this.logger.warn(`All compatible account/model pairs are temporarily unavailable: ${model ?? 'unknown'}`);
       return [];
     }
     const filteredAccountPool = requestableAccountPool.filter(
