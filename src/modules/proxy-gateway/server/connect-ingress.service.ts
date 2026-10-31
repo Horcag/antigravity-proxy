@@ -382,40 +382,77 @@ export class ConnectIngressService {
       if (this.isClosed || clientClosed || clientSocket.destroyed || clientSocket.closed) {
         return;
       }
-      const verifiedIp = allowedAddresses[0].address;
-      const upstreamSocket = net.connect({ host: verifiedIp, port: parsed.port }, () => {
-        if (this.isClosed || clientClosed || clientSocket.destroyed || clientSocket.closed) {
-          upstreamSocket.destroy();
+      // Prefer IPv4 addresses: WSL2 often has broken IPv6 connectivity
+      const sorted = [...allowedAddresses].sort((a, b) => a.family - b.family);
+      const tryConnect = (index: number) => {
+        if (index >= sorted.length || this.isClosed || clientClosed || clientSocket.destroyed || clientSocket.closed) {
+          if (!clientSocket.destroyed && !clientSocket.closed) {
+            clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+            clientSocket.destroy();
+          }
           return;
         }
-        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        if (head && head.length > 0) {
-          upstreamSocket.write(head);
-        }
-        clientSocket.pipe(upstreamSocket);
-        upstreamSocket.pipe(clientSocket);
-      });
-      const releaseUpstream = this.admission.reserve('tunnel', true)!;
-      this.activeSockets.add(upstreamSocket);
-      upstreamSocket.once('close', () => {
-        this.activeSockets.delete(upstreamSocket);
-        releaseUpstream();
-      });
-      clientSocket.once('close', () => {
-        clientClosed = true;
-        upstreamSocket.destroy();
-      });
-      upstreamSocket.once('close', () => {
-        clientSocket.destroy();
-      });
-      upstreamSocket.setTimeout(60000, () => {
-        upstreamSocket.destroy();
-        clientSocket.destroy();
-      });
-      upstreamSocket.on('error', (err) => {
-        logger.debug(`[ConnectIngress] Upstream tunnel error for ${destination}: ${err.message}`);
-        clientSocket.destroy();
-      });
+        const verifiedIp = sorted[index].address;
+        let connected = false;
+        let cleanedUp = false;
+        const releaseUpstream = this.admission.reserve('tunnel', true)!;
+
+        const upstreamSocket = net.connect({ host: verifiedIp, port: parsed.port }, () => {
+          if (this.isClosed || clientClosed || clientSocket.destroyed || clientSocket.closed) {
+            upstreamSocket.destroy();
+            return;
+          }
+          connected = true;
+          clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          if (head && head.length > 0) {
+            upstreamSocket.write(head);
+          }
+          clientSocket.pipe(upstreamSocket);
+          upstreamSocket.pipe(clientSocket);
+        });
+
+        this.activeSockets.add(upstreamSocket);
+        const cleanupUpstream = () => {
+          if (!cleanedUp) {
+            cleanedUp = true;
+            this.activeSockets.delete(upstreamSocket);
+            releaseUpstream();
+          }
+        };
+
+        const onClientClose = () => {
+          clientClosed = true;
+          upstreamSocket.destroy();
+        };
+        clientSocket.once('close', onClientClose);
+
+        upstreamSocket.once('close', () => {
+          cleanupUpstream();
+          clientSocket.removeListener('close', onClientClose);
+          if (connected) {
+            clientSocket.destroy();
+          }
+        });
+
+        upstreamSocket.setTimeout(60000, () => {
+          upstreamSocket.destroy();
+          clientSocket.destroy();
+        });
+
+        upstreamSocket.on('error', (err) => {
+          logger.debug(`[ConnectIngress] Upstream tunnel error for ${destination} (${verifiedIp}): ${err.message}`);
+          upstreamSocket.removeAllListeners('close');
+          upstreamSocket.destroy();
+          cleanupUpstream();
+          clientSocket.removeListener('close', onClientClose);
+          if (!connected) {
+            tryConnect(index + 1);
+          } else {
+            clientSocket.destroy();
+          }
+        });
+      };
+      tryConnect(0);
     });
   }
   isAttached(): boolean {

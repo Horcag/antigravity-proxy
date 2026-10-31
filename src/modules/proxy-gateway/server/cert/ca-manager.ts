@@ -243,8 +243,9 @@ unset AGY_CLI_DISABLE_AUTO_UPDATE
 
 export HTTPS_PROXY="$PROXY_URL"
 export https_proxy="$PROXY_URL"
-export NO_PROXY='localhost,127.0.0.1,::1'
-export no_proxy='localhost,127.0.0.1,::1'
+# Authentication belongs to the native account and must survive rotation proxy downtime.
+export NO_PROXY="localhost,127.0.0.1,::1,www.googleapis.com,oauth2.googleapis.com,accounts.google.com,\${NO_PROXY:-},\${no_proxy:-}"
+export no_proxy="$NO_PROXY"
 export SSL_CERT_FILE="$TRUST_BUNDLE"
 
 exec "$AGY_REAL" "$@"

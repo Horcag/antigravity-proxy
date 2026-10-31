@@ -81,6 +81,7 @@ describe('CaManager', () => {
       const wrapperScript = fs.readFileSync(launcherPath, 'utf-8');
       expect(wrapperScript).toContain('#!/bin/sh');
       expect(wrapperScript).toContain('PROXY_URL="http://127.0.0.1:8045"');
+      expect(wrapperScript).toContain('www.googleapis.com,oauth2.googleapis.com,accounts.google.com');
       expect(wrapperScript).toContain(agyNativePath);
 
       // Update observer state must be initialized
@@ -491,5 +492,5 @@ describe('ConnectIngressService', () => {
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
-});
 
+});

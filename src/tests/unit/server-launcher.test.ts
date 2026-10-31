@@ -51,7 +51,7 @@ describe('server-launcher', () => {
     expect(wrapper).toContain('TRUST_BUNDLE="/path/to/trust.pem"');
     expect(wrapper).toContain('export HTTPS_PROXY="$PROXY_URL"');
     expect(wrapper).toContain('export SSL_CERT_FILE="$TRUST_BUNDLE"');
-    expect(wrapper).toContain('localhost,127.0.0.1,::1,oauth2.googleapis.com,accounts.google.com');
+    expect(wrapper).toContain('localhost,127.0.0.1,::1,www.googleapis.com,oauth2.googleapis.com,accounts.google.com');
     expect(wrapper).toContain('exec "$SERVER_REAL" "$@"');
   });
 
@@ -65,7 +65,7 @@ describe('server-launcher', () => {
     }).trim().split('\n');
     expect(lines[0]).toBe('http://127.0.0.1:1');
     expect(lines[1].split(',')).toEqual(expect.arrayContaining([
-      'localhost', '127.0.0.1', '::1', 'oauth2.googleapis.com', 'accounts.google.com',
+      'localhost', '127.0.0.1', '::1', 'www.googleapis.com', 'oauth2.googleapis.com', 'accounts.google.com',
       'internal.example', 'lower.example',
     ]));
     expect(lines[2]).toBe(lines[1]);

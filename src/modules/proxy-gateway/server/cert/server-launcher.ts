@@ -83,7 +83,7 @@ fi
 export HTTPS_PROXY="$PROXY_URL"
 export https_proxy="$PROXY_URL"
 # Authentication belongs to the native account and must survive rotation proxy downtime.
-export NO_PROXY="localhost,127.0.0.1,::1,oauth2.googleapis.com,accounts.google.com,\${NO_PROXY:-},\${no_proxy:-}"
+export NO_PROXY="localhost,127.0.0.1,::1,www.googleapis.com,oauth2.googleapis.com,accounts.google.com,\${NO_PROXY:-},\${no_proxy:-}"
 export no_proxy="$NO_PROXY"
 
 exec "$SERVER_REAL" "$@"
