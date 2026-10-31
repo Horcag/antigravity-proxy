@@ -384,6 +384,8 @@ export class ConnectIngressService {
       }
       // Prefer IPv4 addresses: WSL2 often has broken IPv6 connectivity
       const sorted = [...allowedAddresses].sort((a, b) => a.family - b.family);
+      const CONNECT_TIMEOUT_MS = 5000;
+      const TUNNEL_IDLE_TIMEOUT_MS = 60000;
       const tryConnect = (index: number) => {
         if (index >= sorted.length || this.isClosed || clientClosed || clientSocket.destroyed || clientSocket.closed) {
           if (!clientSocket.destroyed && !clientSocket.closed) {
@@ -403,6 +405,7 @@ export class ConnectIngressService {
             return;
           }
           connected = true;
+          upstreamSocket.setTimeout(TUNNEL_IDLE_TIMEOUT_MS);
           clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
           if (head && head.length > 0) {
             upstreamSocket.write(head);
@@ -431,12 +434,20 @@ export class ConnectIngressService {
           clientSocket.removeListener('close', onClientClose);
           if (connected) {
             clientSocket.destroy();
+          } else {
+            tryConnect(index + 1);
           }
         });
 
-        upstreamSocket.setTimeout(60000, () => {
-          upstreamSocket.destroy();
-          clientSocket.destroy();
+        upstreamSocket.setTimeout(CONNECT_TIMEOUT_MS);
+        upstreamSocket.on('timeout', () => {
+          if (!connected) {
+            logger.debug(`[ConnectIngress] Upstream connect timeout for ${destination} (${verifiedIp})`);
+            upstreamSocket.destroy(new Error('ETIMEDOUT'));
+          } else {
+            upstreamSocket.destroy();
+            clientSocket.destroy();
+          }
         });
 
         upstreamSocket.on('error', (err) => {

@@ -19,7 +19,7 @@ function response(): any {
   res.headersSent = false; res.writableEnded = false; res.statusCode = 200;
   res.writeHead = vi.fn((statusCode) => { res.statusCode = statusCode; res.headersSent = true; });
   res.write = vi.fn(() => true);
-  res.end = vi.fn(() => { res.writableEnded = true; });
+  res.end = vi.fn(() => { res.writableEnded = true; res.emit('finish'); });
   return res;
 }
 
@@ -49,7 +49,7 @@ describe('Cache affinity diagnostics', () => {
     await gateway.handleRequest(request(), response());
 
     const diagnostics = warnSpy.mock.calls.flat().map(String).join('\n');
-    expect(diagnostics).toContain('Session confirmation rejected (unrecognized)');
+    expect(diagnostics).toContain('Session confirmation not committed (unrecognized)');
     expect(diagnostics).not.toContain('raw-session-sentinel');
     expect(diagnostics).not.toContain(rawAccount);
     expect(releaseReservation).toHaveBeenCalledOnce();
