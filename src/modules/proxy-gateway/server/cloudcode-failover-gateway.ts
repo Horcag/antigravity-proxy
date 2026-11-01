@@ -17,7 +17,7 @@ import { extractModelName, extractSessionKey, isReplaySafeOperation, composeAtte
 import { classifyUpstreamFailure, safeDecodeGrpcMessage, type FailureEvidence } from './upstream-failure';
 import { evaluateRetryDecision } from './upstream-retry-decision';
 import { logUpstreamFailure, sanitizeLogString } from './cloudcode-diagnostics';
-import { formatTerminalDownstreamError, resolveHasAlternativeAccounts } from './cloudcode-terminal-response';
+import { formatPoolCapacityError, formatTerminalDownstreamError, resolveHasAlternativeAccounts } from './cloudcode-terminal-response';
 export { isVerifiedSessionKey, isHintSessionKey };
 export type ProtocolFailureCategory = 'inspection-limit' | 'unsupported-encoding' | 'malformed-upstream-message' | 'deadline-exceeded' | 'account-quota' | 'upstream-transient';
 export interface ProtocolFrameDecision {
@@ -82,12 +82,9 @@ export class CloudCodeFailoverGateway {
     const rawUrl = req.url || '/';
     let urlPath = rawUrl;
     if (urlPath.startsWith('http://') || urlPath.startsWith('https://')) {
-      try {
-        const parsed = new URL(urlPath);
-        urlPath = parsed.pathname + parsed.search;
-      } catch {
-        // preserve urlPath
-      }
+      // Convert absolute-form to origin-form without URL's path normalization.
+      const target = /^https?:\/\/[^/?#]+([^#]*)/.exec(urlPath)?.[1];
+      if (target !== undefined) urlPath = target.startsWith('/') ? target : `/${target}`;
     }
     const method = req.method || 'POST';
     // Determine upstream target host strictly from :authority or host header
@@ -222,8 +219,7 @@ export class CloudCodeFailoverGateway {
       hasAccountPinnedResources: preflight.hasAccountPinnedResources,
     });
     let ambiguityProbesUsed = 0;
-    let accountProjectCorrectionsUsed = 0;
-    let quotaHeaderMode: 'with-quota-header' | 'without-quota-header' = 'with-quota-header';
+    const quotaHeaderMode = 'with-quota-header' as const;
     let lastAmbiguousError: {
       statusCode: number;
       headers: http.IncomingHttpHeaders;
@@ -244,7 +240,6 @@ export class CloudCodeFailoverGateway {
       migrationAuthorization = createMigrationAuthorization(reason, sessionKey, binding, requestId) ?? undefined;
     };
     migrationAuthorization = this.accountLeaseService?.authorizeBoundSessionMigration?.(sessionKey, modelName, requestId);
-
     let activeLease: {
       account: CloudAccount;
       sessionKey?: string;
@@ -301,6 +296,19 @@ export class CloudCodeFailoverGateway {
               model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey,
               deferSessionBinding: true, migrationAuthorization, signal: requestAbortController.signal, requestId, affinityOwnerTimeoutMs,
             });
+            if (!activeLease && migrationAuthorization) {
+              migrationAuthorization = undefined;
+              activeLease = await this.accountLeaseService.acquireAttemptLease({
+                model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey,
+                deferSessionBinding: true, migrationAuthorization: undefined, signal: requestAbortController.signal, requestId, affinityOwnerTimeoutMs,
+              });
+            }
+            if (!activeLease && sessionKey) {
+              activeLease = await this.accountLeaseService.acquireAttemptLease({
+                model: modelName, excludeAccountIds: Array.from(attemptedAccountIds),
+                signal: requestAbortController.signal, requestId,
+              });
+            }
           } else {
             const acc = await this.accountLeaseService.getNextToken({
               model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, deferSessionBinding: true,
@@ -318,49 +326,34 @@ export class CloudCodeFailoverGateway {
               writeDownstream('bad_gateway', ambiguous.statusCode, ambiguous.headers, ambiguous.bufferedBody);
               return;
             }
-            writeDownstream('unavailable', 503, { 'content-type': 'application/json' },
-              JSON.stringify({ error: { code: 503, message: 'No available upstream account capacity in managed pool', status: 'UNAVAILABLE' } }));
+            const failure = requestedModel ? this.accountLeaseService.getPoolCapacityFailure?.(requestedModel) : undefined, terminal = formatPoolCapacityError(failure, requestedModel);
+            writeDownstream(failure ? 'rate_limited' : 'unavailable', terminal.statusCode, terminal.headers, terminal.body);
           }
           return;
         }
-        quotaHeaderMode = 'with-quota-header';
-        accountProjectCorrectionsUsed = 0;
       }
-
       try {
         currentAttemptAccount = activeLease?.account ?? null; activeReleaseReservation = activeLease?.releaseReservation;
         activeCompleteAffinityPlacement = activeLease?.completeAffinityPlacement;
         if (activeLease?.affinityAbortSignal?.aborted) { abortExpiredAffinityOwner(); return; }
         if (!leaseRetainedForSameAccount) {
           activeLease?.affinityAbortSignal?.addEventListener('abort', abortExpiredAffinityOwner, { once: true });
-          const initialBinding =
-            sessionKey && typeof this.accountLeaseService?.getSessionBinding === 'function'
-              ? this.accountLeaseService.getSessionBinding(sessionKey)
-              : null;
+          const initialBinding = sessionKey && typeof this.accountLeaseService?.getSessionBinding === 'function' ? this.accountLeaseService.getSessionBinding(sessionKey) : null;
           attemptGeneration = activeLease?.generation ?? initialBinding?.generation ?? 1;
           attemptTableIncarnation = activeLease?.tableIncarnation ?? initialBinding?.tableIncarnation;
           migrationCapability = null;
-          const needsMigration = Boolean(
-            sessionKey && isVerifiedSessionKey(sessionKey) && activeLease?.account &&
-            initialBinding && initialBinding.accountId !== activeLease.account.id,
-          );
-          if (
-            authorizesMigration(migrationAuthorization, sessionKey, initialBinding, requestId) &&
-            needsMigration && sessionKey && isVerifiedSessionKey(sessionKey) && activeLease?.account &&
-            typeof this.accountLeaseService?.startSessionMigration === 'function'
-          ) {
-            migrationCapability = this.accountLeaseService.startSessionMigration(
-              sessionKey, attemptGeneration, activeLease.account.id, requestId, attemptTableIncarnation,
-            );
+          const needsMigration = Boolean(sessionKey && isVerifiedSessionKey(sessionKey) && activeLease?.account && initialBinding && initialBinding.accountId !== activeLease.account.id);
+          const canAttemptMigration = authorizesMigration(migrationAuthorization, sessionKey, initialBinding, requestId) ||
+            (!migrationAuthorization && typeof this.accountLeaseService?.startSessionMigration === 'function');
+          if (canAttemptMigration && needsMigration && sessionKey && isVerifiedSessionKey(sessionKey) && activeLease?.account && typeof this.accountLeaseService?.startSessionMigration === 'function') {
+            migrationCapability = this.accountLeaseService.startSessionMigration(sessionKey, attemptGeneration, activeLease.account.id, requestId, attemptTableIncarnation);
             if (migrationCapability) {
               attemptGeneration = migrationCapability.generation;
               const cap = migrationCapability;
-              activeAbortMigration = () => {
-                this.accountLeaseService?.abortSessionMigration?.(cap.sessionKey, cap.generation, cap.ownerRequestId, cap.tableIncarnation);
-              };
+              activeAbortMigration = () => { this.accountLeaseService?.abortSessionMigration?.(cap.sessionKey, cap.generation, cap.ownerRequestId, cap.tableIncarnation); };
             }
           }
-          if (needsMigration && !migrationCapability) {
+          if (needsMigration && migrationAuthorization && !migrationCapability) {
             releaseActiveLease();
             if (!responseCommitted && !res.writableEnded) {
               writeDownstream('unavailable', 503, { 'content-type': 'application/json' },
@@ -394,17 +387,8 @@ export class CloudCodeFailoverGateway {
             ? this.accountLeaseService.resolveDynamicModelForAccount(account.id, requestedModel)
             : requestedModel;
         const { urlPath: attemptUrlPath, headers: upstreamHeaders, payloadToSend } = composeAttemptRequest({
-          rawBody,
-          reqHeaders: req.headers,
-          targetHost,
-          method,
-          urlPath,
-          requestedModel,
-          effectiveModel,
-          routingProject: account?.token?.project_id,
-          quotaHeaderMode,
+          rawBody, reqHeaders: req.headers, targetHost, method, urlPath,
           accessToken: account?.token?.access_token,
-          attempt,
         });
         logger.debug(
           `[CloudCodeGateway] Attempt ${attempt} model=${sanitizeLogString(effectiveModel) || 'default'} operation=upstream_attempt`,
@@ -416,7 +400,7 @@ export class CloudCodeFailoverGateway {
           const decision = evaluateRetryDecision({
             evidence: failureEvidence, attempt, maxAttempts, downstreamCommitted: responseCommitted,
             isReplaySafe, ambiguityProbesUsed, maxAmbiguityProbes: 1,
-            projectCorrectionsUsed: accountProjectCorrectionsUsed, maxProjectCorrections: 1,
+            projectCorrectionsUsed: 0, maxProjectCorrections: 0,
             quotaHeaderMode,
             hasAlternativeAccounts: resolveHasAlternativeAccounts(this.accountLeaseService, account, attemptedAccountIds, attempt, maxAttempts),
             effectiveModel, transientRetriesUsed, maxTransientRetries: 1,
@@ -431,7 +415,7 @@ export class CloudCodeFailoverGateway {
           if (account && this.accountLeaseService) {
             try {
               if (decision.healthEffect.kind === 'rate-limited') {
-                void this.accountLeaseService.markFromUpstreamError({
+                await this.accountLeaseService.markFromUpstreamError({
                   accountIdOrEmail: account.id, status: status >= 400 ? status : 429,
                   model: effectiveModel, body: failureEvidence.rawErrorText, headers: responseHeaders,
                   reason: decision.healthEffect.isQuota ? RateLimitReason.QuotaExhausted : RateLimitReason.RateLimitExceeded,
@@ -446,16 +430,6 @@ export class CloudCodeFailoverGateway {
             } catch {
               logger.warn('[CloudCodeGateway] Failed to record account error health effect: health_effect_failed');
             }
-          }
-
-          if (decision.action.kind === 'retry-same-account') {
-            if (decision.action.repair === 'project-context') {
-              accountProjectCorrectionsUsed++;
-              quotaHeaderMode = 'without-quota-header';
-              logger.warn(`[CloudCodeGateway] Upstream project rejected (attempt ${attempt}/${maxAttempts}). Retrying without x-goog-user-project header on same account...`);
-            }
-            leaseRetainedForSameAccount = true;
-            return 'continue';
           }
 
           if (decision.action.kind === 'retry-transient') {
@@ -854,62 +828,31 @@ export class CloudCodeFailoverGateway {
                           attemptGeneration,
                           requestId,
                         );
-                  const isRejected =
-                    (typeof commitResult === 'boolean' && !commitResult) ||
-                    (typeof commitResult === 'object' &&
-                      commitResult !== null &&
-                      commitResult.kind === 'rejected');
+                  const isRejected = (typeof commitResult === 'boolean' && !commitResult) ||
+                    (typeof commitResult === 'object' && commitResult !== null && commitResult.kind === 'rejected');
                   if (isRejected) {
-                    logger.warn(
-                      `[CloudCodeGateway] Session confirmation rejected (${safeAffinityCommitRejectionReason(commitResult)}); suppressing output`,
-                    );
-                    releaseActiveLease();
-                    bodyStream.destroy();
                     if (!isReplaySafe) {
-                      const errBody = encodeErrorBody({
-                        code: 502,
-                        status: 'BAD_GATEWAY',
-                        message: 'Bad Gateway: Session confirmation rejected on non-replayable operation',
-                        category: 'session-confirmation-rejected',
-                      });
+                      releaseActiveLease(); bodyStream.destroy();
+                      const errBody = encodeErrorBody({ code: 502, status: 'BAD_GATEWAY', message: 'Bad Gateway: Session confirmation rejected on non-replayable operation', category: 'session-confirmation-rejected' });
                       writeDownstream('bad_gateway', 502, { 'content-type': 'application/json' }, errBody);
                       return;
                     }
-                    continue;
+                    logger.warn(`[CloudCodeGateway] Session confirmation not committed (${safeAffinityCommitRejectionReason(commitResult)}); proceeding with valid upstream response`);
+                    activeCompleteAffinityPlacement?.('aborted'); activeCompleteAffinityPlacement = undefined;
                   }
                 } else if (typeof this.accountLeaseService?.bindSession === 'function') {
-                  const bound =
-                    expectedIncarnation !== undefined
-                      ? this.accountLeaseService.bindSession(
-                          sessionKey,
-                          account.id,
-                          undefined,
-                          attemptGeneration,
-                          expectedIncarnation,
-                        )
-                      : this.accountLeaseService.bindSession(
-                          sessionKey,
-                          account.id,
-                          undefined,
-                          attemptGeneration,
-                        );
+                  const bound = expectedIncarnation !== undefined
+                    ? this.accountLeaseService.bindSession(sessionKey, account.id, undefined, attemptGeneration, expectedIncarnation)
+                    : this.accountLeaseService.bindSession(sessionKey, account.id, undefined, attemptGeneration);
                   if (bound === false) {
-                    logger.warn(
-                      '[CloudCodeGateway] Session binding rejected (lost race); suppressing output',
-                    );
-                    releaseActiveLease();
-                    bodyStream.destroy();
                     if (!isReplaySafe) {
-                      const errBody = encodeErrorBody({
-                        code: 502,
-                        status: 'BAD_GATEWAY',
-                        message: 'Bad Gateway: Session binding rejected on non-replayable operation',
-                        category: 'session-binding-rejected',
-                      });
+                      releaseActiveLease(); bodyStream.destroy();
+                      const errBody = encodeErrorBody({ code: 502, status: 'BAD_GATEWAY', message: 'Bad Gateway: Session binding rejected on non-replayable operation', category: 'session-binding-rejected' });
                       writeDownstream('bad_gateway', 502, { 'content-type': 'application/json' }, errBody);
                       return;
                     }
-                    continue;
+                    logger.warn('[CloudCodeGateway] Session binding race not won; proceeding with valid upstream response');
+                    activeCompleteAffinityPlacement?.('aborted'); activeCompleteAffinityPlacement = undefined;
                   }
                 }
               }
@@ -927,12 +870,18 @@ export class CloudCodeFailoverGateway {
           } catch (err) { rejectAndTerminateDownstream(err); }
         };
         bodyStream.once('end', onStreamEnd);
+        let downstreamClosed = false;
         res.once('close', () => {
+          downstreamClosed = true;
           clearLogicalDeadline();
           bodyStream.destroy();
         });
-        res.once('error', rejectAndTerminateDownstream);
+        res.once('error', (err) => {
+          downstreamClosed = true;
+          rejectAndTerminateDownstream(err);
+        });
         bodyStream.once('error', (err) => {
+          if (downstreamClosed || (res as any).destroyed || res.writableEnded) return;
           logger.warn(
             '[CloudCodeGateway] Upstream streaming error: operation=upstream_stream reason=stream_error',
           );
@@ -1051,6 +1000,8 @@ export class CloudCodeFailoverGateway {
     }
     const anyRes = res as any;
     if (!anyRes.headersSent) {
+      const poolFailure = requestedModel ? this.accountLeaseService?.getPoolCapacityFailure?.(requestedModel) : undefined;
+      if (poolFailure) { const terminal = formatPoolCapacityError(poolFailure, requestedModel); writeDownstream('rate_limited', terminal.statusCode, terminal.headers, terminal.body); return; }
       const exhaustedClassification = exhaustedByUnavailable ? 'unavailable' : 'rate_limited';
       writeDownstream(exhaustedClassification, exhaustedByUnavailable ? 503 : 429, { 'content-type': 'application/json' },
         JSON.stringify({
@@ -1442,7 +1393,7 @@ export class CloudCodeFailoverGateway {
   private executeUpstreamCall(
     method: string,
     url: string,
-    headers: Record<string, string>,
+    headers: Record<string, string | string[]>,
     payload: Buffer,
     upstreamHost: string,
     onReqCreated?: (req: http.ClientRequest) => void,

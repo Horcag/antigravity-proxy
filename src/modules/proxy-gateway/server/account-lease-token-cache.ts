@@ -21,14 +21,16 @@ export interface AccountLeaseTokenCacheSnapshot {
 export class AccountLeaseTokenCache {
   constructor(private readonly options: AccountLeaseTokenCacheOptions) {}
 
-  async loadAccounts(): Promise<AccountLeaseTokenCacheSnapshot | null> {
+  async loadAccounts(
+    currentTokens?: ReadonlyMap<string, AccountLeaseTokenData>,
+  ): Promise<AccountLeaseTokenCacheSnapshot | null> {
     try {
       const accounts = await this.options.accountStore.getAccounts();
       let count = 0;
       const tokens = new Map<string, AccountLeaseTokenData>();
 
       for (const account of accounts) {
-        const tokenData = this.mapAccountToTokenData(account);
+        const tokenData = this.mapAccountToTokenData(account, currentTokens?.get(account.id)?.session_id);
         if (tokenData) {
           tokens.set(account.id, tokenData);
           count++;
@@ -46,7 +48,7 @@ export class AccountLeaseTokenCache {
     }
   }
 
-  mapAccountToTokenData(account: CloudAccount): AccountLeaseTokenData | null {
+  mapAccountToTokenData(account: CloudAccount, existingSessionId?: string): AccountLeaseTokenData | null {
     if (!account.token || account.status === 'expired') {
       return null;
     }
@@ -65,7 +67,7 @@ export class AccountLeaseTokenCache {
       expires_in: account.token.expires_in,
       expiry_timestamp: account.token.expiry_timestamp,
       project_id: account.token.project_id || undefined,
-      session_id: account.token.session_id || this.generateSessionId(),
+      session_id: account.token.session_id || existingSessionId || this.generateSessionId(),
       upstream_proxy_url: account.token.upstream_proxy_url || account.proxy_url || undefined,
       quota,
       last_successful_quota_refresh_at: quota?.last_successful_refresh_at,

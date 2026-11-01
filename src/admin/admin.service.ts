@@ -315,7 +315,7 @@ export class AdminService {
       imported.push(toSanitizedAccount(fullAccount));
     }
 
-    await this.accountLeaseService.reloadAllAccounts();
+    await this.accountLeaseService.loadAccounts();
     return {
       imported: imported.length,
       skipped,

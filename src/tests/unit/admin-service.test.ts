@@ -32,6 +32,7 @@ function createAccount(overrides: Partial<CloudAccount> = {}): CloudAccount {
 
 function createService() {
   const leaseService = {
+    loadAccounts: vi.fn().mockResolvedValue(1),
     reloadAllAccounts: vi.fn().mockResolvedValue(1),
     setPreferredAccount: vi.fn(),
     refreshQuotaCatalog: vi.fn().mockResolvedValue({
@@ -44,7 +45,7 @@ function createService() {
       refresh_interval_seconds: 600,
       accounts: [],
     }),
-  } as Pick<AccountLeaseService, 'reloadAllAccounts'> as AccountLeaseService;
+  } as Pick<AccountLeaseService, 'loadAccounts' | 'reloadAllAccounts'> as AccountLeaseService;
 
   return new AdminService(leaseService);
 }
@@ -193,8 +194,11 @@ describe('AdminService', () => {
     vi.spyOn(CloudAccountRepo, 'getAccountByEmail').mockImplementation(async (email) => {
       return email.toLowerCase() === existing.email ? existing : undefined;
     });
-    const addAccount = vi.spyOn(CloudAccountRepo, 'addAccount').mockResolvedValue(undefined);
     const service = createService();
+    const addAccount = vi.spyOn(CloudAccountRepo, 'addAccount').mockImplementation(async () => {
+      await Promise.resolve();
+      expect((service as any).accountLeaseService.loadAccounts).not.toHaveBeenCalled();
+    });
 
     await service.importAccounts({
       version: '1.0',
@@ -234,11 +238,25 @@ describe('AdminService', () => {
     );
     expect((addAccount.mock.calls[1]?.[0] as CloudAccount).id).not.toBe('existing-id');
 
-    const reloadAllAccounts = (service as any).accountLeaseService.reloadAllAccounts;
+    const { loadAccounts, reloadAllAccounts } = (service as any).accountLeaseService;
+    expect(loadAccounts).toHaveBeenCalledOnce();
+    expect(reloadAllAccounts).not.toHaveBeenCalled();
+    for (const callOrder of addAccount.mock.invocationCallOrder) {
+      expect(callOrder).toBeLessThan(loadAccounts.mock.invocationCallOrder[0]);
+    }
+  });
+
+  it('keeps the explicit reload endpoint on the clear-all path', async () => {
+    const service = createService();
+
+    await expect(service.reloadAccounts()).resolves.toEqual({
+      reloaded: true,
+      account_count: 1,
+    });
+
+    const { loadAccounts, reloadAllAccounts } = (service as any).accountLeaseService;
     expect(reloadAllAccounts).toHaveBeenCalledOnce();
-    expect(addAccount.mock.invocationCallOrder[1]).toBeLessThan(
-      reloadAllAccounts.mock.invocationCallOrder[0],
-    );
+    expect(loadAccounts).not.toHaveBeenCalled();
   });
 
   it('preserves omitted optional import metadata while allowing explicit replacements and clears', async () => {

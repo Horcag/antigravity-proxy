@@ -65,10 +65,10 @@ function setUnitRuntimeLayout(root: string, runtimePath: 'bin/node' | 'runtime/n
 function expectCurrentUnitRuntime(root: string, runtimePath: 'bin/node' | 'runtime/node') {
   const current = join(root, 'opt/antigravity-proxy/current');
   const unit = readFileSync(join(root, 'etc/systemd/system/antigravity-proxy.service'), 'utf8');
+  expect(unit).toContain('Restart=always');
   expect(unit).toContain(`ExecStart=/opt/antigravity-proxy/current/${runtimePath} /opt/antigravity-proxy/current/dist/cli.js serve`);
   expect(existsSync(join(current, runtimePath))).toBe(true);
 }
-
 function runReleaseLibrary(root: string, releaseId: string, program: string, extraEnv: NodeJS.ProcessEnv = {}) {
   return spawnSync('bash', ['-c', program, 'release-library-test', releaseLibrary], {
     cwd: repositoryRoot,

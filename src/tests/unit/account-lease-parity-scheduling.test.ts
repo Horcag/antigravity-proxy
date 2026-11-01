@@ -2,15 +2,19 @@ import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_PROXY_CONFIG, ProxyConfig } from '@/modules/config/types';
 import { setServerConfig } from '../../server/server-config';
+import { releaseAdmission } from '../../server/release-admission';
 import { AccountLeaseService } from '../../modules/proxy-gateway/server/account-lease.service';
 import { resolveModelRoute } from '../../modules/proxy-gateway/antigravity/ModelMapping';
 import { GoogleAPIService, type TokenResponse } from '@/modules/cloud-account/services/GoogleAPIService';
 import { proxyModelAvailabilityStore } from '@/modules/proxy-gateway/server/proxy-model-availability-store';
-import type {
-  AccountLeaseAccountStore,
-  AccountLeaseUpstream,
-} from '@/modules/proxy-gateway/server/account-lease-adapters';
+import type { AccountLeaseAccountStore, AccountLeaseUpstream } from '@/modules/proxy-gateway/server/account-lease-adapters';
 import type { CloudAccount, CloudQuotaData } from '@/modules/cloud-account/types';
+
+// Scheduling tests own their background work; real gate behavior has its own suite.
+vi.mock('../../server/release-admission', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../server/release-admission')>(),
+  runReleaseBackground: <T>(work: () => Promise<T>): Promise<T> => work(),
+}));
 
 function createProxyConfig(overrides: Partial<ProxyConfig>): ProxyConfig {
   return {
@@ -1284,23 +1288,19 @@ describe('AccountLeaseService parity scheduling replay', () => {
     expect(store.updateToken).not.toHaveBeenCalled();
   });
 
-  it('tears down the periodic quota catalog refresh lifecycle', async () => {
+  it('tears down quota refresh even when the private production release gate is unavailable', async () => {
     vi.useFakeTimers();
-    const accounts = [account('acc-1', quota({ 'gemini-old-flash-high': 10 }))];
-    const upstream = createUpstream({
-      fetchQuota: vi.fn().mockResolvedValue(quota({ 'gemini-new-flash-high': 66 })),
-    });
-    service = new AccountLeaseService(createAccountStore(accounts), upstream);
-
+    const gate = vi.spyOn(releaseAdmission(), 'gate').mockImplementation(() => { throw new Error('EACCES: private production release gate'); });
+    const upstream = createUpstream({ fetchQuota: vi.fn().mockResolvedValue(quota({ 'gemini-new-flash-high': 66 })) });
+    service = new AccountLeaseService(createAccountStore([account('acc-1')]), upstream);
     await service.onModuleInit();
     expect(upstream.fetchQuota).toHaveBeenCalledTimes(1);
-
     await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
     expect(upstream.fetchQuota).toHaveBeenCalledTimes(2);
-
-    service.onModuleDestroy();
+    await service.onModuleDestroy();
     await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
     expect(upstream.fetchQuota).toHaveBeenCalledTimes(2);
+    expect(gate).not.toHaveBeenCalled();
   });
 
   it('passes oauth_client_key when refreshing token and persists refreshed key', async () => {

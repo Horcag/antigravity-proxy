@@ -238,10 +238,10 @@ export class AccountLeaseModelPolicy {
   resolveDynamicModelForAccount(
     accountId: string,
     mappedModel: string,
-    logRewrite = true,
+    logRewrite = true, capabilityOnly = false,
   ): string {
     const tokenData = this.options.getTokenCache().get(accountId);
-    const unrequestableSibling = this.resolveUnrequestableSibling(
+    const unrequestableSibling = capabilityOnly ? undefined : this.resolveUnrequestableSibling(
       accountId,
       mappedModel,
       tokenData,
@@ -259,9 +259,9 @@ export class AccountLeaseModelPolicy {
       return mappedModel;
     }
 
-    const availableModels = this.filterRequestableModels(
+    const availableModels = (capabilityOnly ? this.filterCapabilityModels : this.filterRequestableModels).call(this,
       accountId,
-      this.getAvailableModelsFromToken(tokenData),
+      this.getAvailableModelsFromToken(tokenData), { readOnly: capabilityOnly },
     );
     if (availableModels.size === 0) {
       return mappedModel;

@@ -74,7 +74,7 @@ function createMockAccount(id: string, email: string): CloudAccount {
   };
 }
 
-describe('CloudCodeFailoverGateway Dynamic Model Resolution', () => {
+describe('CloudCodeFailoverGateway native model preservation', () => {
   let mockAccountLeaseService: any;
   let gateway: CloudCodeFailoverGateway;
 
@@ -93,7 +93,7 @@ describe('CloudCodeFailoverGateway Dynamic Model Resolution', () => {
     gateway = new CloudCodeFailoverGateway(mockAccountLeaseService);
   });
 
-  it('rewrites requested model in JSON payload to effective resolved model', async () => {
+  it('preserves requested model despite configured account alias', async () => {
     const account1 = createMockAccount('acc-1', 'acc1@test.com');
     mockAccountLeaseService.getNextToken.mockResolvedValue(account1);
 
@@ -113,18 +113,14 @@ describe('CloudCodeFailoverGateway Dynamic Model Resolution', () => {
 
     await gateway.handleRequest(req, res);
 
-    expect(mockAccountLeaseService.resolveDynamicModelForAccount).toHaveBeenCalledWith(
-      'acc-1',
-      'gemini-3.8-flash-high',
-    );
 
     const sentPayloadBuffer = executeSpy.mock.calls[0][3] as Buffer;
     const sentPayload = JSON.parse(sentPayloadBuffer.toString('utf-8'));
-    expect(sentPayload.model).toBe('gemini-3.8-flash-tiered');
+    expect(sentPayload.model).toBe('gemini-3.8-flash-high');
     expect(sentPayload.contents[0].parts[0].text).toBe('Hello');
   });
 
-  it('rewrites nested request.model and URL path consistently', async () => {
+  it('preserves nested request.model and URL path despite configured account alias', async () => {
     const account1 = createMockAccount('acc-1', 'acc1@test.com');
     mockAccountLeaseService.getNextToken.mockResolvedValue(account1);
 
@@ -148,10 +144,10 @@ describe('CloudCodeFailoverGateway Dynamic Model Resolution', () => {
     await gateway.handleRequest(req, res);
 
     const sentUrlPath = executeSpy.mock.calls[0][1] as string;
-    expect(sentUrlPath).toBe('/v1/models/gemini-3.8-flash-tiered:streamGenerateContent');
+    expect(sentUrlPath).toBe('/v1/models/gemini-3.8-flash-high:streamGenerateContent');
 
     const sentPayloadBuffer = executeSpy.mock.calls[0][3] as Buffer;
     const sentPayload = JSON.parse(sentPayloadBuffer.toString('utf-8'));
-    expect(sentPayload.request.model).toBe('gemini-3.8-flash-tiered');
+    expect(sentPayload.request.model).toBe('gemini-3.8-flash-high');
   });
 });

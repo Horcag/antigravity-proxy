@@ -33,6 +33,52 @@ Current surface:
 - Graceful `SIGINT`/`SIGTERM`
 - Rotation tests for `429`, `RESOURCE_EXHAUSTED`, quota exhaustion, and retry exclusions
 
+## Native AGY CONNECT requests
+
+The CONNECT gateway relays Antigravity's native CloudCode protocol. It substitutes
+OAuth credentials in headers; it does not translate native requests through the
+API-compatible HTTP handlers. TLS is terminated and re-established by the gateway.
+
+Native request bodies retain their original bytes, including compression, model,
+project, session metadata, signatures and unknown fields. Origin paths and queries
+are preserved. End-to-end header values, including `x-goog-session-id` and
+`x-goog-user-project`, survive retries. Changes are limited to credentials and the
+HTTP transport fields needed for forwarding, including authority/Host representation,
+Content-Length and hop-by-hop header removal.
+
+Account rotation does not change the requested model or repair the project context.
+If another credential is not entitled to that original context, the gateway returns
+the upstream failure instead of silently rewriting the request.
+
+## Antigravity IDE / Language Server (WSL mode)
+
+When Antigravity runs in WSL mode, the desktop app launches `language_server` directly
+under `~/.antigravity-server/bin/<version>/language_server`.
+
+To route IDE traffic through the proxy and enable transparent account rotation:
+
+```bash
+# Check status of installed server versions
+antigravity-proxy ide status
+# Or use the helper script:
+./scripts/patch-antigravity-server.sh status
+
+# Patch all installed language_server binaries with managed transparent wrappers
+antigravity-proxy ide patch
+# Or:
+./scripts/patch-antigravity-server.sh patch
+
+# Revert wrappers back to native binaries
+antigravity-proxy ide unpatch
+```
+
+The wrapper routes CloudCode calls to `http://127.0.0.1:8045` and trusts the managed
+local CA (`agy-trust.pem`) while keeping Windows `host_bridge_url` on `127.0.0.1` direct
+via `NO_PROXY`. Native OAuth token exchange and Google sign-in also bypass the
+rotation proxy, and existing caller bypasses are preserved. The system service
+restarts after unexpected clean exits as well as failures; `systemctl stop` still
+stops it explicitly.
+
 ## Build
 
 ```bash
@@ -80,6 +126,11 @@ never paste or print that file in a terminal transcript. Existing keys, OAuth se
 `accounts.db`, `accounts.db-wal`, `accounts.db-shm`, and `.master-key` are preserved.
 
 ### Update, rollback, and migration
+
+`./apply-fix.sh` delegates to the configured system updater, which builds the committed
+HEAD in isolated staging and publishes an immutable release with smoke checks and rollback.
+Commit intended changes before running it. Do not copy `dist` into `current` or an
+existing rollback release: that destroys the correspondence between source and running code.
 
 Choose a release ID that identifies the source revision and update atomically. `current` and
 `previous` are sibling links under `/opt/antigravity-proxy`, both resolving into `releases/`.

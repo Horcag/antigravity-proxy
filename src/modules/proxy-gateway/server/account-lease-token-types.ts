@@ -56,3 +56,32 @@ export function normalizeClientKey(clientKey: string | undefined): string | unde
   const normalized = clientKey.trim().toLowerCase();
   return normalized !== '' ? normalized : undefined;
 }
+
+export interface QuotaDiagnosticsTemporaryBlock {
+  reason: string;
+  unavailable_until: string;
+  remaining_seconds: number;
+}
+export interface AccountQuotaDiagnosticsModel {
+  public_model_id: string;
+  physical_model_id: string;
+  remaining_percentage: number | null;
+  reset_time: string | null;
+  availability: 'unknown' | 'available' | 'unavailable';
+  requestable: boolean;
+  temporary_block?: QuotaDiagnosticsTemporaryBlock;
+}
+export interface AccountQuotaDiagnostics {
+  /** Request-local ordinal only; it is not stable across diagnostic responses. */
+  account_label: string;
+  status: 'active' | 'rate_limited';
+  last_successful_refresh_at: string | null;
+  refresh_age_seconds: number | null;
+  refresh_state: 'fresh' | 'stale' | 'unknown';
+  account_cooldown?: QuotaDiagnosticsTemporaryBlock;
+  models: AccountQuotaDiagnosticsModel[];
+}
+export interface QuotaDiagnostics {
+  refresh_interval_seconds: number;
+  accounts: AccountQuotaDiagnostics[];
+}
