@@ -127,6 +127,11 @@ never paste or print that file in a terminal transcript. Existing keys, OAuth se
 
 ### Update, rollback, and migration
 
+`./apply-fix.sh` delegates to the configured system updater, which builds the committed
+HEAD in isolated staging and publishes an immutable release with smoke checks and rollback.
+Commit intended changes before running it. Do not copy `dist` into `current` or an
+existing rollback release: that destroys the correspondence between source and running code.
+
 Choose a release ID that identifies the source revision and update atomically. `current` and
 `previous` are sibling links under `/opt/antigravity-proxy`, both resolving into `releases/`.
 A failed post-start smoke check restores both links and the system unit to their exact pre-update

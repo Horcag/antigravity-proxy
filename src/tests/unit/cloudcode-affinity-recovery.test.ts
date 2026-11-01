@@ -125,6 +125,92 @@ describe('CloudCodeFailoverGateway affinity recovery', () => {
     expect(res.writableEnded).toBe(true);
   });
 
+  it.each([
+    [
+      'active binding conflict',
+      { kind: 'rejected', reason: 'active-binding-conflict' },
+      { accountId: 'acc-bound', generation: 1, tableIncarnation: 1 },
+    ],
+    [
+      'lost migration with missing binding',
+      { kind: 'rejected', reason: 'migration-confirmation-rejected' },
+      null,
+    ],
+    ['legacy boolean rejection with missing binding', false, null],
+  ] as const)('keeps a valid response and does not rebind after %s', async (_name, confirmation, currentBinding) => {
+    const account = createMockAccount('acc-response', 'response@test.com');
+    const completeAffinityPlacement = vi.fn();
+    mockAccountLeaseService.acquireAttemptLease = vi.fn().mockResolvedValue({
+      account,
+      generation: 2,
+      tableIncarnation: 1,
+      releaseReservation: vi.fn(),
+      completeAffinityPlacement,
+    });
+    mockAccountLeaseService.confirmOrBindSession = vi.fn().mockReturnValue(confirmation);
+    mockAccountLeaseService.getSessionBinding = vi.fn().mockReturnValue(currentBinding);
+    mockAccountLeaseService.bindSession = vi.fn().mockReturnValue(true);
+
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockResolvedValueOnce({
+      statusCode: 200,
+      headers: { 'content-type': 'application/json' },
+      bodyStream: createMockStream(['{"candidates":[{"content":{"parts":[{"text":"preserved"}]}}]}']),
+    });
+
+    const req = createMockRequest({
+      headers: { 'x-session-id': 'session-rejection-no-rebind', host: 'daily-cloudcode-pa.googleapis.com' },
+      body: JSON.stringify({ model: 'gemini-2.5-pro' }),
+    });
+    const res = createMockResponse();
+
+    await gateway.handleRequest(req, res);
+
+    expect(res.writeHead).toHaveBeenCalledWith(200, expect.anything());
+    expect(res.write.mock.calls.map(([chunk]: [unknown]) => Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)).join(''))
+      .toContain('preserved');
+    expect(res.writableEnded).toBe(true);
+    expect(mockAccountLeaseService.bindSession).not.toHaveBeenCalled();
+    expect(completeAffinityPlacement).toHaveBeenCalledWith('aborted');
+  });
+
+  it('does not retry a failed legacy bind without its generation fence', async () => {
+    const account = createMockAccount('acc-legacy-bind', 'legacy-bind@test.com');
+    const completeAffinityPlacement = vi.fn();
+    mockAccountLeaseService.acquireAttemptLease = vi.fn().mockResolvedValue({
+      account,
+      generation: 3,
+      tableIncarnation: 7,
+      releaseReservation: vi.fn(),
+      completeAffinityPlacement,
+    });
+    mockAccountLeaseService.bindSession = vi.fn().mockReturnValue(false);
+
+    vi.spyOn(gateway as any, 'executeUpstreamCall').mockResolvedValueOnce({
+      statusCode: 200,
+      headers: { 'content-type': 'application/json' },
+      bodyStream: createMockStream(['{"candidates":[{"content":{"parts":[{"text":"legacy response"}]}}]}']),
+    });
+
+    const req = createMockRequest({
+      headers: { 'x-session-id': 'session-legacy-bind-race', host: 'daily-cloudcode-pa.googleapis.com' },
+      body: JSON.stringify({ model: 'gemini-2.5-pro' }),
+    });
+    const res = createMockResponse();
+
+    await gateway.handleRequest(req, res);
+
+    expect(mockAccountLeaseService.bindSession).toHaveBeenCalledTimes(1);
+    expect(mockAccountLeaseService.bindSession).toHaveBeenCalledWith(
+      'session:session-legacy-bind-race', account.id, undefined, 3, 7,
+    );
+    expect(res.writeHead).toHaveBeenCalledWith(200, expect.anything());
+    expect(res.write.mock.calls.map(([chunk]: [unknown]) => Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)).join(''))
+      .toContain('legacy response');
+    expect(res.writableEnded).toBe(true);
+    expect(completeAffinityPlacement).toHaveBeenCalledTimes(1);
+    expect(completeAffinityPlacement).toHaveBeenCalledWith('aborted');
+  });
+
   it('falls back to pool-wide lease acquisition if affinity lease returns null', async () => {
     const account2 = createMockAccount('acc-fallback', 'fallback@test.com');
     // First call with sessionKey returns null; second call without sessionKey returns fallback lease

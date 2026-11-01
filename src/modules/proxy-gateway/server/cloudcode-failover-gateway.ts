@@ -838,10 +838,7 @@ export class CloudCodeFailoverGateway {
                       return;
                     }
                     logger.warn(`[CloudCodeGateway] Session confirmation not committed (${safeAffinityCommitRejectionReason(commitResult)}); proceeding with valid upstream response`);
-                    const currentBinding = this.accountLeaseService.getSessionBinding?.(sessionKey);
-                    if (!currentBinding || currentBinding.accountId !== account.id) {
-                      try { this.accountLeaseService.bindSession?.(sessionKey, account.id); } catch { /* ignore */ }
-                    }
+                    activeCompleteAffinityPlacement?.('aborted'); activeCompleteAffinityPlacement = undefined;
                   }
                 } else if (typeof this.accountLeaseService?.bindSession === 'function') {
                   const bound = expectedIncarnation !== undefined
@@ -855,7 +852,7 @@ export class CloudCodeFailoverGateway {
                       return;
                     }
                     logger.warn('[CloudCodeGateway] Session binding race not won; proceeding with valid upstream response');
-                    try { this.accountLeaseService.bindSession(sessionKey, account.id); } catch { /* ignore */ }
+                    activeCompleteAffinityPlacement?.('aborted'); activeCompleteAffinityPlacement = undefined;
                   }
                 }
               }

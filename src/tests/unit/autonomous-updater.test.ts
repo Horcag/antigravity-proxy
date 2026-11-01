@@ -20,6 +20,21 @@ describe('autonomous system updater', () => {
     expect(client).not.toContain('install-systemd.sh');
   });
 
+  it('routes apply-fix through the atomic updater without mutating installed releases', () => {
+    const temporary = mkdtempSync(join(tmpdir(), 'agp-apply-fix-'));
+    try {
+      mkdirSync(join(temporary, 'scripts'));
+      copyFileSync(join(root, 'apply-fix.sh'), join(temporary, 'apply-fix.sh'));
+      writeFileSync(join(temporary, 'scripts/update-systemd.sh'),
+        '#!/bin/sh\nprintf "updater:%s\\n" "$*"\nexit 37\n', { mode: 0o755 });
+      const result = spawnSync('bash', [join(temporary, 'apply-fix.sh'), 'unexpected'], { encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(37);
+      expect(result.stdout).toBe('updater:unexpected\n');
+    } finally {
+      rmSync(temporary, { recursive: true, force: true });
+    }
+  });
+
   it('serializes the entire snapshot, build, and publication transaction', () => {
     const launcher = readFileSync(join(root, 'scripts/autonomous-update-launcher.sh'), 'utf8');
     expect(launcher).toContain('/usr/bin/flock -n -o /run/lock/antigravity-proxy-autonomous-update.lock');
