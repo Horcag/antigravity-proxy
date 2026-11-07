@@ -424,7 +424,7 @@ export class CloudCodeFailoverGateway {
                   logger.warn('[CloudCodeGateway] Failed to record account error health effect: health_effect_failed');
                 });
               } else if (decision.healthEffect.kind === 'credential-rejected') {
-                this.accountLeaseService.markAsForbidden?.(account.id);
+                this.accountLeaseService.markAsForbidden?.(account.id, failureEvidence.ruleId === 'google.tos.violation' ? 'tos_violation' : 'forbidden');
               } else if (decision.healthEffect.kind === 'model-unrequestable') {
                 this.accountLeaseService.markModelUnrequestable?.(account.id, decision.healthEffect.effectiveModel);
               }

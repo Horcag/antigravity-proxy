@@ -277,6 +277,12 @@ export class AccountLeaseQuotaRefreshPolicy {
       this.accountFailureCooldownUntil.delete(accountId);
       return true;
     } catch (error) {
+      if (error instanceof Error && (error.message === 'TOS_VIOLATION' || error.message.includes('TOS_VIOLATION'))) {
+        this.options.logger.warn(`Account ${accountId} marked expired due to TOS_VIOLATION`, error);
+        void this.options.accountStore.updateStatus?.(accountId, 'expired', 'tos_violation');
+        this.options.getTokenCache().delete(accountId);
+        return false;
+      }
       if (isQuotaAuthError(error)) {
         try {
           const refreshedAfterAuthFailure = await this.options.hydrateTokenAfterAuthFailure(

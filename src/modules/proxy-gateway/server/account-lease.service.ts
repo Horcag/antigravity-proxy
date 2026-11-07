@@ -197,12 +197,8 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   private get rateLimitTracker(): RateLimitTracker {
     return this.limitPolicy.getRateLimitTracker();
   }
-  private get shadowComparisonCount(): number {
-    return this.selectionPolicy.getShadowComparisonCount();
-  }
-  private get noGoBlocked(): boolean {
-    return this.selectionPolicy.isNoGoBlocked();
-  }
+  private get shadowComparisonCount(): number { return this.selectionPolicy.getShadowComparisonCount(); }
+  private get noGoBlocked(): boolean { return this.selectionPolicy.isNoGoBlocked(); }
   async onModuleInit() {
     await ProductionOwnerGate.acquireExclusiveOwnership();
     await this.loadAccounts();
@@ -422,17 +418,15 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   recordParityError(): void {
     this.selectionPolicy.recordParityError(this.configPolicy.getSelectionConfig(), this.logger);
   }
-  setPreferredAccount(accountId?: string): void {
-    this.configPolicy.setPreferredAccount(accountId);
-  }
-  isRateLimited(accountIdOrEmail: string, model?: string): boolean {
-    return this.limitPolicy.isRateLimited(accountIdOrEmail, model);
-  }
-  markAsRateLimited(accountIdOrEmail: string) {
-    this.limitPolicy.markAsRateLimited(accountIdOrEmail);
-  }
-  markAsForbidden(accountIdOrEmail: string) {
+  setPreferredAccount(accountId?: string): void { this.configPolicy.setPreferredAccount(accountId); }
+  isRateLimited(accountIdOrEmail: string, model?: string): boolean { return this.limitPolicy.isRateLimited(accountIdOrEmail, model); }
+  markAsRateLimited(accountIdOrEmail: string) { this.limitPolicy.markAsRateLimited(accountIdOrEmail); }
+  markAsForbidden(accountIdOrEmail: string, reason?: string) {
     this.limitPolicy.markAsForbidden(accountIdOrEmail);
+    if (reason === 'tos_violation') {
+      const id = this.resolveAccountId(accountIdOrEmail);
+      if (id) { void this.accountStore.updateStatus?.(id, 'expired', 'tos_violation'); this.tokens.delete(id); }
+    }
   }
   public getBreakerGeneration(accountId: string): number {
     return this.accountBreakerGenerations.get(accountId) ?? 0;

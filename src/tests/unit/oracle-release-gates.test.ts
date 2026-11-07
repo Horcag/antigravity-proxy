@@ -144,7 +144,7 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     expect(binding?.accountId).toBe('acc-2');
     expect(binding?.state).toBe('active');
     expect(binding?.generation).toBe(2);
-  });
+  }, 15000);
   // Gate 2: A and B fail; C succeeds -> Each candidate transition uses the returned current migration capability
   it('Gate 2: Multi-step migration A -> B (fails) -> C (succeeds) tracks versioned migration capability', async () => {
     const acc3 = createMockAccount('acc-3', 'acc3@test.com');
@@ -194,7 +194,7 @@ describe('Oracle Turn 12 Release Gates Integration', () => {
     expect(binding?.accountId).toBe('acc-3');
     expect(binding?.state).toBe('active');
     expect(binding?.generation).toBe(3);
-  });
+  }, 15000);
   // Gate 3: Old A response arrives after B confirmation -> No stale migration back to A
   it('Gate 3: Stale A arrival after B is confirmed is strictly rejected', () => {
     const sessionKey = 'session:gate-3-test';

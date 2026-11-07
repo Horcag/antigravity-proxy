@@ -282,9 +282,7 @@ interface ProjectContext {
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function buildInternalApiHeaders(accessToken: string): Record<string, string> {
@@ -751,6 +749,13 @@ export class GoogleAPIService {
           break;
         } else {
           lastError = toSafeHttpError(response.status);
+          if (response.status === 403) {
+            const errBody = await response.text().catch(() => '');
+            if (errBody.includes('TOS_VIOLATION') || errBody.includes('violation of Terms of Service')) {
+              logger.error(`[GoogleAPIService] Account ToS violation detected at ${endpoint}`);
+              throw new Error('TOS_VIOLATION');
+            }
+          }
           if (endpoint === URLS.LOAD_PROJECT && response.status === 429) {
             logger.warn(
               '[GoogleAPIService] Prod loadCodeAssist returned 429, falling back to sandbox endpoint',
@@ -759,6 +764,7 @@ export class GoogleAPIService {
           }
         }
       } catch (error) {
+        if (error instanceof Error && error.message === 'TOS_VIOLATION') throw error;
         lastError = toSafeRequestError(error);
         logger.warn(
           `[GoogleAPIService] Project context request failed at endpoint #${endpoints.indexOf(endpoint) + 1}: ${lastError.message}`,
@@ -848,26 +854,16 @@ export class GoogleAPIService {
 
     for (const [modelName, modelInfoRaw] of Object.entries(data.models || {})) {
       const modelQuota = toModelQuotaInfo(modelName, modelInfoRaw);
-      if (modelQuota) {
-        result.models[modelName] = modelQuota;
-      }
+      if (modelQuota) result.models[modelName] = modelQuota;
     }
 
     const modelForwardingRules = toModelForwardingRules(data.deprecatedModelIds);
-    if (modelForwardingRules) {
-      result.model_forwarding_rules = modelForwardingRules;
-    }
-
+    if (modelForwardingRules) result.model_forwarding_rules = modelForwardingRules;
     return result;
   }
 
-  private static shouldFallbackQuotaEndpoint(status: number): boolean {
-    return status === 429 || status >= 500;
-  }
-
-  private static isPermanentQuotaHttp4xx(errorMsg: string): boolean {
-    return /^HTTP 4\d{2}\b/.test(errorMsg) && !errorMsg.startsWith('HTTP 429');
-  }
+  private static shouldFallbackQuotaEndpoint(status: number): boolean { return status === 429 || status >= 500; }
+  private static isPermanentQuotaHttp4xx(errorMsg: string): boolean { return /^HTTP 4\d{2}\b/.test(errorMsg) && !errorMsg.startsWith('HTTP 429'); }
 
   /**
    * Core logic: Fetches detailed model quota information.
@@ -877,6 +873,7 @@ export class GoogleAPIService {
     try {
       projectContext = await this.fetchProjectContext(accessToken, proxyUrl);
     } catch (error) {
+      if (error instanceof Error && error.message === 'TOS_VIOLATION') throw error;
       logger.warn(
         '[GoogleAPIService] Project context unavailable; continuing quota lookup without project',
         toSafeRequestError(error).message,
@@ -984,7 +981,7 @@ export class GoogleAPIService {
           const errorMsg = lastError.message;
 
           // Abort retries for auth errors
-          if (errorMsg === 'FORBIDDEN' || errorMsg === 'UNAUTHORIZED') {
+          if (errorMsg === 'FORBIDDEN' || errorMsg === 'UNAUTHORIZED' || errorMsg === 'TOS_VIOLATION') {
             throw error;
           }
 

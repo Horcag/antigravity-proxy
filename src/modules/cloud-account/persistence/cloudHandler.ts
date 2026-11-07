@@ -201,4 +201,14 @@ export class CloudAccountRepo {
     statement.run(lastUsed, accountId);
     return true;
   }
+
+  static async updateStatus(
+    accountId: string,
+    status: CloudAccount['status'],
+    statusReason?: string,
+  ): Promise<void> {
+    this.getDatabase()
+      .prepare('UPDATE accounts SET status = ?, status_reason = ? WHERE id = ?')
+      .run(status, statusReason ?? null, accountId);
+  }
 }
