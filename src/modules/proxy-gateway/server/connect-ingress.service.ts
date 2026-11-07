@@ -384,10 +384,13 @@ export class ConnectIngressService {
       }
       // Prefer IPv4 addresses: WSL2 often has broken IPv6 connectivity
       const sorted = [...allowedAddresses].sort((a, b) => a.family - b.family);
-      const CONNECT_TIMEOUT_MS = 5000;
+      const CONNECT_TIMEOUT_MS = 3000;
+      const MAX_TOTAL_CONNECT_MS = 6000;
+      const connectStartTime = Date.now();
       const TUNNEL_IDLE_TIMEOUT_MS = 60000;
       const tryConnect = (index: number) => {
-        if (index >= sorted.length || this.isClosed || clientClosed || clientSocket.destroyed || clientSocket.closed) {
+        const elapsed = Date.now() - connectStartTime;
+        if (index >= sorted.length || elapsed >= MAX_TOTAL_CONNECT_MS || this.isClosed || clientClosed || clientSocket.destroyed || clientSocket.closed) {
           if (!clientSocket.destroyed && !clientSocket.closed) {
             clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
             clientSocket.destroy();
@@ -439,7 +442,8 @@ export class ConnectIngressService {
           }
         });
 
-        upstreamSocket.setTimeout(CONNECT_TIMEOUT_MS);
+        const remainingConnectTime = Math.max(500, MAX_TOTAL_CONNECT_MS - (Date.now() - connectStartTime));
+        upstreamSocket.setTimeout(Math.min(CONNECT_TIMEOUT_MS, remainingConnectTime));
         upstreamSocket.on('timeout', () => {
           if (!connected) {
             logger.debug(`[ConnectIngress] Upstream connect timeout for ${destination} (${verifiedIp})`);
