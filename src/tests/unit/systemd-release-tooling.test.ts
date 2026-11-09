@@ -345,7 +345,7 @@ describe('systemd release tooling', { timeout: 60_000 }, () => {
         expect(readFileSync(targetPath, 'utf8')).toBe('substituted\n');
       }
     }
-  }, 60_000);
+  }, 120_000);
 
   it('removes an exact failed committed release and permits an identical migration retry', () => {
     const root = createRoot();

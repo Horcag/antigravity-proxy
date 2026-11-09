@@ -163,6 +163,25 @@ async function run(parsed: ParsedArgs): Promise<void> {
     return;
   }
 
+  if (primary === 'migration' && secondary === 'import-easycli') {
+    if (!getBooleanOption(options, 'stdin') || options.file) {
+      throw new Error('Usage: antigravity-proxy migration import-easycli --stdin');
+    }
+    try {
+      const { importEasyCliPayload } = await import('@/migration/easycli-import');
+      let payload: unknown;
+      try {
+        payload = JSON.parse(await readStdin());
+      } catch {
+        throw new Error('EasyCLI migration input must be valid JSON');
+      }
+      writeJson(await importEasyCliPayload(payload));
+    } finally {
+      CloudAccountRepo.close();
+    }
+    return;
+  }
+
   if (primary === 'health') {
     const response = await fetch(`${resolveBaseUrl(options)}/health`);
     writeJson(await response.json());
@@ -335,6 +354,7 @@ async function run(parsed: ParsedArgs): Promise<void> {
       '  antigravity-proxy status [--admin-key key] [--url http://127.0.0.1:8045]',
       '  antigravity-proxy accounts list|import|export|remove|reload|refresh-quota|quota-diagnostics',
       '  antigravity-proxy accounts preferred get|set|clear',
+      '  antigravity-proxy migration import-easycli --stdin',
       '  antigravity-proxy oauth url|exchange',
       '  antigravity-proxy ide status|patch|unpatch [--dir <path>]',
     ].join('\n'),

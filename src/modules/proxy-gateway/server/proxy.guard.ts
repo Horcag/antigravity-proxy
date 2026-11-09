@@ -8,8 +8,8 @@ import {
 import { getServerConfig } from '../../../server/server-config';
 import {
   extractApiKeyToken,
-  hasConfiguredApiKey,
-  hasMatchingApiKey,
+  isProxyApiKeyConfigured,
+  hasMatchingProxyApiKey,
   RequestHeaders,
 } from './guards/api-key-auth.util';
 
@@ -22,18 +22,14 @@ export class ProxyGuard implements CanActivate {
 
     const config = getServerConfig();
 
-    // 1. Check for API Key in config
-    const apiKey = config?.api_key;
-
     const headers = request.headers as RequestHeaders;
     const clientToken = extractApiKeyToken(headers);
 
-    // 2. Bypass if no api_key set (Open Mode) or config missing
-    if (!hasConfiguredApiKey(apiKey)) {
+    if (!isProxyApiKeyConfigured(config)) {
       return true;
     }
 
-    if (hasMatchingApiKey(clientToken, apiKey)) {
+    if (hasMatchingProxyApiKey(config, clientToken)) {
       return true;
     }
     this.logger.warn(`Rejected unauthorized request from ${request.ip}`);

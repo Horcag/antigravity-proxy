@@ -28,7 +28,7 @@ export interface ProxyTokenRetryState {
 export interface ProxyRetryAccountLeaseService {
   getNextToken(options?: RetryTokenOptions): Promise<CloudAccount | null>;
   recordParityError(): void;
-  markAsForbidden(accountIdOrEmail: string): void;
+  markAsForbidden(accountIdOrEmail: string, reason?: string): void;
   markAsRateLimited(accountIdOrEmail: string): void;
   markFromUpstreamError(params: {
     accountIdOrEmail: string;

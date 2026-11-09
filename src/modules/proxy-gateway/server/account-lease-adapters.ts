@@ -29,6 +29,11 @@ export interface AccountLeaseAccountStore {
     lastUsed: number,
     isCurrent: () => boolean,
   ): boolean;
+  updateStatus?(
+    accountId: string,
+    status: CloudAccount['status'],
+    statusReason?: string,
+  ): Promise<void> | void;
 }
 
 export interface AccountLeaseUpstream {
@@ -57,6 +62,8 @@ export const cloudAccountStoreAdapter: AccountLeaseAccountStore = {
   updateLastUsed: (accountId, lastUsed) => CloudAccountRepo.updateLastUsed(accountId, lastUsed),
   updateLastUsedIfCurrent: (accountId, lastUsed, isCurrent) =>
     CloudAccountRepo.updateLastUsedIfCurrent(accountId, lastUsed, isCurrent),
+  updateStatus: (accountId, status, statusReason) =>
+    CloudAccountRepo.updateStatus(accountId, status, statusReason),
 };
 
 export const googleAccountLeaseUpstreamAdapter: AccountLeaseUpstream = {

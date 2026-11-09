@@ -47,9 +47,13 @@ function deriveTerminalHealthEffect(evidence: FailureEvidence, effectiveModel?: 
     case 'project-context':
       return { kind: 'project-capability-rejected' };
     case 'permission-denied':
-      return evidence.ruleId === 'google.location.unsupported-location'
-        ? { kind: 'rate-limited', isQuota: false }
-        : { kind: 'none' };
+      if (evidence.ruleId === 'google.location.unsupported-location') {
+        return { kind: 'rate-limited', isQuota: false };
+      }
+      if (evidence.ruleId === 'google.tos.violation') {
+        return { kind: 'credential-rejected' };
+      }
+      return { kind: 'none' };
     default:
       return { kind: 'none' };
   }
@@ -115,6 +119,12 @@ export function evaluateRetryDecision(params: EvaluateRetryParams): RetryDecisio
       };
 
     case 'permission-denied':
+      if (evidence.ruleId === 'google.tos.violation') {
+        return {
+          action: { kind: 'commit-error' },
+          healthEffect: { kind: 'credential-rejected' },
+        };
+      }
       return {
         action: hasAlternativeAccounts
           ? { kind: 'migrate-account', reason: 'permission-denied' }

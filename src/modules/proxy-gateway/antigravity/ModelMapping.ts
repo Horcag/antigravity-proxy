@@ -160,11 +160,30 @@ export function getPublicModelIdForDisplayName(displayName: unknown): string | u
   return PUBLIC_MODEL_BY_DISPLAY_NAME.get(displayName.trim().toLowerCase());
 }
 
+function collectCatalogModelIds(
+  customMapping: Record<string, string>,
+  dynamicModelIds?: Iterable<string>,
+  excludeImages = false,
+): Set<string> {
+  const liveModelIds = collectDynamicModelIds(dynamicModelIds);
+  const modelIds = new Set(liveModelIds);
+  for (const [alias, target] of Object.entries(customMapping)) {
+    const normalizedAlias = normalizeCatalogModelId(alias);
+    const normalizedTarget = normalizeGeminiModelAlias(target);
+    if (normalizedAlias && liveModelIds.has(normalizedTarget) &&
+      !isNonChatCatalogModelId(normalizedTarget) &&
+      !(excludeImages && isImageCatalogModelId(normalizedTarget))) {
+      modelIds.add(normalizedAlias);
+    }
+  }
+  return modelIds;
+}
+
 export function getAllDynamicModels(
-  _customMapping: Record<string, string> = {},
+  customMapping: Record<string, string> = {},
   dynamicModelIds?: Iterable<string>,
 ): string[] {
-  const modelIds = collectDynamicModelIds(dynamicModelIds);
+  const modelIds = collectCatalogModelIds(customMapping, dynamicModelIds);
   if (modelIds.size === 0) {
     return [];
   }
@@ -175,11 +194,11 @@ export function getAllDynamicModels(
 }
 
 export function getOpenAICompatibleModels(
-  _customMapping: Record<string, string> = {},
+  customMapping: Record<string, string> = {},
   dynamicModelIds?: Iterable<string>,
-  _anthropicMapping: Record<string, string> = {},
+  anthropicMapping: Record<string, string> = {},
 ): string[] {
-  const modelIds = collectDynamicModelIds(dynamicModelIds);
+  const modelIds = collectCatalogModelIds({ ...customMapping, ...anthropicMapping }, dynamicModelIds, true);
   if (modelIds.size === 0) {
     return [];
   }

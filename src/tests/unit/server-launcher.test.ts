@@ -2,13 +2,14 @@ import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import {
   isElfFile,
   generateServerWrapperContent,
   getAntigravityServerPatchStatus,
   patchAntigravityServer,
   unpatchAntigravityServer,
+  resolveLauncherConfig,
 } from '../../modules/proxy-gateway/server/cert/server-launcher';
 
 describe('server-launcher', () => {
@@ -22,7 +23,17 @@ describe('server-launcher', () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('uses the native technical listener by default while honoring an explicit configured listener', () => {
+    vi.stubEnv('AG_PROXY_PORT', '');
+    vi.stubEnv('AG_PROXY_HOST', '');
+    expect(resolveLauncherConfig().proxyUrl).toBe('http://127.0.0.1:8317');
+    expect(resolveLauncherConfig({ proxyPort: 18317 }).proxyUrl).toBe('http://127.0.0.1:18317');
+    vi.stubEnv('AG_PROXY_PORT', '19317');
+    expect(resolveLauncherConfig().proxyUrl).toBe('http://127.0.0.1:19317');
   });
 
   function createMockElfBinary(filePath: string): void {

@@ -16,6 +16,7 @@ import {
 } from '@nestjs/common';
 import { FastifyReply, FastifyRequest } from 'fastify';
 import { MultipartFile } from '@fastify/multipart';
+import { getRequestProject } from './request-project-context';
 import {
   isBoolean,
   isEmpty,
@@ -690,9 +691,8 @@ export class ProxyController {
   }> {
     const config = getServerConfig();
     return getOpenAICompatibleModels(
-      config?.custom_mapping ?? {},
+      { ...config?.custom_mapping, ...config?.anthropic_mapping, ...getRequestProject()?.model_mapping },
       this.accountLeaseService?.getAllCollectedModels(),
-      config?.anthropic_mapping ?? {},
     ).map((id) => ({
       id,
       object: 'model' as const,

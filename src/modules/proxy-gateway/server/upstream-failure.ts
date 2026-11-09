@@ -305,7 +305,21 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
       buildSafeErrorMessage('authentication', 'google.auth.invalid-credentials', rpc, statusCode, errorInfoReason), errorText, false);
   }
 
-  // 8. Location / Precondition / Permission Denied
+  // 8. Terms of Service Violation / Account Disabled
+  const isTosViolation =
+    errorInfoReason === 'TOS_VIOLATION' ||
+    ((statusCode === 403 || rpcStatus === 'PERMISSION_DENIED') && (
+      lowerText.includes('tos_violation') ||
+      lowerText.includes('violation of terms of service') ||
+      lowerText.includes('service has been disabled in this account for violation')
+    ));
+  if (isTosViolation) {
+    const rpc = rpcStatus || 'PERMISSION_DENIED';
+    return makeEvidence('permission-denied', 'google.tos.violation', source, statusCode, rpc,
+      buildSafeErrorMessage('permission-denied', 'google.tos.violation', rpc, statusCode, 'TOS_VIOLATION'), errorText, false, 'explicit');
+  }
+
+  // 9. Location / Precondition / Permission Denied
   const isLocation = errorInfoReason === 'LOCATION_NOT_SUPPORTED' ||
     ((rpcStatus === 'FAILED_PRECONDITION' || statusCode === 400) &&
       (lowerText.includes('location is not supported') || lowerText.includes('user location is not supported') || /location.*not.*supported/i.test(errorText)));

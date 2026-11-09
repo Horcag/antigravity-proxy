@@ -6,6 +6,8 @@ import zlib from 'node:zlib';
 import type { Readable } from 'node:stream';
 import { logger } from '../../../shared/logging/logger';
 import { getServerConfig } from '../../../server/server-config';
+import { observeNativeModel } from '../../../shared/request-observation';
+import { forwardNativeControlPlane, isNativeControlPlaneRequest } from './native-control-plane';
 import { AccountLeaseService } from './account-lease.service';
 import { CloudAccount } from '../../cloud-account/types';
 import { RateLimitReason } from './rate-limit-tracker';
@@ -105,6 +107,11 @@ export class CloudCodeFailoverGateway {
       return;
     }
     const targetHost = parsedAuthority.hostname;
+    if (isNativeControlPlaneRequest(method, urlPath)) {
+      receiptOwner.expectDownstreamCommit('validated_response');
+      await forwardNativeControlPlane(req, res, targetHost, urlPath);
+      return;
+    }
     const requestAbortController = new AbortController(), LOGICAL_REQUEST_DEADLINE_MS = (getServerConfig()?.request_timeout ?? 120) * 1000, affinityOwnerTimeoutMs = LOGICAL_REQUEST_DEADLINE_MS + 5000;
     const deadlineAt = Date.now() + LOGICAL_REQUEST_DEADLINE_MS;
     let logicalDeadlineTimer: NodeJS.Timeout | null = null;
@@ -214,6 +221,7 @@ export class CloudCodeFailoverGateway {
     }
     const parsedBody = preflight.parsedBody || null;
     const modelName = extractModelName(urlPath, parsedBody);
+    observeNativeModel(req, modelName);
     const requestedModel = modelName;
     const isReplaySafe = isReplaySafeOperation(method, urlPath, {
       hasAccountPinnedResources: preflight.hasAccountPinnedResources,
@@ -397,12 +405,13 @@ export class CloudCodeFailoverGateway {
         const handleFailureOutcome = async (
           failureEvidence: FailureEvidence, status: number, responseHeaders: http.IncomingHttpHeaders, responseBody?: Buffer,
         ): Promise<'continue' | 'terminal'> => {
+          const hasAlternatives = resolveHasAlternativeAccounts(this.accountLeaseService, account, attemptedAccountIds, attempt, maxAttempts);
           const decision = evaluateRetryDecision({
             evidence: failureEvidence, attempt, maxAttempts, downstreamCommitted: responseCommitted,
             isReplaySafe, ambiguityProbesUsed, maxAmbiguityProbes: 1,
             projectCorrectionsUsed: 0, maxProjectCorrections: 0,
             quotaHeaderMode,
-            hasAlternativeAccounts: resolveHasAlternativeAccounts(this.accountLeaseService, account, attemptedAccountIds, attempt, maxAttempts),
+            hasAlternativeAccounts: hasAlternatives,
             effectiveModel, transientRetriesUsed, maxTransientRetries: 1,
           });
 
@@ -423,7 +432,7 @@ export class CloudCodeFailoverGateway {
                   logger.warn('[CloudCodeGateway] Failed to record account error health effect: health_effect_failed');
                 });
               } else if (decision.healthEffect.kind === 'credential-rejected') {
-                this.accountLeaseService.markAsForbidden?.(account.id);
+                this.accountLeaseService.markAsForbidden?.(account.id, failureEvidence.ruleId === 'google.tos.violation' ? 'tos_violation' : 'forbidden');
               } else if (decision.healthEffect.kind === 'model-unrequestable') {
                 this.accountLeaseService.markModelUnrequestable?.(account.id, decision.healthEffect.effectiveModel);
               }
@@ -480,16 +489,10 @@ export class CloudCodeFailoverGateway {
           return 'terminal';
         };
 
+        const hasAlternatives = resolveHasAlternativeAccounts(this.accountLeaseService, account, attemptedAccountIds, attempt, maxAttempts);
         const upstreamResult = await this.executeUpstreamCall(
-          method,
-          attemptUrlPath,
-          upstreamHeaders,
-          payloadToSend,
-          targetHost,
-          (upReq) => {
-            currentUpstreamReq = upReq;
-          },
-          deadlineAt,
+          method, attemptUrlPath, upstreamHeaders, payloadToSend, targetHost,
+          (upReq) => { currentUpstreamReq = upReq; }, deadlineAt, hasAlternatives,
         );
         const { statusCode, headers, bodyStream, bufferedBody } = upstreamResult;
         currentUpstreamRes = bodyStream;
@@ -540,6 +543,7 @@ export class CloudCodeFailoverGateway {
         const firstChunkResult = await new Promise<{ buffer: Buffer | null; decision: ProtocolFrameDecision }>(
           (resolve, reject) => {
             let settled = false;
+            let firstChunkTimer: NodeJS.Timeout | null = null;
             const chunks: Buffer[] = [];
             let totalRawBytes = 0;
             let decompressedBytes = 0;
@@ -557,6 +561,7 @@ export class CloudCodeFailoverGateway {
               streamDecompressor = zlib.createBrotliDecompress();
             }
             const cleanup = () => {
+              if (firstChunkTimer) { clearTimeout(firstChunkTimer); firstChunkTimer = null; }
               bodyStream.removeListener('data', onData);
               bodyStream.removeListener('end', onEnd);
               bodyStream.removeListener('close', onClose);
@@ -744,6 +749,10 @@ export class CloudCodeFailoverGateway {
             bodyStream.once('error', onError);
             req.once?.('close', onClientClose);
             res.once?.('close', onClientClose);
+            const firstChunkTimeoutMs = Math.min(20000, Math.max(2000, deadlineAt - Date.now()));
+            firstChunkTimer = setTimeout(() => {
+              if (!settled) { settled = true; cleanup(); reject(new Error(`Upstream first chunk timeout after ${firstChunkTimeoutMs}ms`)); }
+            }, firstChunkTimeoutMs);
           },
         );
         if (clientAborted || res.destroyed) {
@@ -981,7 +990,7 @@ export class CloudCodeFailoverGateway {
           return;
         }
         logger.warn(
-          `[CloudCodeGateway] Upstream network error: operation=upstream_request reason=network_error attempt=${attempt}/${maxAttempts}`,
+          `[CloudCodeGateway] Upstream network error: operation=upstream_request reason=network_error attempt=${attempt}/${maxAttempts} error=${err instanceof Error ? err.message : String(err)}`,
         );
         if (attempt === maxAttempts) {
           const anyRes = res as any;
@@ -1029,18 +1038,6 @@ export class CloudCodeFailoverGateway {
     if (typeof anyRes.writeHead === 'function') {
       anyRes.writeHead(statusCode, responseHeaders);
     }
-  }
-  private isQuotaErrorText(text?: string): boolean {
-    if (!text) return false;
-    const lower = text.toLowerCase();
-    if (lower.includes('quota project') || lower.includes('serviceusage')) return false;
-    return (
-      lower.includes('quota') ||
-      lower.includes('resource_exhausted') ||
-      lower.includes('rate limit') ||
-      lower.includes('credit') ||
-      lower.includes('429')
-    );
   }
   private classifyParsedEnvelope(
     parsed: any,
@@ -1398,6 +1395,7 @@ export class CloudCodeFailoverGateway {
     upstreamHost: string,
     onReqCreated?: (req: http.ClientRequest) => void,
     deadlineAt?: number,
+    hasAlternativeAccounts: boolean = false,
   ): Promise<{
     statusCode: number;
     headers: http.IncomingHttpHeaders;
@@ -1411,7 +1409,11 @@ export class CloudCodeFailoverGateway {
         reject(new Error('Upstream attempt deadline exceeded before start'));
         return;
       }
-      const attemptTimeoutMs = Math.min(60000, remainingDeadlineMs);
+      // When alternative accounts are available in the pool, fail fast on hanging upstream (20s)
+      // to allow attempting other accounts before logical request deadline (120s) expires.
+      // If no alternatives, allow slightly longer (35s) but still bounded.
+      const defaultAttemptTimeoutMs = hasAlternativeAccounts ? 20000 : 35000;
+      const attemptTimeoutMs = Math.min(defaultAttemptTimeoutMs, remainingDeadlineMs);
       const options: https.RequestOptions = {
         hostname: upstreamHost,
         port: 443,
@@ -1420,15 +1422,8 @@ export class CloudCodeFailoverGateway {
         headers,
         timeout: 60000, // Inactivity timeout on socket
       };
-      let settled = false;
-      let deadlineTimer: NodeJS.Timeout | null = null;
-      let upstreamResRef: http.IncomingMessage | null = null;
-      const cleanupCall = () => {
-        if (deadlineTimer) {
-          clearTimeout(deadlineTimer);
-          deadlineTimer = null;
-        }
-      };
+      let settled = false, deadlineTimer: NodeJS.Timeout | null = null, upstreamResRef: http.IncomingMessage | null = null;
+      const cleanupCall = () => { if (deadlineTimer) { clearTimeout(deadlineTimer); deadlineTimer = null; } };
       const upstreamReq = https.request(options, (upstreamRes) => {
         upstreamResRef = upstreamRes;
         const statusCode = upstreamRes.statusCode || 200;
@@ -1479,12 +1474,10 @@ export class CloudCodeFailoverGateway {
           });
         } else {
           // Success status: stream directly
-          // Do not clear deadlineTimer here: allow it to protect body stream trickling!
+          // Response headers arrived - clear attempt deadline timer so streaming is not aborted!
           if (settled) return;
           settled = true;
-          upstreamRes.once('end', cleanupCall);
-          upstreamRes.once('close', cleanupCall);
-          upstreamRes.once('error', cleanupCall);
+          cleanupCall();
           resolve({
             statusCode,
             headers: upstreamRes.headers,
