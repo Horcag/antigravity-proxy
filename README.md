@@ -334,7 +334,7 @@ Back up the destination configuration and encrypted database before migration: c
 and account updates use separate persistence operations. Do not store the payload in Git.
 
 Native login/setup operations preserve the caller's original OAuth and project and work
-without a generation pool. Native audio uses an HTTP/2 duplex connection for the exact
-Antigravity audio RPC, with one account lease held for the stream and no replay. Explicit
+without a generation pool. Native audio keeps its original Google authorization and
+unmodified TLS tunnel; it requires a valid native sign-in, independently of the generation pool. Explicit
 ToS suspension stops the request and excludes that credential; it does not trigger a
 cross-account retry. These safeguards do not establish immunity from provider restrictions.

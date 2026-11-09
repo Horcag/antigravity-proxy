@@ -22,7 +22,8 @@ describe('CaManager', () => {
     // Non-cloudcode-pa endpoints and unverified services are left outside interception (T10-F06)
     expect(CaManager.isTargetHost('generativelanguage.googleapis.com:443')).toBe(false);
     expect(CaManager.isTargetHost('businessaicode.googleapis.com:443')).toBe(false);
-    expect(CaManager.isTargetHost('aicode.googleapis.com:443')).toBe(true);
+    // Native audio keeps its original OAuth and TLS stream outside account substitution.
+    expect(CaManager.isTargetHost('aicode.googleapis.com:443')).toBe(false);
     expect(CaManager.isTargetHost('aiplatform.googleapis.com:443')).toBe(false);
     // Rejects attacker and unauthorized domains (Probe C25)
     expect(CaManager.isTargetHost('aicode.attacker.invalid:443')).toBe(false);

@@ -10,7 +10,6 @@ import { CloudCodeFailoverGateway, GatewayReceiptTransferError } from './cloudco
 import { AnonymousTransportReceiptOwner } from './anonymous-transport-receipt';
 import { AccountLeaseService } from './account-lease.service';
 import { observeNativeRequest } from '../../../dashboard/native-request-journal';
-import { NativeBidiGateway, NATIVE_AUDIO_HOST } from './native-bidi-gateway';
 import { parseConnectAuthority } from './connect-authority';
 export { parseConnectAuthority };
 export type { ParsedConnectAuthority } from './connect-authority';
@@ -162,10 +161,8 @@ export class ConnectIngressService {
   private reservedSockets = 0;
   private pendingRequests = 0;
   private isClosed = false;
-  private readonly nativeBidiGateway: NativeBidiGateway;
   constructor(accountLeaseService?: AccountLeaseService, private readonly admission: ReleaseAdmission = releaseAdmission()) {
     this.failoverGateway = new CloudCodeFailoverGateway(accountLeaseService);
-    this.nativeBidiGateway = new NativeBidiGateway(accountLeaseService);
   }
   attach(httpServer: http.Server): void {
     this.isClosed = false;
@@ -185,10 +182,7 @@ export class ConnectIngressService {
       (req, res) => {
         observeNativeRequest(req, res);
         this.pendingRequests++;
-        const nativeAuthority = String(req.headers[':authority'] ?? req.headers.host ?? '').toLowerCase();
-        const gateway = nativeAuthority === NATIVE_AUDIO_HOST || nativeAuthority === `${NATIVE_AUDIO_HOST}:443`
-          ? this.nativeBidiGateway : this.failoverGateway;
-        const admitted = this.admission.runResponse(res, () => gateway.handleRequest(req, res).catch((err: unknown) => {
+        const admitted = this.admission.runResponse(res, () => this.failoverGateway.handleRequest(req, res).catch((err: unknown) => {
           logger.error(formatSafeEvent('connect_ingress_gateway_failure', {
             classification: err instanceof GatewayReceiptTransferError ? 'receipt_transfer' : 'gateway_failure',
           }, ['classification']));
