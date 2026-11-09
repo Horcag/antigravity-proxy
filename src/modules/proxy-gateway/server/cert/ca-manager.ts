@@ -14,7 +14,6 @@ export const TARGET_CLOUDCODE_HOSTS = [
   'daily-cloudcode-pa.sandbox.googleapis.com',
   'autopush-cloudcode-pa.sandbox.googleapis.com',
   'preprod-daily-cloudcode-pa.sandbox.googleapis.com',
-  'aicode.googleapis.com',
 ] as const;
 
 export const ALLOWED_TARGET_HOSTS = new Set<string>(TARGET_CLOUDCODE_HOSTS);
