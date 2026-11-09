@@ -166,7 +166,7 @@ test('request labels distinguish known service calls, inference and unknown hist
   );
   assert.equal(
     requestModelLabel({ route: 'other', requested_model: null, effective_model: null }),
-    'Историческая запись: операция не сохранена'
+    'Операция не сохранена'
   );
 });
 

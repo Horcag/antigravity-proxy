@@ -117,7 +117,7 @@ export function statisticsTraffic(
 
 export function requestModelLabel(request: RequestEntry): string {
   if (request.route === 'other' && !request.requested_model && !request.effective_model)
-    return 'Историческая запись: операция не сохранена';
+    return 'Операция не сохранена';
   if (request.request_kind === 'service') return 'Служебный запрос';
   return `${request.requested_model ?? 'Не измерена'} → ${request.effective_model ?? 'Не измерена'}`;
 }
