@@ -1,0 +1,364 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { AxiosError } from 'axios';
+import { createServer } from 'vite';
+
+const originalWindow = globalThis.window;
+globalThis.window = new EventTarget();
+
+const vite = await createServer({
+  appType: 'custom',
+  logLevel: 'silent',
+  server: { middlewareMode: true },
+});
+
+const [{ apiClient, ltsExtensionClient }, { parseApiErrorResponse }, versionUtils] = await Promise.all([
+  vite.ssrLoadModule('/src/services/api/client.ts'),
+  vite.ssrLoadModule('/src/services/api/apiError.ts'),
+  vite.ssrLoadModule('/src/utils/version.ts'),
+]);
+
+const unauthorizedError = (config, data) =>
+  new AxiosError('Request failed with status code 401', 'ERR_BAD_REQUEST', config, null, {
+    data,
+    status: 401,
+    statusText: 'Unauthorized',
+    headers: {},
+    config,
+  });
+
+test('reasoning effort capability is read from the current Core and cleared by an older config response', async () => {
+  const observed = [];
+  const listener = (event) => observed.push(event.detail.supported);
+  window.addEventListener('server-reasoning-effort-policy-update', listener);
+  try {
+    apiClient.setConfig({ apiBase: 'https://policy.example.test', managementKey: 'synthetic' });
+    await apiClient.get('/config.yaml', { adapter: async (config) => ({ data: 'config-version: 8', status: 200, statusText: 'OK', headers: { 'x-cpa-reasoning-effort-policy': '1' }, config }) });
+    assert.equal(observed.at(-1), true);
+    await apiClient.get('/config.yaml', { adapter: async (config) => ({ data: 'config-version: 8', status: 200, statusText: 'OK', headers: {}, config }) });
+    assert.equal(observed.at(-1), false);
+  } finally {
+    window.removeEventListener('server-reasoning-effort-policy-update', listener);
+  }
+});
+
+test('switch preparation blocks new writes and tracks in-flight mutations until completion', async () => {
+  const lifecycle = await vite.ssrLoadModule('/src/services/connectionSession.ts');
+  apiClient.setConfig({ apiBase: 'https://test.example.test', managementKey: 'synthetic' });
+  let finish;
+  const pending = apiClient.put('/config', {}, { adapter: (config) => new Promise((resolve) => {
+    finish = () => resolve({ data: {}, status: 200, statusText: 'OK', headers: {}, config });
+  }) });
+  assert.equal(lifecycle.hasActiveWrites(), true);
+  lifecycle.setSessionFrozen(true);
+  try {
+    await assert.rejects(apiClient.post('/config', {}, { adapter: () => { throw new Error('must not reach network'); } }), /Connection switch/);
+    finish();
+    await pending;
+    assert.equal(lifecycle.hasActiveWrites(), false);
+  } finally {
+    lifecycle.setSessionFrozen(false);
+  }
+});
+
+test('read-only usage POST queries neither block a switch nor become frozen writes', async () => {
+  const lifecycle = await vite.ssrLoadModule('/src/services/connectionSession.ts');
+  apiClient.setConfig({ apiBase: 'https://test.example.test', managementKey: 'synthetic' });
+  const response = (config) => ({ data: {}, status: 200, statusText: 'OK', headers: {}, config });
+  for (const path of ['/usage/query/summary', '/usage/query/details', '/usage/query/pricing', '/usage/query/analytics']) {
+    let finish;
+    const pending = apiClient.post(path, {}, { adapter: (config) => new Promise(resolve => { finish = () => resolve(response(config)); }) });
+    try {
+      assert.equal(lifecycle.hasActiveWrites(), false, path);
+      lifecycle.setSessionFrozen(true);
+      await apiClient.post(path, {}, { adapter: async (config) => response(config) });
+      assert.equal(lifecycle.hasActiveWrites(), false);
+    } finally {
+      finish();
+      await pending;
+      lifecycle.setSessionFrozen(false);
+    }
+  }
+  lifecycle.setSessionFrozen(true);
+  try {
+    for (const path of ['/usage/import', '/usage/query/unknown', '/usage/query/summary/extra']) {
+      await assert.rejects(apiClient.post(path, {}, { adapter: async (config) => response(config) }), /Connection switch/);
+    }
+    await assert.rejects(apiClient.put('/usage/query/summary', {}, { adapter: async (config) => response(config) }), /Connection switch/);
+  } finally { lifecycle.setSessionFrozen(false); }
+});
+
+test.after(async () => {
+  apiClient.clearConfig();
+  await vite.close();
+  if (originalWindow === undefined) {
+    delete globalThis.window;
+  } else {
+    globalThis.window = originalWindow;
+  }
+});
+
+test('binds connection details when the request is created', async () => {
+  const initialGeneration = apiClient.setConfig({
+    apiBase: 'https://old-core.example.test',
+    managementKey: 'old-management-key',
+  });
+
+  let capturedConfig;
+  const pending = apiClient.get('/probe', {
+    adapter: async (config) => {
+      capturedConfig = config;
+      return {
+        data: { ok: true },
+        status: 200,
+        statusText: 'OK',
+        headers: {},
+        config,
+      };
+    },
+  });
+
+  apiClient.setConfig({
+    apiBase: 'https://new-core.example.test',
+    managementKey: 'new-management-key',
+  });
+
+  await pending;
+
+  assert.equal(capturedConfig.baseURL, 'https://old-core.example.test/v8/management');
+  assert.equal(capturedConfig.headers.get('Authorization'), 'Bearer old-management-key');
+  assert.equal(capturedConfig.__cpaConnectionGeneration, initialGeneration);
+});
+
+test('the LTS extension client shares connection state but targets /v0/management', async () => {
+  const generation = ltsExtensionClient.setConfig({
+    apiBase: 'https://core.example.test/v8/management',
+    managementKey: 'shared-key',
+  });
+  assert.equal(apiClient.getConnectionGeneration(), generation);
+  assert.equal(apiClient.getConnectionRevision(), generation);
+  const seen = [];
+  const adapter = async (config) => {
+    seen.push({ base: config.baseURL, auth: config.headers.get('Authorization') });
+    return { data: {}, status: 200, statusText: 'OK', headers: {}, config };
+  };
+  await apiClient.get('/config', { adapter });
+  await ltsExtensionClient.get('/usage', { adapter });
+  assert.deepEqual(seen, [
+    { base: 'https://core.example.test/v8/management', auth: 'Bearer shared-key' },
+    { base: 'https://core.example.test/v0/management', auth: 'Bearer shared-key' },
+  ]);
+  apiClient.clearConfig();
+  assert.equal(ltsExtensionClient.isCurrentConnection(generation), false);
+});
+
+test('raw LTS extension fetches (Flow SSE) target /v0/management, management targets /v8', async () => {
+  const { computeApiUrl, computeLtsExtensionApiUrl } = await vite.ssrLoadModule(
+    '/src/utils/connection.ts'
+  );
+  assert.equal(computeApiUrl('core.example.test:8317/v0/management'), 'http://core.example.test:8317/v8/management');
+  assert.equal(
+    computeLtsExtensionApiUrl('https://core.example.test/v8/management/'),
+    'https://core.example.test/v0/management'
+  );
+  assert.equal(computeLtsExtensionApiUrl(''), '');
+});
+
+test('prefers a human-readable Management API message and preserves the stable code', () => {
+  assert.deepEqual(
+    parseApiErrorResponse(
+      {
+        error: 'plugin_install_failed',
+        message: 'download plugin archive: 404 Not Found',
+      },
+      'Request failed with status code 502'
+    ),
+    {
+      message: 'download plugin archive: 404 Not Found',
+      apiCode: 'plugin_install_failed',
+    }
+  );
+  assert.deepEqual(parseApiErrorResponse({ error: 'invalid body' }, 'Bad Request'), {
+    message: 'invalid body',
+    apiCode: 'invalid body',
+  });
+  assert.deepEqual(
+    parseApiErrorResponse(
+      { error: { code: 'invalid_config', message: 'plugins-dir is invalid' } },
+      'Bad Request'
+    ),
+    {
+      message: 'plugins-dir is invalid',
+      apiCode: 'invalid_config',
+    }
+  );
+  assert.deepEqual(parseApiErrorResponse('upstream unavailable', 'Network Error'), {
+    message: 'upstream unavailable',
+  });
+  assert.deepEqual(parseApiErrorResponse({ error: null }, 'Network Error'), {
+    message: 'Network Error',
+    apiCode: undefined,
+  });
+});
+
+test('rejects placeholder versions and compares real CPA release versions', () => {
+  for (const placeholder of ['', ' unknown ', 'DEV', 'none', 'null', 'N/A', 'not set', 'unset']) {
+    assert.equal(versionUtils.normalizeReportedVersion(placeholder), null, placeholder);
+  }
+  assert.equal(versionUtils.normalizeReportedVersion(' v1-lts-0.0.29 '), 'v1-lts-0.0.29');
+  assert.equal(versionUtils.compareVersions('v1-lts-0.0.30', 'v1-lts-0.0.29'), 1);
+  assert.equal(versionUtils.compareVersions('v1-lts-0.0.29', 'v1-lts-0.0.29'), 0);
+  assert.equal(versionUtils.compareVersions('unknown', 'v1-lts-0.0.29'), null);
+});
+
+test('does not publish an unknown response header as the current CPA version', async () => {
+  let versionEvent;
+  const onVersion = (event) => {
+    versionEvent = event.detail;
+  };
+  window.addEventListener('server-version-update', onVersion);
+
+  try {
+    apiClient.setConfig({ apiBase: 'https://test.example.test', managementKey: 'synthetic' });
+    await apiClient.get('/version-placeholder', {
+      adapter: async (config) => ({
+        data: {},
+        status: 200,
+        statusText: 'OK',
+        headers: {
+          'x-cpa-version': 'unknown',
+          'x-cpa-build-date': '2026-09-20T09:08:24Z',
+        },
+        config,
+      }),
+    });
+    assert.deepEqual(versionEvent, {
+      version: null,
+      buildDate: '2026-09-20T09:08:24Z',
+      runtimeKind: 'cpa',
+    });
+  } finally {
+    window.removeEventListener('server-version-update', onVersion);
+  }
+});
+
+test('a stale 401 keeps its parsed error but cannot log out the current connection', async () => {
+  let releaseStaleRequest;
+  let unauthorizedEvents = 0;
+  const onUnauthorized = () => {
+    unauthorizedEvents += 1;
+  };
+  window.addEventListener('unauthorized', onUnauthorized);
+
+  try {
+    apiClient.setConfig({
+      apiBase: 'https://old-core.example.test',
+      managementKey: 'old-management-key',
+    });
+    const staleRequest = apiClient.get('/stale-401', {
+      adapter: (config) =>
+        new Promise((_, reject) => {
+          releaseStaleRequest = () =>
+            reject(
+              unauthorizedError(config, {
+                error: 'stale_unauthorized',
+                message: 'old connection expired',
+              })
+            );
+        }),
+    });
+
+    apiClient.setConfig({
+      apiBase: 'https://current-core.example.test',
+      managementKey: 'current-management-key',
+    });
+    assert.equal(typeof releaseStaleRequest, 'function');
+    releaseStaleRequest();
+
+    await assert.rejects(staleRequest, (error) => {
+      assert.equal(error.message, 'old connection expired');
+      assert.equal(error.status, 401);
+      assert.equal(error.apiCode, 'stale_unauthorized');
+      return true;
+    });
+    assert.equal(unauthorizedEvents, 0);
+
+    await assert.rejects(
+      apiClient.get('/current-401', {
+        adapter: async (config) => {
+          throw unauthorizedError(config, {
+            error: 'unauthorized',
+            message: 'current connection expired',
+          });
+        },
+      }),
+      (error) => {
+        assert.equal(error.message, 'current connection expired');
+        assert.equal(error.apiCode, 'unauthorized');
+        return true;
+      }
+    );
+    assert.equal(unauthorizedEvents, 1);
+  } finally {
+    window.removeEventListener('unauthorized', onUnauthorized);
+  }
+});
+
+test('captured OAuth cleanup stays on its original connection and late 401 cannot log out the replacement', async () => {
+  apiClient.setConfig({ apiBase: 'https://original.example.test', managementKey: 'synthetic-original' });
+  const captured = apiClient.captureConnection();
+  const generation = apiClient.setConfig({ apiBase: 'https://replacement.example.test', managementKey: 'synthetic-replacement' });
+  let unauthorized = 0;
+  const listener = () => unauthorized++;
+  window.addEventListener('unauthorized', listener);
+  try {
+    await assert.rejects(captured.delete('/oauth/session', { params: { state: 'synthetic-old-state' }, adapter: async (config) => {
+      assert.equal(config.baseURL, 'https://original.example.test/v8/management');
+      assert.equal(config.headers.Authorization, 'Bearer synthetic-original');
+      throw unauthorizedError(config, { error: 'expired' });
+    }}));
+    assert.equal(unauthorized, 0);
+    assert.equal(apiClient.getConnectionGeneration(), generation);
+  } finally { window.removeEventListener('unauthorized', listener); }
+});
+
+test('frozen connection allows only targeted OAuth session cleanup on the captured server', async () => {
+  const lifecycle = await vite.ssrLoadModule('/src/services/connectionSession.ts');
+  apiClient.setConfig({ apiBase: 'https://original.example.test', managementKey: 'synthetic-original' });
+  const captured = apiClient.captureConnection();
+  lifecycle.setSessionFrozen(true);
+  let calls = 0;
+  const adapter = async (config) => {
+    calls++;
+    assert.equal(config.baseURL, 'https://original.example.test/v8/management');
+    assert.equal(config.headers.Authorization, 'Bearer synthetic-original');
+    return { data: {status:'ok'}, status: 200, statusText: 'OK', headers: {}, config };
+  };
+  try {
+    await captured.delete('/oauth/session', {params:{state:'synthetic-state'},adapter});
+    for (const path of ['/credentials', '/config', '/oauth/session/extra']) {
+      await assert.rejects(captured.delete(path, {adapter}), /Connection switch/);
+    }
+    assert.equal(calls, 1);
+    assert.equal(lifecycle.hasActiveWrites(), false);
+  } finally { lifecycle.setSessionFrozen(false); }
+});
+
+
+test('deployed management.html detects its reverse proxy prefix without query or hash', async () => {
+  const { detectApiBaseFromLocation } = await vite.ssrLoadModule('/src/utils/connection.ts');
+  const previous = window.location;
+  try {
+    for (const [url, expected] of [
+      ['https://test.example/uat/management.html?view=1#/login','https://test.example/uat'],
+      ['http://localhost:8317/team/dev/management.html#/config','http://localhost:8317/team/dev'],
+      ['http://localhost:8317/management.html','http://localhost:8317'],
+      ['http://localhost:5173/index.html','http://localhost:5173'],
+      ['file:///tmp/management.html',''],
+      ['about:blank',''],
+    ]) {
+      window.location = new URL(url);
+      assert.equal(detectApiBaseFromLocation(), expected, url);
+    }
+  } finally { window.location = previous; }
+});

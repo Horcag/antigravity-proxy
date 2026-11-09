@@ -1,0 +1,340 @@
+@use '../components/config/configTokens' as config;
+@use '../styles/mixins' as *;
+@use '../styles/variables' as *;
+
+.container {
+  @include config.config-tokens;
+  color: var(--config-text);
+
+  width: min(100%, 1320px);
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: clamp(18px, 2.4vw, 28px);
+  margin: 0 auto;
+  padding-bottom: calc(
+    var(--config-action-bar-height, 0px) + var(--shell-bottom-inset, 0px) + 18px +
+      env(safe-area-inset-bottom) + #{$spacing-md}
+  );
+}
+
+// Expose the shell scrollport after route animation so nested config navigation can stay sticky.
+:global(.main-content):has(
+  > :global(.page-transition:not(.page-transition--animating))
+    > :global(.page-transition__layer[aria-hidden='false'])
+    .container
+) {
+  overflow-x: clip;
+  overflow-y: visible;
+}
+
+:global(.page-transition:not(.page-transition--animating)):has(
+  > :global(.page-transition__layer[aria-hidden='false']) .container
+) {
+  overflow: visible;
+}
+
+:global(.page-transition:not(.page-transition--animating))
+  > :global(.page-transition__layer[aria-hidden='false']):has(.container) {
+  transform: none;
+}
+
+@include mobile {
+  :global(.app-shell):has(
+    :global(.page-transition:not(.page-transition--animating))
+      > :global(.page-transition__layer[aria-hidden='false'])
+      .container
+  ) {
+    overflow: visible;
+  }
+
+  :global(.content):has(
+    > :global(.main-content)
+      > :global(.page-transition:not(.page-transition--animating))
+      > :global(.page-transition__layer[aria-hidden='false'])
+      .container
+  ) {
+    overflow: visible;
+  }
+}
+
+.pageHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  min-width: 0;
+
+  @media (max-width: 900px) {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 12px;
+  }
+}
+
+.pageTitle {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin: 0;
+  white-space: nowrap;
+}
+
+.tabBar {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px;
+  width: min(100%, 340px);
+  padding: 3px;
+  border: 1px solid var(--config-group-border);
+  border-radius: 9px;
+  background: var(--config-group-surface);
+
+  @media (max-width: 900px) {
+    width: 100%;
+  }
+}
+
+.tabItem {
+  @include button-reset;
+  min-height: 34px;
+  padding: 0 12px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.25;
+  white-space: nowrap;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+
+  &:hover:not(:disabled) {
+    color: var(--text-primary);
+    background: color-mix(in srgb, var(--text-primary) 5%, transparent);
+  }
+
+  &:disabled {
+    opacity: 0.58;
+    cursor: not-allowed;
+  }
+
+  &:focus:not(:focus-visible) {
+    outline: none;
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--config-accent);
+    outline-offset: 2px;
+    box-shadow: 0 0 0 3px var(--config-focus-ring);
+  }
+}
+
+.tabActive {
+  color: var(--config-accent-strong);
+  background: var(--bg-primary);
+  border-color: transparent;
+  box-shadow: inset 0 -2px 0 var(--config-accent);
+}
+
+.workspaceShell {
+  display: flex;
+  flex-direction: column;
+  gap: $spacing-lg;
+  min-width: 0;
+}
+
+.content {
+  display: flex;
+  flex-direction: column;
+  gap: $spacing-lg;
+  min-height: 0;
+}
+
+.sourceWorkspace {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.sourceToolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg-primary) 76%, transparent);
+
+  @include mobile {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.searchInputWrapper {
+  min-width: 0;
+  position: relative;
+  display: flex;
+  align-items: center;
+
+  :global(.form-group) {
+    margin-bottom: 0;
+    width: 100%;
+  }
+}
+
+.searchInput {
+  min-height: 38px !important;
+  border-radius: 6px !important;
+  padding-right: 128px !important;
+  background: var(--bg-secondary) !important;
+}
+
+.searchRight {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.searchCount {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.searchButton {
+  @include button-reset;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 6px;
+  border: 1px solid var(--text-primary);
+  background: var(--text-primary);
+  color: var(--bg-primary);
+  transition:
+    background-color $transition-fast,
+    border-color $transition-fast,
+    opacity $transition-fast;
+
+  &:hover:not(:disabled) {
+    background: var(--primary-hover);
+    border-color: var(--primary-hover);
+  }
+
+  &:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+}
+
+.searchActions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+
+  button {
+    min-width: 38px;
+    width: 38px;
+    height: 38px;
+    padding: 0 !important;
+    border-radius: 6px;
+  }
+
+  @include mobile {
+    justify-content: stretch;
+
+    button {
+      flex: 1;
+      width: auto;
+    }
+  }
+}
+
+.editorWrapper {
+  width: 100%;
+  flex: 0 0 auto;
+  height: clamp(500px, 70vh, 1040px);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg-primary);
+
+  @supports (height: 100dvh) {
+    height: clamp(500px, 70dvh, 1040px);
+  }
+
+  :global {
+    .cm-editor {
+      height: 100%;
+      font-size: 13px;
+      font-family:
+        ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New',
+        monospace;
+      background: transparent;
+    }
+
+    .cm-scroller {
+      overflow: auto;
+      -webkit-overflow-scrolling: touch;
+      touch-action: pan-x pan-y;
+      overscroll-behavior: contain;
+    }
+
+    .cm-gutters {
+      border-right: 1px solid var(--border-color);
+      background: color-mix(in srgb, var(--bg-secondary) 86%, transparent);
+    }
+
+    .cm-lineNumbers .cm-gutterElement {
+      padding: 0 8px 0 12px;
+      min-width: 40px;
+      color: var(--text-muted);
+    }
+
+    .cm-activeLine,
+    .cm-activeLineGutter {
+      background: color-mix(in srgb, var(--text-primary) 5%, transparent);
+    }
+
+    .cm-selectionMatch {
+      background: rgba(224, 170, 20, 0.24);
+    }
+
+    .cm-searchMatch {
+      background: rgba(224, 170, 20, 0.32);
+      outline: 1px solid rgba(224, 170, 20, 0.48);
+    }
+
+    .cm-searchMatch-selected {
+      background: rgba(198, 87, 70, 0.32);
+    }
+  }
+}
+
+@media (max-width: 480px) {
+  // Keep the search field clear of the shared draft action bar buttons.
+  .searchInput {
+    padding-right: 108px !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tabItem {
+    transition: none;
+  }
+}

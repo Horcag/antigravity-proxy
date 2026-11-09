@@ -1,0 +1,1445 @@
+version: 1
+generated_from: local/20260616/lts-maintenance-plan.md
+maintenance_model: protected-selective-port-with-minimal-shared-file-delta
+
+status_definitions:
+  protected: LTS identity surface. Must remain present and functional unless the LTS product direction changes.
+  lts-maintained: Upstream-deprecated or downstream-only, but still supported by CPA-Core-LTS.
+  coexist: Accepted upstream feature. May coexist with LTS surfaces, but must not replace protected behavior.
+  shared: Shared Core/Panel management behavior that can evolve with compatible contracts.
+  experimental: Optional surface that may be gated or hidden when backend support is missing.
+
+features:
+  - id: reasoning-effort-policy-config
+    status: lts-maintained
+    reason: Core-owned semantic effort policy needs capability-gated editing and lossless YAML persistence across protocol-specific payload rules.
+    routes:
+      - /config
+    panel_files:
+      - src/components/config/ReasoningEffortRulesEditor.tsx
+      - src/components/config/reasoningEffort.ts
+      - src/components/config/reasoningEffort.test.mjs
+      - src/hooks/useVisualConfig.ts
+      - src/types/visualConfig.ts
+      - src/services/api/client.ts
+      - src/services/api/configFile.ts
+      - src/utils/v8VisualProjection.ts
+      - docs/lts/reasoning-effort-policy.md
+    core_endpoints:
+      - /v0/management/config.yaml
+    required_markers:
+      - reasoning-effort
+      - x-cpa-reasoning-effort-policy
+      - supportsReasoningEffortPolicy
+    validation:
+      - npm run test:config
+      - npm run test:api-client
+      - python3 scripts/smoke-reasoning-effort.py
+
+  - id: codex-zcode-context-usage-config
+    status: experimental
+    reason: Optional native context counting for Codex clients using zcode search keeps client compaction totals separate from full provider usage accounting.
+    routes:
+      - /config
+    panel_files:
+      - src/services/api/configFile.ts
+      - src/lts/codexPolicy/zcodeContextUsage.ts
+      - src/lts/codexPolicy/zcodeContextUsage.test.mjs
+      - src/lts/codexPolicy/useCodexPolicyControls.tsx
+      - src/lts/i18n/
+      - src/hooks/useVisualConfig.ts
+      - src/types/visualConfig.ts
+      - src/components/config/configNavigation.ts
+      - scripts/smoke-config-editor.py
+    core_endpoints:
+      - /v0/management/config.yaml
+    required_markers:
+      - codexZcodeContextUsage
+      - zcode-context-usage
+      - codex_zcode_context_usage
+      - codex-policy_context
+    validation:
+      - npm run test:config
+      - npm run smoke:config
+      - npm run check:lts
+
+  - id: codex-cache-affinity-config
+    status: lts-maintained
+    reason: ChatGPT OAuth cache affinity needs understandable controls while preserving absent defaults, unknown YAML and upstream cache semantics.
+    routes:
+      - /config
+    panel_files:
+      - src/services/api/configFile.ts
+      - src/lts/codexPolicy/cacheAffinity.ts
+      - src/lts/codexPolicy/cacheAffinity.test.mjs
+      - src/lts/codexPolicy/useCodexPolicyControls.tsx
+      - src/lts/i18n/
+      - src/hooks/useVisualConfig.ts
+      - src/types/visualConfig.ts
+      - src/components/config/configNavigation.ts
+      - src/components/config/ConfigDomainPanels.tsx
+      - scripts/smoke-config-editor.py
+      - scripts/smoke-lts-panel-core.py
+      - docs/lts/codex-cache-affinity.md
+    core_endpoints:
+      - /v0/management/config.yaml
+    required_markers:
+      - codexCacheAffinityStrategy
+      - cache-affinity
+      - codex_cache_affinity
+      - client-aware
+      - stable-id
+      - legacy
+    validation:
+      - npm run test:config
+      - npm run type-check
+      - npm run build
+      - npm run smoke:config
+
+  - id: codex-outbound-config
+    status: lts-maintained
+    reason: Core codex.outbound selects the upstream transport for HTTP clients and aligns request-body compression and Accept-Encoding with the official Codex client; operators need visual controls that keep absent defaults, unknown values and unrelated YAML intact.
+    routes:
+      - /config
+    panel_files:
+      - src/services/api/configFile.ts
+      - src/lts/codexPolicy/outbound.ts
+      - src/lts/codexPolicy/outbound.test.mjs
+      - src/lts/codexPolicy/useCodexPolicyControls.tsx
+      - src/lts/i18n/
+      - src/hooks/useVisualConfig.ts
+      - src/types/visualConfig.ts
+      - src/components/config/configNavigation.ts
+    core_endpoints:
+      - /v0/management/config.yaml
+    required_markers:
+      - codexOutboundTransport
+      - codexOutboundWebsocketThresholdBytes
+      - codexOutboundRequestCompression
+      - codexOutboundAcceptEncoding
+      - websocket-threshold-bytes
+      - request-compression
+      - accept-encoding
+      - codex_outbound
+      - codex-policy_outbound
+    validation:
+      - npm run test:config
+      - npm run type-check
+      - npm run build
+
+  - id: usage-request-size
+    status: lts-maintained
+    reason: Core size_version 1 usage details record request body size and upstream transport; the usage page shows them per request, flags upstream connection failures on large requests, and the analytics views show the request size distribution, while older Cores and exports without these fields keep working.
+    routes:
+      - /usage
+    panel_files:
+      - src/services/api/usageAnalytics.ts
+      - src/utils/usage.ts
+      - src/utils/usage/requestSize.ts
+      - src/utils/usage/requestSize.test.mjs
+      - src/utils/usage/requestSizeAnalytics.ts
+      - src/utils/usage/requestSizeAnalytics.test.mjs
+      - src/utils/usage/analyticsModel.ts
+      - src/utils/usage/importPreflight.ts
+      - src/types/usageAnalytics.ts
+      - src/components/usage/RequestEventsDetailsCard.tsx
+      - src/components/usage/RequestSizeDistributionCard.tsx
+      - src/components/usage/UsageAnalyticsCharts.tsx
+    core_endpoints:
+      - /usage/query/analytics
+    required_markers:
+      - size_version
+      - upstream_transport
+      - upstream_request_bytes
+      - upstream_request_wire_bytes
+      - upstream_request_encoding
+      - requestSize
+      - isRequestSizeDistribution
+      - isLargeRequestConnectFailure
+      - upstream_connect_failure
+      - request_size_title
+      - downloadRequestLogById
+      - request_events_request_log
+    validation:
+      - npm run test:usage
+      - npm run type-check
+      - npm run build
+
+  - id: multi-instance-connections
+    status: lts-maintained
+    reason: Independent same-origin runtime documents preserve per-instance pages, drafts, and clients. Multi-instance management is opt-in and off by default, so the panel auto-enters the only or first remembered instance with a resident connection, and keeping several instances connected requires enabling the dedicated toggle.
+    panel_files:
+      - src/components/layout/PanelShell.tsx
+      - src/components/layout/PanelShell.module.scss
+      - src/components/layout/ConnectionSwitcher.tsx
+      - src/components/layout/ConnectionRuntime.tsx
+      - src/components/layout/MainLayout.tsx
+      - src/services/connectionRuntime.ts
+      - src/services/storage/connectionProfiles.ts
+      - src/services/storage/connectionProfiles.test.mjs
+      - src/services/connectionSession.ts
+      - src/services/api/connectionProbe.ts
+      - src/stores/useAuthStore.ts
+      - src/hooks/useMultiInstanceEnabled.ts
+      - scripts/smoke-connections.py
+    required_markers:
+      - getManagedConnection
+      - tabAuthStorage
+      - hasSessionChanges
+      - probeConnection
+      - safeSessionPath
+      - data-connection-frame
+      - keep_connected
+      - readMultiInstanceEnabled
+      - useMultiInstanceEnabled
+  - id: full-usage-statistics
+    status: protected
+    reason: Complete usage statistics are the primary CPA-Panel-LTS protected delta, including provider-sourced local pricing that preserves unsupported tiers as incomplete coverage.
+    routes:
+      - /usage
+      - /usage/pricing
+      - /usage/events
+      - /lts/usage
+    panel_files:
+      - src/router/MainRoutes.tsx
+      - src/pages/UsagePage.tsx
+      - src/pages/UsageEventsPage.tsx
+      - src/utils/usage/eventWorkspace.ts
+      - src/utils/usage/timeRange.ts
+      - src/utils/usage/timeRangeFilter.test.mjs
+      - src/pages/UsagePage.module.scss
+      - src/pages/UsagePricingPage.tsx
+      - src/pages/UsagePricingPage.module.scss
+      - src/components/usage/
+      - src/components/usage/PricingEntryCard.tsx
+      - src/components/usage/PresetPricingCatalog.tsx
+      - src/components/usage/PresetPricingCatalog.module.scss
+      - src/components/usage/presetPricingCatalogUtils.ts
+      - src/components/usage/PresetPricingCatalog.test.mjs
+      - src/components/providers/ProviderStatusBar.tsx
+      - src/components/providers/hooks/useProviderStats.ts
+      - src/services/api/usage.ts
+      - src/services/api/usageImportContract.ts
+      - src/services/api/config.ts
+      - src/stores/useUsageStatsStore.ts
+      - src/stores/useUsageQueryStore.ts
+      - src/services/api/usageQuery.ts
+      - src/services/api/usageQuery.test.mjs
+      - src/types/usageQuery.ts
+      - src/components/usage/hooks/useUsageQuery.ts
+      - src/components/usage/hooks/useUsageQueryDetails.ts
+      - src/components/usage/hooks/usageDetailsExport.ts
+      - docs/lts/usage-export.md
+      - src/utils/usage/queryView.ts
+      - src/utils/usage/queryView.test.mjs
+      - src/types/usage.ts
+      - src/utils/usage.ts
+      - src/utils/usageIndex.ts
+      - src/utils/usage/
+      - src/utils/usage/performance.ts
+      - src/utils/usage/performance.test.mjs
+      - src/utils/usage/percentiles.ts
+      - src/utils/usage/percentiles.test.mjs
+      - src/utils/usage/latencyAnalysis.ts
+      - src/utils/usage/latencyAnalysis.test.mjs
+      - src/utils/usage/cacheAnalytics.ts
+      - src/utils/usage/errorAnalytics.ts
+      - src/utils/usage/analyticsModules.test.mjs
+      - src/components/usage/UsageAnalyticsSection.tsx
+      - src/components/usage/LatencyTrendChart.tsx
+      - src/components/usage/LatencyDistributionCard.tsx
+      - src/components/usage/CacheEfficiencyCard.tsx
+      - src/components/usage/ErrorAnalysisCard.tsx
+      - src/components/usage/ModelShareCard.tsx
+      - src/components/usage/hooks/useUsageAnalyticsDetails.ts
+      - src/utils/usage/cacheTokens.test.mjs
+      - src/utils/usage/modelPrices.ts
+      - src/utils/usage/modelPrices.test.mjs
+      - src/utils/usage/importPreflight.ts
+      - src/utils/usage/importPreflight.test.mjs
+      - src/utils/usage/reasoningEffort.ts
+      - src/utils/usage/reasoningEffort.test.mjs
+      - src/utils/usage/serviceTier.ts
+      - src/utils/usage/serviceTier.test.mjs
+      - src/utils/usage/pricing/index.ts
+      - src/utils/usage/pricing/index.test.mjs
+      - src/utils/usage/pricing/catalog.ts
+      - src/utils/usage/pricing/storage.ts
+      - src/utils/usage/pricing/storage.test.mjs
+      - src/utils/usage/pricing/usagePricing.ts
+      - src/utils/usage/pricing/usagePricing.test.mjs
+      - src/utils/usage/pricing/usageAggregation.test.mjs
+    core_endpoints:
+      - /v0/management/usage
+      - /v0/management/usage/export
+      - /v0/management/usage/import
+      - /v0/management/usage/query/capabilities
+      - /v0/management/usage/query/summary
+      - /v0/management/usage/query/details
+      - /v0/management/usage/query/export
+      - /v0/management/usage/query/pricing
+      - /v0/management/usage-statistics-enabled
+    required_markers:
+      - usageApi.getUsage
+      - usageApi.exportUsage
+      - usageApi.importUsage
+      - usageQueryApi
+      - export_version
+      - max_export_page_size
+      - usage-query-v1
+      - buildQueryPriceRules
+      - calculateStatusBarData
+      - collectUsageDetailsForCandidates
+      - resolveUsageTotalTokens
+      - resolveCacheWriteUnitPrice
+      - getUsageNonCacheReadInputTokenCount
+      - non_cache_read_input_tokens
+      - normalizePersistedModelPrices
+      - analyzeUsageImport
+      - usage_version_unsupported
+      - usage_shape_invalid
+      - usage_v1_token_contract_invalid
+      - usage_v1_cache_semantics_ambiguous
+      - usage_v2_token_contract_invalid
+      - usage_aggregate_overflow
+      - schema_version
+      - migrated_from_version
+      - v1_uncached_input_tokens_to_v2
+      - import_success_migrated_v1
+      - import_review_uncertain_identities
+      - uncertainIdentityCount
+      - normalizeReasoningEffort
+      - service_tier
+      - request_service_tier
+      - outbound_service_tier
+      - response_service_tier
+      - effective_service_tier
+      - response_cyber_program
+      - resolveServiceTier
+      - ServiceTierEvidence
+      - request_events_filter_tier
+      - /usage/pricing
+      - PRICE_CATALOG
+      - glm-5.2
+      - glm-5.3-flashx
+      - ZAI_PRICING_SOURCE_URL
+      - kimi-k3
+      - kimi-k3-256k
+      - k3-256k
+      - kimi-k2.7-code
+      - kimi-k2.7-code-highspeed
+      - kimi-for-coding
+      - kimi-for-coding-highspee
+      - kimi-for-coding-highspeed
+      - KIMI_PRICING_SOURCE_URL
+      - grok-4.5
+      - grok-4.6
+      - grok-4.3
+      - grok-4.7
+      - grok-4.7-fast
+      - grok-4.7-build-fast
+      - XAI_PRICING_SOURCE_URL
+      - XAI_GROK_46_PRICING_SOURCE_URL
+      - XAI_GROK_43_PRICING_SOURCE_URL
+      - XAI_GROK_47_PRICING_SOURCE_URL
+      - XAI_GROK_47_FAST_PRICING_SOURCE_URL
+      - XAI_LONG_CONTEXT_INPUT_TOKEN_THRESHOLD
+      - doubao-seed-2.1-pro
+      - DOUBAO_PRICING_SOURCE_URL
+      - gemini-4-argon
+      - GEMINI_PRICING_SOURCE_URL
+      - gpt-6.1-terra
+      - gpt-daybreak-blue-latest
+      - claude-haiku-4-5-20251001
+      - claude-haiku-4-5
+      - claude-sonnet-4-5-20250929
+      - claude-sonnet-4-5
+      - claude-sonnet-4-6
+      - claude-sonnet-5
+      - claude-opus-4-5-20251101
+      - claude-opus-4-5
+      - claude-opus-4-6
+      - claude-opus-4-7
+      - claude-opus-4-8
+      - claude-opus-5
+      - claude-fable-5
+      - ANTHROPIC_PRICING_SOURCE_URL
+      - ANTHROPIC_MODEL_IDS_SOURCE_URL
+      - getCatalogSourceLinks
+      - getLocalEstimateCoverageDisplay
+      - isLocalEstimateComplete
+      - PRICE_PROFILE_STORAGE_KEY
+      - cli-proxy-model-prices-v3
+      - estimateUsageDetailCost
+      - aggregateCostEstimateCoverage
+      - calculatePricingCoverage
+      - analyzeUsagePricing
+      - PricingEntryCard
+      - PresetPricingCatalog
+      - preset-pricing-catalog
+      - pricing_browser_notice
+      - pricing_catalog_table_label
+      - pricing_catalog_fast_explicit_summary
+      - pricing_catalog_verified_as_of
+      - pricing_source
+      - pricing_cost_incomplete
+      - reasoning_effort
+      - request_events_filter_effort
+      - RequestEventsDetailsCard
+      - __apiBucket
+      - request_events_request_key
+      - request_identity_type
+      - request_key_hint
+      - ttfb_ms
+      - output_timing
+      - token_breakdown
+      - resolvePerformanceTokens
+      - extractTTFBMs
+      - calculateFirstContentMs
+      - calculateOutputTps
+      - calculateAverageTps
+      - request_events_ttfb
+      - request_events_first_content
+      - request_events_ttft
+      - request_events_ttfa
+      - request_events_output_tps
+      - request_events_average_tps
+      - request_events_visible_average_tps
+      - request_events_reasoning_ratio
+      - request_events_weighted_output_tps
+      - request_events_weighted_average_tps
+      - request_events_performance_samples
+      - timing_version
+      - first_content_ms
+      - ttft_ms
+      - ttfa_ms
+      - summarizeUsagePerformance
+      - usage_v1_timing_semantics_ambiguous
+      - usage_v2_timing_semantics_ambiguous
+      - usage_v3_token_contract_invalid
+      - usage_v3_timing_contract_invalid
+      - request_events_cost_estimate
+      - estimated_cost_usd
+      - pricing_status
+      - data-request-cost-status
+    validation:
+      - npm run test:usage-cache
+      - npm run test:usage-prices
+      - npm run test:usage-pricing-v3
+      - npm run test:usage-pricing-catalog
+      - npm run test:usage-pricing-storage
+      - npm run test:usage-performance
+      - npm run test:usage-pricing-integration
+      - npm run test:usage-analytics
+      - npm run test:usage
+      - npm run smoke:lts
+      - npm run smoke:lts:core -- --no-write-smoke
+      - npm run check:lts
+      - npm run check:feature-contract
+      - npm run type-check
+      - npm run build
+
+  - id: dashboard-overview
+    status: shared
+    reason: Dashboard provider counts must derive from cached config without dropping LTS-maintained providers (including ampcode and Interactions API) or presenting load failures as real zero counts. The upstream visual rewrite (features/dashboard + shared motion hooks) was ported on top of the LTS data contract.
+    routes:
+      - /
+      - /dashboard
+    panel_files:
+      - src/features/dashboard/DashboardPage.tsx
+      - src/features/dashboard/dashboard.module.scss
+      - src/features/dashboard/hooks/useDashboardOverview.ts
+      - src/features/dashboard/dashboardMetrics.test.mjs
+      - src/hooks/motion.ts
+      - src/hooks/useApiKeysForModels.ts
+      - src/components/providers/hooks/useProviderRecentRequests.ts
+      - src/services/api/apiKeyUsage.ts
+      - src/services/api/config.ts
+      - src/services/api/authFiles.ts
+      - src/services/api/models.ts
+      - src/stores/useConfigStore.ts
+      - src/stores/useModelsStore.ts
+      - src/types/ampcode.ts
+      - src/utils/recentRequests.ts
+      - src/i18n/locales/
+      - scripts/smoke-lts-panel.py
+      - scripts/smoke-lts-panel-core.py
+    core_endpoints:
+      - /v0/management/config
+      - /v0/management/auth-files
+      - /v8/management/observability/usage/api-keys
+      - /v1/models
+    required_markers:
+      - useConfigStore
+      - fetchConfig
+      - countAmpcodeConfig
+      - config.ampcode
+      - config.interactionsApiKeys
+      - modelsApi.fetchModels
+      - useProviderRecentRequests
+      - summarizeProviderTraffic
+      - 'modelsError ? null : models.length'
+      - Where to go from here
+    validation:
+      - npm run test:dashboard
+      - npm run check:lts
+      - npm run smoke:lts
+      - npm run smoke:lts:core -- --no-write-smoke
+
+  - id: provider-stable-lts-page
+    status: protected
+    reason: Full usage-backed provider status bars (auth-index attribution from the complete usage statistics) are an LTS contract. Under the v8-only Panel the legacy per-family pages were removed; the same status surface now lives in the Workbench resource table, where full usage is the primary source and Core recent-request summaries are only a fallback when usage statistics are disabled. /lts/providers redirects to /ai-providers.
+    routes:
+      - /ai-providers
+      - /lts/providers
+    panel_files:
+      - src/features/providers/components/ProviderResourceTable.tsx
+      - src/features/providers/fullUsageStatus.ts
+      - src/features/providers/useProviderFullUsage.ts
+      - src/features/providers/fullUsageStatus.test.mjs
+      - src/pages/AiProvidersPage.module.scss
+      - src/components/providers/
+      - src/components/providers/hooks/useProviderStats.ts
+      - src/components/providers/ProviderStatusBar.tsx
+      - src/services/api/providers.ts
+      - src/services/api/usage.ts
+      - src/utils/usage.ts
+      - src/utils/usageIndex.ts
+    core_endpoints:
+      - /v8/management/config
+      - /v8/management/config/api-keys/:family
+      - /v0/management/usage
+    required_markers:
+      - ProviderStatusBar
+      - calculateStatusBarData
+      - resolveFullUsageStatus
+      - useProviderFullUsage
+      - data-usage-source
+      - Workbench status bars use full usage attributed by the v8 auth_index
+
+  - id: provider-workbench
+    status: coexist
+    reason: The Workbench is the only provider management surface at /ai-providers (v8-only Panel); /ai-providers/workbench remains a redirect alias. It writes native v8 provider families with PUT /config/api-keys/{family}, bound by If-Match to the ETag of the same GET /config/api-keys/{family}, re-reading before every write, stripping response-only auth_index/auth-index, and locating groups by persisted source snapshots and sourceIndex. Key edits cannot change the shared base URL; explicit configuration-group editing confirms the affected membership, verifies the complete group snapshot and reads back the result. It adopts upstream runtime policy, error-rule, provider behavior and advanced model capability editors while keeping the LTS thinking editor. It must preserve and edit Core model mapping fields including canonical display-name from Core v7.2.70 or later. Its all-provider thinking editor follows Core ThinkingSupport fields levels, min, max, zero_allowed, and dynamic_allowed. It does not expose the Codex client-only ultra compatibility preset as a provider wire capability, while unknown existing levels and fields remain lossless through advanced JSON. The accepted xAI and Interactions API adapt-ports target current CPA-Core-LTS management contracts, preserve unknown config fields, and use api-key plus base-url selectors. Credential weights round-trip for provider keys and OpenAI key entries. Branded groups, including the Infistar and Kimi adaptations, remain config-detected only and must not add promotional quick-start routes, affiliate metadata, recommendations, or registration links.
+    routes:
+      - /ai-providers
+      - /ai-providers/workbench
+    panel_files:
+      - src/router/MainRoutes.tsx
+      - src/features/providers/ProvidersWorkbenchPage.tsx
+      - src/features/providers/useProviderWorkbench.ts
+      - src/features/providers/descriptors.ts
+      - src/features/providers/xaiApiKeyProvider.test.mjs
+      - src/features/providers/providerIntegrity.test.mjs
+      - src/features/providers/thinkingLevels.ts
+      - src/features/providers/code0.ts
+      - src/features/providers/fennoAI.ts
+      - src/features/providers/qiniuCloud.ts
+      - src/features/providers/infistar.ts
+      - src/features/providers/claudeApi.ts
+      - src/features/providers/sponsorDefinitions.ts
+      - src/features/providers/sponsorMutationRecovery.ts
+      - src/features/providers/sheets/forms/BaseProviderForm.tsx
+      - src/features/providers/configGroups.ts
+      - src/features/providers/sheets/ConfigGroupSheet.tsx
+      - src/features/providers/sheets/forms/ModelEntriesEditor.tsx
+      - src/features/providers/sheets/forms/SponsorProviderForm.tsx
+      - src/features/providers/sheets/forms/useModelDiscovery.ts
+      - src/features/providers/sheets/forms/useConnectivityTest.ts
+      - src/features/providers/adapters.ts
+      - src/components/providers/utils.ts
+      - src/components/providers/hooks/useProviderRecentRequests.ts
+      - src/components/providers/hooks/providerRecentRequests.test.mjs
+      - src/components/ui/modelInputListUtils.ts
+      - src/services/api/config.ts
+      - src/services/api/providers.ts
+      - src/services/api/providersNative.test.mjs
+      - src/services/api/testing/fakeV8Core.mjs
+      - src/services/api/configValue.ts
+      - src/services/api/configRevision.ts
+      - src/services/api/providerModels.ts
+      - src/features/providers/runtimePolicy.ts
+      - src/features/providers/errorRules.ts
+      - src/features/providers/modelOptions.ts
+      - src/features/providers/providerBehavior.ts
+      - src/features/providers/kimi.ts
+      - src/features/providers/sheets/forms/RuntimePolicyEditor.tsx
+      - src/features/providers/sheets/forms/ErrorRulesEditor.tsx
+      - src/features/providers/sheets/forms/ProviderBehaviorEditor.tsx
+      - src/features/providers/sheets/forms/ModelAdvancedFields.tsx
+      - src/services/api/transformers.ts
+      - src/stores/useConfigStore.ts
+      - src/types/config.ts
+      - src/services/api/apiKeyUsage.ts
+      - src/types/provider.ts
+      - src/utils/credentialWeight.ts
+      - src/utils/recentRequests.ts
+      - scripts/smoke-lts-panel.py
+      - scripts/smoke-lts-panel-core.py
+    core_endpoints:
+      - /v8/management/config
+      - /v8/management/config/api-keys/:family
+      - /v8/management/observability/usage/api-keys
+    required_markers:
+      - useProviderRecentRequests
+      - MODEL_DISCOVERY_BRANDS
+      - CONFIG_DETECTED_BRANDS
+      - runOpenAIAllKeys
+      - runCodex
+      - createXAIConfig
+      - updateXAIConfig
+      - deleteXAIConfig
+      - createXAIConfig(
+      - 'interactions'
+      - createInteractionsKey
+      - updateInteractionsKey
+      - deleteInteractionsKey
+      - buildInteractionsEndpoint
+      - INTERACTIONS_API_REVISION
+      - gemini-interactions
+      - manages Interactions API resources through the Core contract
+      - BROWSER provider workbench Interactions API weight round-trip
+      - round-trips credential weights without dropping provider fields
+      - CODE0_PROVIDER_NAME
+      - FENNO_AI_PROVIDER_NAME
+      - QINIU_CLOUD_PROVIDER_NAME
+      - INFISTAR_PROVIDER_NAME
+      - CLAUDE_API_BASE_URL
+      - openrouter-a
+      - openrouter-b
+      - openrouter.ai/api/v1/chat/completions
+      - openrouter.ai/api/v1/models
+      - openai/smoke-discovered
+      - x-lts-unknown-provider
+      - x-lts-entry-note
+      - x-lts-model-note
+      - dropped provider unknown fields
+      - dropped model unknown field
+      - dropped configured branded provider
+      - adapts configured Infistar endpoints without promotional metadata
+      - include_branded_providers
+      - run_branded_provider_visibility_smoke
+      - shown as a recommendation
+      - run_browser_provider_workbench_smoke
+      - run_browser_provider_key_crud_smoke
+      - BROWSER provider workbench OpenAI Compatibility save PUT /v8/management/config/api-keys/openai-compatibility
+      - Provider write smoke persisted response-only auth-index
+      - getSponsorAggregationConflict
+      - getSponsorOpenAIDeleteIndices
+      - runSponsorMutationWithRecovery
+      - sourceIndex
+      - createProviderRecentRequestsCacheController
+      - assert_each_request_immediately_preceded_by
+      - display-name
+      - modelDisplayNamePlaceholder
+      - updated model display-name
+      - new model display-name
+      - preserved legacy model routing aliases
+      - cleared model display-name without dropping unknown fields
+      - updated sponsor model display-name
+      - THINKING_EFFORT_LEVELS
+      - updateThinkingBudgetJson
+      - zero_allowed
+      - dynamic_allowed
+      - thinking capability round-trip and reset
+      - legacy model inputs preserve fields that are not visually editable
+      - fingerprint-profile
+      - claudeCodeCliProfile
+      - fingerprintProfileClaudeCodeCli
+      - round-trips the Claude fingerprint profile without dropping unknown fields
+      - cleared Claude fingerprint profile without dropping unknown fields
+      - BROWSER provider workbench Claude fingerprint-profile round-trip and reset
+      - locateProviderGroup
+      - applyProviderChanges
+      - preserveModelMetadata
+      - stripProviderGroupResponseFields
+      - ifMatch(revision)
+      - buildRuntimePolicy
+      - pickProviderBehavior
+      - ModelAdvancedFields
+      - KIMI_PROVIDER_NAME
+      - provider writes send If-Match from the same GET
+      - 'F22: deleting with a stale snapshot'
+      - 'F23: renaming a Vertex model keeps force-mapping'
+      - 'F24: changing provider B keeps provider A auth index'
+    validation:
+      - npm run test:providers
+      - npm run smoke:lts
+      - npm run smoke:lts:core
+
+  - id: ampcode
+    status: lts-maintained
+    reason: Upstream Panel removed Ampcode, but CPA-Core-LTS still exposes the top-level v8 ampcode config node. The Panel edits it at /ai-providers/ampcode with one revisioned PUT /config/ampcode; /lts/ampcode redirects there.
+    routes:
+      - /ai-providers/ampcode
+      - /lts/ampcode
+    panel_files:
+      - src/router/MainRoutes.tsx
+      - src/assets/icons/amp.svg
+      - src/pages/AiProvidersAmpcodeEditPage.tsx
+      - src/services/api/ampcode.ts
+      - src/types/ampcode.ts
+    core_endpoints:
+      - /v8/management/config/ampcode
+    required_markers:
+      - saveAmpcode
+      - getAmpcodeSnapshot
+      - force-model-mappings
+      - upstream-api-keys
+
+  - id: plugin-management
+    status: coexist
+    reason: CPA-Core-LTS exposes real plugin management capabilities behind a support header. Plugin list/store/delete use v8 routes; plugin enable/config are v8 config nodes written with If-Match; readiness stays on the LTS extension client.
+    routes:
+      - /plugins
+      - /plugin-store
+      - /plugin-pages/:pluginId/:menuIndex
+    panel_files:
+      - src/router/MainRoutes.tsx
+      - src/features/plugins/PluginsPage.tsx
+      - src/features/plugins/PluginStorePage.tsx
+      - src/features/plugins/PluginStorePage.module.scss
+      - src/features/plugins/PluginResourcePage.tsx
+      - src/features/plugins/PluginRuntimeUnavailable.tsx
+      - src/features/plugins/PluginRuntimeUnavailable.module.scss
+      - src/features/plugins/pluginReleaseVersions.ts
+      - src/features/plugins/pluginResources.ts
+      - src/features/plugins/pluginConfigDraft.ts
+      - src/features/plugins/PluginReadinessSheet.tsx
+      - src/features/plugins/pluginReadiness.ts
+      - src/features/plugins/pluginReadiness.test.mjs
+      - docs/lts/plugin-readiness-management.md
+      - src/features/plugins/pluginResources.test.mjs
+      - src/features/plugins/components/PluginInstallGateModal.tsx
+      - src/features/plugins/components/PluginInstallGateModal.module.scss
+      - src/components/config/VisualConfigEditor.tsx
+      - src/components/config/ConfigFieldControls.tsx
+      - src/lts/codexPolicy/useCodexPolicyControls.tsx
+      - src/components/config/ConfigFieldShells.tsx
+      - src/components/config/ConfigEditorWorkspace.tsx
+      - src/components/config/ConfigDomainPanels.tsx
+      - src/components/config/configNavigation.ts
+      - src/components/config/VisualConfigEditorBlocks.tsx
+      - src/hooks/useVisualConfig.ts
+      - src/services/api/plugins.ts
+      - src/types/auth.ts
+      - src/types/plugin.ts
+      - src/types/visualConfig.ts
+      - src/components/layout/MainLayout.tsx
+      - src/stores/useAuthStore.ts
+      - src/services/api/client.ts
+      - src/services/api/client.test.mjs
+      - src/i18n/locales/
+      - scripts/smoke-lts-panel.py
+      - scripts/smoke-lts-panel-core.py
+    core_endpoints:
+      - /v8/management/plugins
+      - /v8/management/config/plugins/configs/:id
+      - /v8/management/config/plugins/configs/:id/enabled
+      - /v0/management/plugins/:id/readiness
+      - /v8/management/plugins/store
+      - /v8/management/plugins/store/:id/install
+    capability_gates:
+      - x-cpa-support-plugin
+    required_markers:
+      - DEFAULT_PLUGIN_STORE_SOURCE_ID
+      - plugin_store_sources
+      - pluginStoreAuth
+      - store-auth
+      - fetchPluginReleaseVersions
+      - install_version_release_mode
+      - source_errors
+      - auth_required
+      - getPluginConfirmToken
+      - gate_effect_runs_code
+      - server-plugin-support-update
+      - pluginSupportKnown
+      - pluginSupportSource
+      - probePluginSupport
+      - connectionGeneration
+      - 'synchronous: true'
+      - binds connection details when the request is created
+      - PluginRuntimeUnavailable
+      - runtime_unavailable_title
+      - run_plugin_runtime_mismatch_smoke
+      - arm_delayed_config_response
+      - run_plugin_config_smoke
+      - isOfficialRepository
+      - trusts only the official source with an official GitHub repository
+      - supportsPluginVersionSelection
+      - buildPluginConfigPatch
+      - patchConfig
+      - updateEnabled
+      - delete configPatch.enabled
+      - run_plugin_config_patch_smoke
+      - plugin_id = "lts-smoke-plugin"
+    validation:
+      - npm run test:api-client
+      - npm run test:plugins
+      - npm run smoke:lts
+
+  - id: recent-requests
+    status: coexist
+    reason: Recent requests can power short-window health views but must not replace full usage statistics.
+    panel_files:
+      - src/components/providers/utils.ts
+      - src/components/providers/hooks/useProviderRecentRequests.ts
+      - src/components/providers/hooks/providerRecentRequests.test.mjs
+      - src/services/api/apiKeyUsage.ts
+      - src/utils/recentRequests.ts
+      - src/features/providers/ProvidersWorkbenchPage.tsx
+    core_endpoints:
+      - /v8/management/observability/usage/api-keys
+    required_markers:
+      - useProviderRecentRequests
+      - createProviderRecentRequestsCacheController
+      - getProviderRecentStatusData
+      - getOpenAIProviderRecentStatusData
+    validation:
+      - npm run test:provider-recent
+
+  - id: logs-runtime
+    status: shared
+    reason: Logs must support CPA file-log runtime and Home DB runtime without breaking request log downloads.
+    routes:
+      - /logs
+    panel_files:
+      - src/pages/LogsPage.tsx
+      - src/pages/LogsPage.module.scss
+      - src/services/api/logs.ts
+      - src/stores/useAuthStore.ts
+      - scripts/smoke-lts-panel.py
+      - scripts/smoke-lts-panel-core.py
+    core_endpoints:
+      - /v8/management/observability/logs
+      - /v8/management/observability/logs/errors
+      - /v8/management/observability/logs/errors/:name
+      - /v8/management/observability/logs/requests/:id
+    required_markers:
+      - 'cursor?: string'
+      - latestAfter
+      - nextCursor
+      - cursorReset
+      - fullscreenLogs
+      - logs-fullscreen-active
+      - openErrorLog
+      - copySelectedErrorLog
+      - downloadErrorLog
+      - downloadRequestLog
+      - run_logs_runtime_smoke
+      - run_home_logs_runtime_smoke
+      - home_ip=10.99.0.7
+
+  - id: config-management
+    status: shared
+    reason: Source and visual saves use only /v8/management/config.yaml with the read ETag sent as If-Match; the visual editor projects the canonical v8 tree into its field names (no layout classification), preserves unmanaged YAML and concurrent changes, and never confuses client access keys with provider groups.
+    routes:
+      - /config
+    panel_files:
+      - src/pages/ConfigPage.tsx
+      - src/pages/ConfigPage.module.scss
+      - src/components/config/
+      - src/hooks/useConfigDraftSave.ts
+      - src/hooks/useVisualConfig.ts
+      - src/services/api/config.ts
+      - src/services/api/configFile.ts
+      - src/utils/v8VisualProjection.ts
+      - src/utils/v8VisualProjection.test.mjs
+      - src/services/api/configRevision.ts
+      - src/services/api/configValue.ts
+      - src/services/api/configPatch.ts
+      - src/services/api/configFile.test.mjs
+      - src/types/visualConfig.ts
+      - src/utils/credentialWeight.ts
+      - src/utils/apiKey.ts
+      - src/utils/apiKeyStrength.ts
+      - scripts/smoke-lts-panel.py
+      - scripts/smoke-lts-panel-core.py
+    core_endpoints:
+      - /v8/management/config
+      - /v8/management/config.yaml
+      - /v8/management/config/observability/logs/request-log
+    required_markers:
+      - githubToken
+      - server.github-token
+      - devinSensitiveWords
+      - visualBaseYaml
+      - normalizeYamlForVisualDiff
+      - applyVisualChangesToYaml
+      - hasPayloadDirtyFields
+      - payloadRuleRawParamRow
+      - payloadJsonInput
+      - pluginStoreSources
+      - antigravitySensitiveWords
+      - antigravity-sensitive-words
+      - sensitive-words
+      - parsePluginStoreSources
+      - dirtyFields.has('pluginStoreSources')
+      - transientErrorCooldownSeconds
+      - transient-error-cooldown-seconds
+      - transient_error_cooldown_seconds
+      - disableImageGeneration
+      - disable-image-generation
+      - disable_image_generation_passthrough
+      - 'disable-image-generation: passthrough'
+      - latestServerYaml
+      - dirtyFields.has('host')
+      - integer_range_1_3600
+      - concurrent-managed-smoke
+      - generateSecureApiKey
+      - MAX_UNBIASED_BYTE
+      - ApiKeyStrengthMeter
+      - evaluateApiKeyStrength
+      - meta_errors
+      - weighted-round-robin
+      - parseRoutingStrategy
+      - MAX_CREDENTIAL_WEIGHT
+      - BROWSER visual save and reload weighted-round-robin
+    validation:
+      - npm run test:config
+      - npm run smoke:lts
+
+  - id: codex-abnormal-reasoning-retry-config
+    status: lts-maintained
+    reason: CPA-Core-LTS owns codex.abnormal-reasoning-retry; CPA-Panel-LTS must keep a visual config surface for this downstream LTS feature.
+    routes:
+      - /config
+    panel_files:
+      - src/components/config/VisualConfigEditor.tsx
+      - src/components/config/ConfigFieldControls.tsx
+      - src/lts/codexPolicy/useCodexPolicyControls.tsx
+      - src/components/config/ConfigEditorWorkspace.tsx
+      - src/components/config/ConfigDomainPanels.tsx
+      - src/components/config/configNavigation.ts
+      - src/components/config/VisualConfigEditor.module.scss
+      - src/hooks/useVisualConfig.ts
+      - src/services/api/configFile.ts
+      - src/types/visualConfig.ts
+      - src/i18n/locales/
+      - scripts/check-lts-panel-contract.sh
+    core_endpoints:
+      - /v0/management/config.yaml
+    required_markers:
+      - codexAbnormalReasoningRetryAction
+      - codexAbnormalReasoningRetryEnabled
+      - codexAbnormalReasoningRetryModelContains
+      - codexAbnormalReasoningRetryReasoningEfforts
+      - codexAbnormalReasoningRetryReasoningTokens
+      - codexAbnormalReasoningRetryAuthKinds
+      - codexAbnormalReasoningRetryAuthIds
+      - codexAbnormalReasoningRetryStreamBuffer
+      - codexAbnormalReasoningRetryStreamBufferMaxBytes
+      - codexAbnormalReasoningRetryMaxRetries
+      - codexAbnormalReasoningRetryExhaustedBehavior
+      - codexAbnormalReasoningRetryClientUsageAggregation
+      - codexAbnormalReasoningRetryDeliveryPolicy
+      - codexAbnormalReasoningRetryFallbackPolicy
+      - codexAbnormalReasoningRetryHedgedRetryEnabled
+      - codexAbnormalReasoningRetryHedgedRetryMode
+      - codexAbnormalReasoningRetryHedgeDelayMs
+      - codexAbnormalReasoningRetryRequireDistinctAuth
+      - abnormal-reasoning-retry
+      - action
+      - stream-buffer-max-bytes
+      - reasoning-efforts
+      - max-retries
+      - exhausted-behavior
+      - client-usage-aggregation
+      - delivered-only
+      - sum-with-delivered-total
+      - delivery-policy
+      - best-non-special
+      - fallback-policy
+      - best-special
+      - hedged-retry
+      - mode
+      - hedge-delay-ms
+      - require-distinct-auth
+      - hasCodexAbnormalReasoningRetryDirtyFields
+      - dirtyFields.has('codexAbnormalReasoningRetryAction')
+      - useCodexPolicyControls
+      - ConfigFieldsProps
+      - CONFIG_DOMAINS
+      - CONFIG_FIELDS
+      - resolveConfigLocation
+      - focusConfigField
+      - codex-draft-summary
+      - ABNORMAL_RETRY_ACTION_HINT_KEYS
+      - ABNORMAL_RETRY_EXHAUSTED_BEHAVIOR_HINT_KEYS
+      - ABNORMAL_RETRY_USAGE_AGGREGATION_HINT_KEYS
+      - ABNORMAL_RETRY_DELIVERY_POLICY_HINT_KEYS
+      - ABNORMAL_RETRY_FALLBACK_POLICY_HINT_KEYS
+      - ABNORMAL_RETRY_HEDGED_MODE_HINT_KEYS
+      - draftSummary
+      - fieldSelectionHint
+      - codex_abnormal_reasoning_retry_title
+      - codex_abnormal_reasoning_retry_desc
+      - codex_abnormal_reasoning_retry_summary_title
+      - codex_abnormal_reasoning_retry_summary_desc
+      - codex_abnormal_reasoning_retry_summary_action
+      - codex_abnormal_reasoning_retry_summary_stream_buffer
+      - codex_abnormal_reasoning_retry_summary_hedged
+      - codex_abnormal_reasoning_retry_summary_distinct_auth
+      - codex_abnormal_reasoning_retry_summary_on
+      - codex_abnormal_reasoning_retry_summary_off
+      - codex_abnormal_reasoning_retry_group_switches_title
+      - codex_abnormal_reasoning_retry_group_switches_desc
+      - codex_abnormal_reasoning_retry_group_retry_title
+      - codex_abnormal_reasoning_retry_group_retry_desc
+      - codex_abnormal_reasoning_retry_group_match_title
+      - codex_abnormal_reasoning_retry_group_match_desc
+      - codex_abnormal_reasoning_retry_group_delivery_title
+      - codex_abnormal_reasoning_retry_group_delivery_desc
+      - codex_abnormal_reasoning_retry_group_scope_title
+      - codex_abnormal_reasoning_retry_group_scope_desc
+      - codex_abnormal_reasoning_retry_action_label
+      - codex_abnormal_reasoning_retry_action_retry
+      - codex_abnormal_reasoning_retry_action_observe_only
+      - codex_abnormal_reasoning_retry_action_disabled
+      - codex_abnormal_reasoning_retry_action_retry_desc
+      - codex_abnormal_reasoning_retry_action_observe_only_desc
+      - codex_abnormal_reasoning_retry_action_disabled_desc
+      - codex_abnormal_reasoning_retry_stream_buffer_max_bytes_label
+      - codex_abnormal_reasoning_retry_exhausted_behavior_label
+      - codex_abnormal_reasoning_retry_exhausted_behavior_error
+      - codex_abnormal_reasoning_retry_exhausted_behavior_pass_through
+      - codex_abnormal_reasoning_retry_exhausted_behavior_error_desc
+      - codex_abnormal_reasoning_retry_exhausted_behavior_pass_through_desc
+      - codex_abnormal_reasoning_retry_client_usage_aggregation_label
+      - codex_abnormal_reasoning_retry_client_usage_aggregation_delivered_only
+      - codex_abnormal_reasoning_retry_client_usage_aggregation_sum
+      - codex_abnormal_reasoning_retry_client_usage_aggregation_sum_with_delivered_total
+      - codex_abnormal_reasoning_retry_client_usage_aggregation_delivered_only_desc
+      - codex_abnormal_reasoning_retry_client_usage_aggregation_sum_desc
+      - codex_abnormal_reasoning_retry_client_usage_aggregation_sum_with_delivered_total_desc
+      - codex_abnormal_reasoning_retry_delivery_policy_label
+      - codex_abnormal_reasoning_retry_delivery_policy_best_non_special
+      - codex_abnormal_reasoning_retry_delivery_policy_first_non_special
+      - codex_abnormal_reasoning_retry_delivery_policy_max_output
+      - codex_abnormal_reasoning_retry_delivery_policy_latest
+      - codex_abnormal_reasoning_retry_delivery_policy_best_non_special_desc
+      - codex_abnormal_reasoning_retry_delivery_policy_first_non_special_desc
+      - codex_abnormal_reasoning_retry_delivery_policy_max_output_desc
+      - codex_abnormal_reasoning_retry_delivery_policy_latest_desc
+      - codex_abnormal_reasoning_retry_fallback_policy_label
+      - codex_abnormal_reasoning_retry_fallback_policy_best_special
+      - codex_abnormal_reasoning_retry_fallback_policy_max_output_special
+      - codex_abnormal_reasoning_retry_fallback_policy_latest_special
+      - codex_abnormal_reasoning_retry_fallback_policy_best_special_desc
+      - codex_abnormal_reasoning_retry_fallback_policy_max_output_special_desc
+      - codex_abnormal_reasoning_retry_fallback_policy_latest_special_desc
+      - codex_abnormal_reasoning_retry_hedged_retry_enabled
+      - codex_abnormal_reasoning_retry_hedged_retry_mode_label
+      - codex_abnormal_reasoning_retry_hedged_retry_mode_quality
+      - codex_abnormal_reasoning_retry_hedged_retry_mode_speed
+      - codex_abnormal_reasoning_retry_hedged_retry_mode_quality_desc
+      - codex_abnormal_reasoning_retry_hedged_retry_mode_speed_desc
+
+  - id: auth-files-management
+    status: shared
+    reason: Auth files are shared credential management, OAuth alias and exclusion editing, xAI official API routing, weighted-round-robin credential weight editing, and quota state inputs.
+    routes:
+      - /auth-files
+      - /auth-files/oauth-excluded
+      - /auth-files/oauth-model-alias
+      - /oauth
+    panel_files:
+      - src/pages/AuthFilesPage.tsx
+      - src/pages/AuthFilesOAuthExcludedEditPage.tsx
+      - src/pages/AuthFilesOAuthModelAliasEditPage.tsx
+      - src/pages/OAuthPage.tsx
+      - src/components/modelAlias/
+      - src/features/authFiles/
+      - src/features/authFiles/oauthConfigLoadGuard.test.mjs
+      - src/utils/quota/upstreamQuotaPort.test.mjs
+      - src/hooks/useUnsavedChangesGuard.ts
+      - src/services/api/authFiles.ts
+      - src/features/authFiles/constants.ts
+      - src/features/authFiles/reauthRequired.test.mjs
+      - src/services/api/oauth.ts
+      - src/pages/devinOAuth.ts
+      - scripts/smoke-v8-alignment.py
+      - src/lts/codexRemoteCloudConnect/
+      - src/i18n/locales/
+      - src/types/authFile.ts
+      - src/types/oauth.ts
+      - src/utils/credentialWeight.ts
+      - scripts/smoke-lts-panel.py
+      - scripts/smoke-lts-panel-core.py
+    core_endpoints:
+      - /v8/management/credentials/refresh
+      - /v8/management/routing/cooldown/reset
+      - /v8/management/credentials
+      - /v8/management/credentials/status
+      - /v8/management/credentials/fields
+      - /v8/management/credentials/models
+      - /v0/management/auth-files/models/refresh
+      - /v8/management/config/oauth/excluded-models
+      - /v8/management/config/oauth/model-alias
+    required_markers:
+      - CredentialActionDialog
+      - requestManualRefresh
+      - requestAllManualRefresh
+      - validateCooldownResponse
+      - validateDevinCallback
+      - normalizeBatchUploadResponse
+      - normalizeBatchDeleteResponse
+      - AUTH_FILE_INVALID_JSON_OBJECT_ERROR
+      - OAUTH_PROVIDER_PRESETS
+      - CodexRemoteCloudConnectEnvironmentsModal
+      - useCodexRemoteCloudConnectEnvironments
+      - CodexRemoteCloudConnectAuthFileAction
+      - CodexRemoteCloudConnectAuthFileSummary
+      - codex_remote_cloud_connect_environment_button
+      - codex_remote_cloud_connect_environment_card_summary
+      - AUTH_FILE_WEBSOCKET_PROVIDERS
+      - supportsAuthFileWebsockets
+      - websockets_label
+      - AUTH_FILE_USING_API_PROVIDERS
+      - supportsAuthFileUsingApi
+      - readAuthFileUsingApi
+      - using_api_label
+      - run_auth_file_using_api_smoke
+      - run_auth_files_write_smoke
+      - force-mapping
+      - hasModelAliasConflict
+      - isOAuthEditorDirty
+      - getEffectiveOAuthExcludedRules
+      - preserves OAuth model-alias force mapping in both wire variants
+      - normalizes and toggles OAuth excluded rules without dropping custom patterns
+      - keeps OAuth dirty signatures stable while detecting partial edits
+      - useUnsavedChangesGuard
+      - run_oauth_editor_smoke
+      - OAuthConfigLoadError
+      - canWriteOAuthConfig
+      - run_oauth_load_failure_smoke
+      - run_oauth_plugin_model_refresh_smoke
+      - 'weight?: number | null'
+      - validateCredentialWeightText
+      - weight_invalid_max
+      - accepts WRR strategy aliases and enforces credential weight bounds
+      - Auth file credential weight round-tripped through Core
+      - reauth_required
+      - reauthRequired
+    validation:
+      - npm run test:auth-files
+      - npm run smoke:lts
+
+  - id: quota-management
+    status: shared
+    reason: Quota surfaces include LTS Codex quota helpers, companion ChatGPT userscripts, accepted xAI/Grok quota support, and the current Antigravity quota-summary groups plus best-effort subscription metadata.
+    routes:
+      - /quota
+    panel_files:
+      - src/pages/QuotaPage.tsx
+      - src/components/quota/
+      - src/features/authFiles/components/AuthFileQuotaSection.tsx
+      - src/features/authFiles/constants.ts
+      - src/services/api/apiCall.ts
+      - src/services/api/antigravitySubscription.ts
+      - src/services/api/pluginQuota.ts
+      - src/services/api/devinQuota.ts
+      - src/services/api/metaQuota.ts
+      - src/services/api/claudeResetGrants.ts
+      - src/stores/useAuthStore.ts
+      - src/stores/useQuotaStore.ts
+      - src/types/quota.ts
+      - src/utils/quota/
+      - src/lts/codexQuota/
+      - src/i18n/locales/
+      - scripts/chatgpt-quota-helper.js
+      - scripts/codex-quota-compass.user.js
+      - scripts/smoke-lts-panel.py
+    core_endpoints:
+      - /v0/management/api-call
+      - /v8/management/plugins/:id/quota
+    required_markers:
+      - DEVIN_CONFIG
+      - META_CONFIG
+      - createResetGrantOperations
+      - ANTHROPIC_RESET_GRANT_PROGRAM
+      - PLUGIN_CONFIG
+      - quotaPluginId
+      - normalizePluginQuotaSummary
+      - CODEX_CONFIG
+      - resetCodexQuota
+      - CODEX_RATE_LIMIT_RESET_CREDITS_URL
+      - CODEX_RATE_LIMIT_RESET_CREDITS_CONSUME_URL
+      - CODEX_REQUEST_HEADERS
+      - codex-tui/0.149.1
+      - retrieveUserQuotaSummary
+      - antigravity/hub/2.24.0
+      - ANTIGRAVITY_CODE_ASSIST_URL
+      - buildAntigravityQuotaGroups
+      - AntigravityQuotaSummaryPayload
+      - missing_project_id
+      - parses Antigravity quota-summary groups and current request identity
+      - XAI_CONFIG
+      - fetchXaiQuota
+      - XAI_BILLING_WEEKLY_URL
+      - XAI_BILLING_MONTHLY_URL
+      - XAI_USER_URL
+      - XAI_AUTO_TOPUP_URL
+      - XAI_GROK_CLIENT_VERSION
+      - buildXaiGrokUserAgent
+      - buildXaiRequestHeaders
+      - parseXaiAutoTopupPayload
+      - preserveAutoTopup
+      - x-grok-client-mode
+      - grok-pager/1.0.70
+      - assert_xai_billing_identity
+      - assert_xai_user_identity_lookup
+      - assert_xai_auto_topup_identity
+      - batchConcurrency
+      - captureQuotaCacheGeneration
+      - commitIfQuotaCacheCurrent
+      - clearQuotaCache
+      - run_quota_runtime_smoke
+      - codex-smoke-auth
+      - codex-team-smoke-auth
+      - xai-smoke-auth
+      - daily-workspace-usage-counts
+      - usage-leaderboard
+      - CODEX_ANALYTICS_HISTORY_DAYS
+      - CODEX_ROLLING_RANGE_DAYS
+      - codexTeamLeaderboardCacheKey
+      - classifyCodexLeaderboardPayloadForAccount
+      - team_analytics_incomplete
+      - duplicate date
+      - daily-analytics-integrity
+      - team-leaderboard-integrity
+      - rolling-90
+      - rolling-360
+      - Last 360 days
+      - assert_codex_daily_workspace_fetch
+      - rate-limit-reset-credits
+      - rate-limit-reset-credits/consume
+      - cli-chat-proxy.grok.com/v1/billing
+      - weekly_estimate_usd_inline
+      - analytics_backend_now
+      - formatCodexUsdAmount
+      - CodexResetCreditsDetailsButton
+      - LTS-owned reset credit details dialog
+      - showCodexQuotaResetConfirmation
+      - getCodexRateLimitResetCreditsInfo
+      - CODEX_RESET_CREDITS_REQUEST_TIMEOUT_MS
+      - sortCodexResetCredits
+      - rateLimitResetCredits
+      - codexPlanItem
+      - .codexDetails[open] .codexDetailsChevron
+      - .codexResetCreditCard
+      - reset_credits_details_button
+      - Est weekly 0.31 USD
+      - credits_unit
+    validation:
+      - npm run smoke:lts
+      - node --check scripts/chatgpt-quota-helper.js
+      - node --check scripts/codex-quota-compass.user.js
+
+  - id: theme-policy
+    status: lts-maintained
+    reason: CPA-Panel-LTS ships Pure White as the neutral default plus two Aurora glass themes (aurora-nebula dark, aurora-dawn light). Removed Paper, Dark, Auto, Mist, or invalid persisted values permanently migrate to White.
+    panel_files:
+      - src/App.tsx
+      - src/components/layout/MainLayout.tsx
+      - src/stores/useThemeStore.ts
+      - src/stores/themeWorkspace.test.mjs
+      - src/styles/themes.scss
+      - src/types/common.ts
+      - src/utils/constants.ts
+      - src/i18n/locales/
+      - scripts/smoke-lts-panel.py
+    required_markers:
+      - normalizeTheme
+      - "version: 4"
+      - removeAttribute('data-theme')
+      - "Theme = 'white' | 'aurora-nebula' | 'aurora-dawn'"
+      - "[data-theme='aurora-nebula']"
+      - theme.white
+      - theme.aurora_nebula
+      - theme.aurora_dawn
+      - permanently migrates removed and invalid themes to white
+      - Legacy paper theme did not migrate permanently to white
+      - Default theme restored a tinted paper surface
+    validation:
+      - npm run test:ui
+      - npm run check:lts
+      - npm run type-check
+      - npm run build
+      - npm run smoke:lts
+
+  - id: next-workspace-shell
+    status: lts-maintained
+    reason: The downstream Next shell provides the Tower navigation layout, a Core-scoped workspace, compact/classic navigation, and a keyboard command palette without replacing protected Usage or stable provider routes.
+    routes:
+      - /core
+      - /core/workspace
+    panel_files:
+      - src/App.tsx
+      - src/router/MainRoutes.tsx
+      - src/components/layout/MainLayout.tsx
+      - src/components/layout/SidebarNavigation.tsx
+      - src/components/layout/sidebarNavigationModel.ts
+      - src/components/layout/CommandPalette.tsx
+      - src/pages/CoreWorkspace.tsx
+      - src/pages/CoreWorkspace.module.scss
+      - src/stores/useWorkspaceStore.ts
+      - src/stores/themeWorkspace.test.mjs
+      - src/styles/layout.scss
+      - src/styles/next.scss
+      - src/types/common.ts
+      - src/utils/constants.ts
+      - src/i18n/locales/
+      - scripts/smoke-lts-panel.py
+    required_markers:
+      - "WorkspaceLayout = 'tower'"
+      - normalizeWorkspaceLayout
+      - cli-proxy-workspace-layout
+      - data-workspace-layout
+      - sidebar-mode-compact
+      - CommandPalette
+      - CoreWorkspace
+      - "path: '/core'"
+      - "path: '/core/workspace'"
+      - core_workspace.summary_aria
+      - Command palette allowed Tab focus to escape the modal
+      - keeps only the tower workspace layout
+    validation:
+      - npm run test:ui
+      - npm run check:lts
+      - npm run type-check
+      - npm run build
+      - npm run smoke:lts
+
+  - id: codex-remote-environment-advice
+    status: lts-maintained
+    reason: Unknown online status is not proof that an environment can be cleaned up; delayed rechecks must detect normalized heartbeat, version and identity changes as well as count changes.
+    panel_files:
+      - src/lts/codexRemoteCloudConnect/viewModel.ts
+      - src/lts/codexRemoteCloudConnect/viewModel.test.mjs
+      - package.json
+    required_markers:
+      - createCodexRemoteCloudConnectEnvironmentViewModel
+      - areCodexRemoteCloudConnectEnvironmentSummariesEqual
+      - test:codex-remote
+    validation:
+      - npm run test:codex-remote
+      - npm run check:lts
+      - npm run type-check
+      - npm run smoke:lts
+
+  - id: local-flow-control-config
+    status: lts-maintained
+    reason: Opt-in multi-dimensional local admission settings must preserve old YAML and be editable only with a Core that provides the read-only capability/status API. Editing and observation are separate capability-gated pages under /analytics; /flow-control remains a configuration redirect.
+    panel_files:
+      - src/lts/flowControl/
+      - src/services/api/flowControl.ts
+      - src/types/visualConfig.ts
+      - src/hooks/useVisualConfig.ts
+      - src/pages/FlowControlPage.tsx
+      - src/pages/FlowDashboardPage.tsx
+      - src/pages/FlowControlPage.module.scss
+      - src/router/MainRoutes.tsx
+      - src/stores/useAuthStore.ts
+      - src/lts/i18n/
+      - docs/lts/flow-control.md
+    routes:
+      - /flow-control
+      - /analytics/flow
+      - /analytics/flow/config
+    capability_gates:
+      - supportsFlowControl
+      - flowSupportKnown
+      - RequireFlowSupport
+    core_endpoints:
+      - /v0/management/flow-control
+      - /v0/management/flow-control/events
+      - /v0/management/flow-control/explain
+      - /v0/management/flow-control/summary
+      - /v0/management/flow-control/details
+      - /v0/management/flow-control/preview
+      - /v0/management/flow-control/migration-preview
+    required_markers:
+      - FlowControlFields
+      - flow-control-settings
+      - key-model
+      - account-model
+      - flowControlEnabled
+      - resolved-model-options
+      - configuration-failure
+    validation:
+      - npm run test:flow-control
+      - npm run check:lts
+      - npm run type-check
+      - npm run build
+      - npm run smoke:config
+
+  - id: advanced-analytics-workspace
+    status: lts-maintained
+    reason: Historical request analysis stays independent of Flow capabilities; the full usage overview retains model share, pricing, events and import/export.
+    panel_files:
+      - src/pages/AnalyticsLayout.tsx
+      - src/pages/AnalyticsPage.module.scss
+      - src/pages/ObservabilityPage.tsx
+      - src/services/api/usage.ts
+      - src/services/api/usageAnalytics.ts
+      - src/services/api/usageAnalytics.test.mjs
+      - src/stores/usageAnalyticsCache.ts
+      - src/types/usageAnalytics.ts
+      - src/utils/usage/analyticsModel.ts
+      - src/components/usage/UsageAnalyticsCharts.tsx
+      - src/components/usage/hooks/useUsageAnalytics.ts
+      - src/services/api/usageQuery.ts
+      - src/components/usage/UsageAnalyticsSection.tsx
+      - src/components/usage/hooks/useUsageAnalyticsDetails.ts
+      - src/pages/UsagePage.tsx
+      - src/router/MainRoutes.tsx
+      - src/components/layout/MainLayout.tsx
+      - src/services/connectionSession.ts
+      - src/lts/i18n/
+      - docs/lts/advanced-analytics.md
+    routes:
+      - /analytics
+      - /analytics/observability
+    core_endpoints:
+      - /v0/management/usage
+      - /v0/management/usage/query/analytics
+      - /v0/management/usage/query/details
+    required_markers:
+      - analytics_version
+      - UsageAnalyticsSection
+      - ModelShareCard
+      - USAGE_ANALYTICS_AUTO_LOAD_WINDOW_HOURS
+    validation:
+      - npm run test:usage-analytics
+      - npm run test:connections
+      - npm run check:lts
+      - npm run type-check
+      - npm run build
+
+  - id: codex-siwc-binding
+    status: shared
+    reason: File-backed Codex credentials can bind SIWC and toggle its use through the native V8 API. The flow keeps callback ownership, cancellable polling, original-connection cleanup and credential/cache readback.
+    routes:
+      - /auth-files
+    panel_files:
+      - src/pages/AuthFilesPage.tsx
+      - src/features/authFiles/components/AuthFileCard.tsx
+      - src/features/authFiles/components/SiwcBindDialog.tsx
+      - src/features/authFiles/siwcBinding.ts
+      - src/services/api/oauth.ts
+      - src/services/api/authFiles.ts
+      - src/services/api/client.ts
+      - src/services/api/client.test.mjs
+      - src/pages/oauthAttempts.test.mjs
+    core_endpoints:
+      - /v8/management/oauth/siwc/bind
+      - /v8/management/oauth/status
+      - /v8/management/oauth/callback
+      - /v8/management/oauth/session
+      - /v8/management/credentials/fields
+    required_markers:
+      - captureSiwcBindingApi
+      - createSiwcStart
+      - isSiwcCallbackValid
+      - supportsSiwcBinding
+      - use_siwc

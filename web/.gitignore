@@ -1,0 +1,42 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+api.md
+usage.json
+CLAUDE.md
+management-api*
+antigravity_usage.json
+codex_usage.json
+style.md
+
+node_modules
+dist
+dist-ssr
+*.local
+__pycache__/
+*.py[cod]
+local/
+skills
+# Local helper userscripts
+/scripts/*.user.js
+!/scripts/codex-quota-compass.user.js
+
+# Editor directories and files
+settings.local.json
+.codex
+.playwright-mcp/
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+/output

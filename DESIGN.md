@@ -1,43 +1,37 @@
-# Design
+# Antigravity Proxy administrative console
 
 ## Source of truth
-Active, 2026-11-09. Embedded `/dashboard` and protected `/admin/dashboard`. Evidence: Nest/Fastify server, AdminGuard, account repository and quota diagnostics; no previous UI, theme, assets or screenshot baseline exists.
+Active 2026-11-09. React frontend in `web/src/agp`, mounted by `web/src/App.tsx`. Upstream MIT UI: BlueSkyXN/CPA-Panel-LTS pinned to `72247c812be814f2158927c2f8d3ffded7c688c1` (`web/UPSTREAM.json`, unmodified full `web/LICENSE`). The old handmade dashboard is superseded. Backend contracts live under `src/admin-console` and `src/observability`.
 
-## Brand
-Private operational console: calm, clear, restrained. Trust comes from timestamps, explicit unknowns and session scope. Avoid decorative charts and implied availability guarantees.
-
-## Product goals
-See account availability, configured project activity and recent successful/failed requests. No credential editing, request contents or account mutation. Success means an administrator can locate a failure and its project without exposing secrets.
+## Brand and product goals
+Private operational console for managing real Google accounts, model capacity, projects and runtime settings, and investigating persistent metadata. Russian operational copy, explicit freshness and unknown measurements. No request/response contents or existing bearer secrets displayed.
 
 ## Personas and jobs
-Proxy administrator diagnosing account capacity or client failures from desktop or phone.
+Administrator: check capacity, add or retire an account, manage project keys, identify a failed request and compare account/model outcomes over a selected period.
 
 ## Information architecture
-Public login shell → authenticated overview → accounts → runtime model capacity → projects → session request journal. Refresh and exit remain visible.
+Cookie session → separate hash routes: overview `/`, accounts `/accounts`, models `/models`, projects `/projects`, requests `/requests`, statistics `/statistics`, settings `/settings`, attribution `/about`. Every operational section exposes refresh. No unsupported CPA provider/plugin controls.
 
 ## Design principles
-Summarize first; show unknown separately from unavailable. Record HTTP outcomes, never prompts. Prefer native elements and explicit text over color alone.
+Reuse the pinned frontend's actual components and styles. Reflect server data and accepted actions. Distinguish catalog membership, requestability, stale quota and unavailable measurements. Confirm deletion, rotation and account reactivation; require explicit review when Google restrictions apply.
 
 ## Visual language
-Dark navy background, pale text, muted slate metadata, mint success, coral errors. System sans font; tabular numeric data; 8px spacing base, rounded bordered cards. No external fonts, imagery or animation. CSS tokens live in dashboard page source.
+Upstream CPA Panel LTS light neutral theme, sidebar navigation, bordered surfaces, muted metadata, green success and red warning labels. Preserve upstream global tokens and responsive table/chart styles; adapter SCSS adjusts only supported console composition. No remote fonts, scripts or CDN dependencies.
 
-## Components
-Password login form; status banner; four metric cards; horizontally scrollable account, quota, project and request tables; native status/project selects; refresh and exit buttons. All values render with textContent.
+## Components and upstream reuse
+Direct imports: SidebarNavigation and sidebarNavigationModel; Card, Button, Input, Modal; complete Table suite; ThroughputChart with its SCSS, helpers and Collapsible; Russian translation resources and global themes/components/layout/reset. The upstream runtime auth store, provider APIs and multi-server shell are bypassed by a same-origin typed adapter rather than emulated CPA responses. Modal/Sheet timer refs have a narrow browser-number typing fix. Full MIT notice is also rendered on `/about` and attribution remains visible in sidebar/footer.
 
-## Accessibility
-Target WCAG 2.2 AA: semantic headings/tables, visible keyboard focus, explicit labels, live status region, text status indicators, high contrast. No motion or hover-only interactions.
-
-## Responsive behavior
-Four summary columns become two below 760px. Tables scroll within their card; buttons wrap. Form and touch controls retain comfortable height.
+## Accessibility and responsive behavior
+Semantic headings, labeled inputs, table header scopes, live loading/error/success regions, keyboard focus, skip link, upstream modal focus trapping and Escape dismissal. Four metric columns reduce to two; sidebar becomes a menu on narrow screens; tables scroll within upstream wrappers. Reduced motion preference disables animation.
 
 ## Interaction states
-Initial locked shell contains no private data. Loading banner during fetch; explicit authorization/network error; empty-table copy; last update on success. Slow requests time out after 15 seconds; polling every 15 seconds. Exit clears memory and private rendered data.
+Session check on initial load preserves valid remembered sessions. Remember defaults to seven days. Login names `AG_PROXY_ADMIN_API_KEY` as the server-side password source. Every page has loading, server/offline error, empty and refreshed states. Mutations show pending/error/success; credentials clear after import/OAuth or closing the modal. Google flow uses server state-bound callback polling with manual code/URL fallback. Project secrets appear once after creation/rotation, support clipboard copy and clear on close.
 
-## Content voice
-Concise Russian operational wording. “По снимку” for stored account capacity; runtime diagnostics separately show actual model requestability. State session-only retention and lack of response/error bodies.
+## Data contracts and content voice
+`/admin/session` GET/POST/DELETE establishes HttpOnly SameSite session; mutation headers carry session CSRF. `/admin/console`: accounts/import/PATCH/DELETE/quota refresh and quota diagnostics; models and aliases; projects CRUD/rotate; settings; OAuth start/status/exchange; requests with server pagination and account/project/model/status/date filters; statistics with dated totals, per-day/per-model and account attempt aggregates. Request detail contains allowlisted metadata and attempt history only. Null/absent tokens and TTFT render “Неизвестно”; counters known to be zero remain zero. Request search explicitly applies to the loaded page. Counts reflect retained history, with retention bounds shown.
 
-## Implementation constraints
-Self-contained HTML/CSS/JS, no UI dependencies or external requests. Admin key stays in closure memory and travels only in Authorization. API uses AdminGuard and no-store. Journal holds 500 completed requests in memory; lifetime counters remain session totals. Tests cover auth, whitelisted snapshots, redaction, bounds and markup. Browser screenshot acceptance is desirable; no existing visual baseline.
+## Implementation constraints and validation
+Single HTML Vite build, served from the same origin by Node. Active adapter never stores management password or bearer keys in local/session storage, and refuses external API destinations or redirects. Browser credentials transfer only through explicit login/import/OAuth operations. Existing project keys are absent from read responses. No production account mutations are needed for validation. Targeted adapter tests verify auth/CSRF/origin/error/mapping/unknown semantics; `lint:agp`, full TypeScript check and single-file production build validate integration. Browser acceptance is owned by root integration.
 
 ## Open questions
-- [ ] Persist journal across restarts? Owner: operator; currently deliberately session-only.
+None affecting the current supported contract. Legacy requests before persistent recording are unavailable; live Google OAuth still requires the operator's actual authorization and is not fabricated by local tests.

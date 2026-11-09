@@ -1,3 +1,4 @@
+import { observeSelectedAccount } from '../../../observability/request-context';
 import type { CloudAccount } from '@/modules/cloud-account/types';
 import type { AccountLeaseHydrationPolicy } from './account-lease-hydration-policy';
 import type { AccountLeaseTokenData } from './account-lease-token-types';
@@ -51,6 +52,7 @@ export class AccountLeaseFulfillmentPolicy {
       // Speculative binding is never performed during lease fulfillment.
       // Session affinity is strictly confirmed upon successful upstream response/usable output.
 
+      observeSelectedAccount(accountId);
       return {
         id: accountId,
         provider: 'google',

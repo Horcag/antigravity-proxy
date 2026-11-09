@@ -1,0 +1,210 @@
+import { useEffect, useRef, useState } from 'react';
+import { ltsExtensionClient } from '@/services/api/client';
+import { useAuthStore } from '@/stores';
+import { FLOW_CONTROL_ENDPOINTS } from '@/services/api/flowControl';
+import { computeLtsExtensionApiUrl } from '@/utils/connection';
+import { getConnectionFrameElement } from '@/services/connectionRuntime';
+import {
+  asRecord, canObserveLive, mergeSummary, parseFlowCapabilities, parseFlowEvent,
+  type FlowSupport, type FlowStatus,
+} from './model';
+import { FlowSSEDecoder } from './sse';
+import { appendFlowSample, type FlowPoint } from './history';
+
+export type FlowLiveState = 'off' | 'connecting' | 'live' | 'reconnecting' | 'paused' | 'disabled' | 'error';
+
+function isObservationVisible() {
+  return typeof document === 'undefined' || (
+    !document.hidden && getConnectionFrameElement()?.getAttribute('data-active') !== 'false'
+  );
+}
+
+export function useFlowControlStatus({ active = true, observationVisible = true }: { active?: boolean; observationVisible?: boolean } = {}) {
+  const apiBase = useAuthStore((state) => state.apiBase);
+  const managementKey = useAuthStore((state) => state.managementKey);
+  const connectionStatus = useAuthStore((state) => state.connectionStatus);
+  const [revision, setRevision] = useState(0);
+  const [statusVersion, setStatusVersion] = useState(0);
+  const [support, setSupport] = useState<FlowSupport>({ state: 'loading' });
+  const loadedPolicyState = useRef<FlowStatus | null>(null);
+  const [live, setLive] = useState(false);
+  const [liveState, setLiveState] = useState<FlowLiveState>('off');
+  const [visible, setVisible] = useState(isObservationVisible);
+  const [history, setHistory] = useState<FlowPoint[]>([]);
+
+  useEffect(() => {
+    const change = () => setVisible(isObservationVisible());
+    // Hiding a connected instance does not fire the document visibility event.
+    const frame = getConnectionFrameElement();
+    const observer = frame ? new MutationObserver(change) : null;
+    if (frame) observer?.observe(frame, { attributes: true, attributeFilter: ['data-active'] });
+    document.addEventListener('visibilitychange', change);
+    change();
+    return () => {
+      observer?.disconnect();
+      document.removeEventListener('visibilitychange', change);
+    };
+  }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    if (!active) return;
+    loadedPolicyState.current = null;
+    setSupport({ state: 'loading' });
+    setHistory([]);
+    if (connectionStatus === 'connected') {
+      void ltsExtensionClient.get<unknown>(FLOW_CONTROL_ENDPOINTS.status).then((raw) => {
+        if (stopped) return;
+        const data = parseFlowCapabilities(raw);
+        loadedPolicyState.current = data?.state ?? null;
+        setSupport(data ? { state: 'ready', data } : { state: 'unsupported' });
+        setStatusVersion(version => version + 1);
+      }).catch((error: unknown) => {
+        if (stopped) return;
+        const detail = asRecord(error);
+        setSupport({ state: detail?.status === 404 || detail?.status === 501 ? 'unsupported' : 'error' });
+      });
+    }
+    return () => { stopped = true; };
+  }, [apiBase, managementKey, connectionStatus, revision, active]);
+
+  const ready = support.state === 'ready' && support.data.supported;
+  const enabled = canObserveLive(support.state === 'ready' ? support.data : null);
+  const interval = support.state === 'ready' ? support.data['events-interval-ms'] : 2000;
+
+  useEffect(() => {
+    if (!live) { setLiveState('off'); return; }
+    if (!active || !observationVisible) { setLiveState('paused'); return; }
+    if (!visible) { setLiveState('paused'); return; }
+    if (!ready || connectionStatus !== 'connected') { setLiveState('error'); return; }
+    // A newly opened page must wait for its fresh capability read, not connect using the previous visit's state.
+    if (!loadedPolicyState.current) { setLiveState('connecting'); return; }
+    if (!enabled) { setLiveState('disabled'); return; }
+
+    let stopped = false;
+    let permanent = false;
+    let failures = 0;
+    let controller: AbortController | undefined;
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    // Compare the first frame with the last full policy read, not an earlier
+    // summary: observation may have stopped while the policy/process changed.
+    let lastRevision = loadedPolicyState.current?.['policy-revision'];
+    let lastProcess = loadedPolicyState.current?.['process-id'] ?? '';
+    const clearWatchdog = () => { if (watchdog) clearTimeout(watchdog); };
+    const serverDisabled = () => {
+      permanent = true;
+      if (stopped) return;
+      setLiveState('disabled');
+      setSupport((old) => old.state === 'ready'
+        ? { ...old, data: { ...old.data, 'events-enabled': false } } : old);
+    };
+    let firstFrame = true;
+    const accept = (state: FlowStatus) => {
+      if (stopped) return;
+      setSupport((old) => old.state === 'ready' ? {
+        state: 'ready',
+        data: {
+          ...old.data,
+          state: mergeSummary(old.data.state, state),
+          ...(state.observation ? {
+            'events-enabled': state.observation.realtime,
+            'events-interval-ms': state.observation['interval-ms'],
+          } : {}),
+        },
+      } : old);
+      const restarted = !!lastProcess && lastProcess !== state['process-id'];
+      lastProcess = state['process-id'] ?? '';
+      const discontinuity = firstFrame;
+      firstFrame = false;
+      setHistory((old) => appendFlowSample(old, state, { reset: restarted, discontinuity, intervalMs: interval }));
+      // Refresh the rule/alias directory only after a policy or process change,
+      // not on every summary. A late response must not replace a newer summary.
+      if ((lastRevision !== undefined && state['policy-revision'] !== lastRevision) || restarted) {
+        void ltsExtensionClient.get<unknown>(FLOW_CONTROL_ENDPOINTS.status).then((raw) => {
+          if (stopped) return;
+          const data = parseFlowCapabilities(raw);
+          if (!data) return;
+          setSupport((old) => {
+            const current = old.state === 'ready' ? old.data.state : undefined;
+            if (current && current['process-id'] === data.state['process-id']
+              && (current['policy-revision'] ?? 0) > (data.state['policy-revision'] ?? 0)) return old;
+            loadedPolicyState.current = data.state;
+            return { state: 'ready', data };
+          });
+        }).catch(() => {});
+      }
+      lastRevision = state['policy-revision'];
+    };
+
+    const connect = async () => {
+      if (stopped || permanent) return;
+      firstFrame = true;
+      controller = new AbortController();
+      setLiveState(failures ? 'reconnecting' : 'connecting');
+      const resetWatchdog = () => {
+        clearWatchdog();
+        watchdog = setTimeout(() => controller?.abort(), Math.max(15000, interval * 3 + 5000));
+      };
+      resetWatchdog();
+      try {
+        // Flow observation is an LTS extension served only under /v0/management.
+        const response = await fetch(`${computeLtsExtensionApiUrl(apiBase)}${FLOW_CONTROL_ENDPOINTS.events}`, {
+          headers: { Authorization: `Bearer ${managementKey}`, Accept: 'text/event-stream' },
+          signal: controller.signal, cache: 'no-store', redirect: 'error',
+        });
+        if ([401, 403, 404, 409, 501].includes(response.status)) {
+          permanent = true;
+          if (response.status === 409) serverDisabled();
+          else if (!stopped) setLiveState('error');
+          await response.body?.cancel().catch(() => {});
+          return;
+        }
+        if (!response.ok || !response.body) throw new Error('Observation unavailable');
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        const frames = new FlowSSEDecoder((raw) => {
+          if (asRecord(raw)?.['realtime-disabled'] === true) {
+            serverDisabled();
+            controller?.abort();
+            return;
+          }
+          const state = parseFlowEvent(raw);
+          if (!state) throw new Error('Invalid summary');
+          accept(state);
+          failures = 0;
+          if (!stopped) setLiveState('live');
+        }, 256 * 1024);
+        try {
+          for (;;) {
+            const item = await reader.read();
+            if (item.done) break;
+            resetWatchdog();
+            frames.feed(decoder.decode(item.value, { stream: true }));
+          }
+        } finally {
+          await reader.cancel().catch(() => {});
+          reader.releaseLock();
+        }
+      } catch {
+        // Reconnect only observation. Never replay a model request or fall back
+        // to automatic GET polling when the administrator disables realtime.
+      } finally {
+        clearWatchdog();
+      }
+      if (stopped || permanent) return;
+      failures++;
+      setLiveState('reconnecting');
+      retry = setTimeout(() => { void connect(); }, Math.min(10000, 1000 * 2 ** Math.min(failures, 3)));
+    };
+    void connect();
+    return () => {
+      stopped = true;
+      controller?.abort();
+      clearWatchdog();
+      if (retry) clearTimeout(retry);
+    };
+  }, [apiBase, managementKey, connectionStatus, ready, enabled, interval, live, visible, revision, active, observationVisible, statusVersion]);
+
+  return { support, refresh: () => setRevision((value) => value + 1), live, setLive, liveState, history };
+}

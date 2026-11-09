@@ -415,10 +415,11 @@ export class AdminService {
         id_token: tokenResponse.id_token,
         upstream_proxy_url: request.proxy_url,
       },
-      quota,
+      quota: existing?.status === 'expired' ? existing.quota : quota,
       created_at: existing?.created_at ?? now,
       last_used: now,
-      status: 'active',
+      status: existing?.status ?? 'active',
+      status_reason: existing?.status_reason,
       is_active: existing?.is_active ?? false,
       proxy_url: request.proxy_url,
     });

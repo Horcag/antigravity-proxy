@@ -1,0 +1,539 @@
+/** Official provider catalog data is kept separate from the pricing engine and UI. */
+export const PRICE_CURRENCY = 'USD' as const;
+export const OPENAI_CATALOG_AS_OF = '2026-10-03';
+export const GPT6_ASTRA_CATALOG_AS_OF = OPENAI_CATALOG_AS_OF;
+export const ZAI_CATALOG_AS_OF = '2026-07-22';
+export const KIMI_CATALOG_AS_OF = '2026-07-28';
+export const XAI_CATALOG_AS_OF = '2026-07-23';
+export const CODEX_SPARK_CATALOG_AS_OF = '2026-07-25';
+export const ANTHROPIC_CATALOG_AS_OF = '2026-07-26';
+export const PRICE_CATALOG_AS_OF = OPENAI_CATALOG_AS_OF;
+export const PRICE_CATALOG_VERSION = `api-${PRICE_CATALOG_AS_OF}`;
+export const OPENAI_PRICING_SOURCE_URL = 'https://developers.openai.com/api/docs/pricing';
+export const ZAI_PRICING_SOURCE_URL = 'https://docs.z.ai/guides/overview/pricing';
+export const KIMI_PRICING_SOURCE_URL = 'https://platform.kimi.ai/docs/pricing/chat';
+export const XAI_PRICING_SOURCE_URL = 'https://docs.x.ai/developers/models/grok-4.5';
+export const XAI_GROK_46_PRICING_SOURCE_URL = 'https://docs.x.ai/developers/models/grok-4.6';
+export const XAI_GROK_46_CATALOG_AS_OF = '2026-08-18';
+export const XAI_GROK_43_PRICING_SOURCE_URL = 'https://docs.x.ai/developers/models/grok-4.3';
+export const XAI_GROK_43_CATALOG_AS_OF = '2026-10-10';
+export const XAI_GROK_47_PRICING_SOURCE_URL = 'https://docs.x.ai/developers/models/grok-4.7';
+export const XAI_GROK_47_CATALOG_AS_OF = '2026-10-10';
+export const XAI_GROK_47_FAST_PRICING_SOURCE_URL =
+  'https://docs.x.ai/developers/pricing#grok-47-fast-pricing-cursor-and-grok-build-only';
+export const XAI_GROK_47_FAST_CATALOG_AS_OF = '2026-10-13';
+export const DOUBAO_PRICING_SOURCE_URL = 'https://www.volcengine.com/docs/82379/1099320';
+export const DOUBAO_CATALOG_AS_OF = '2026-10-10';
+export const GEMINI_PRICING_SOURCE_URL = 'https://aistudio.google.com/docs/pricing';
+export const GEMINI_CATALOG_AS_OF = '2026-11-07';
+export const ANTHROPIC_PRICING_SOURCE_URL =
+  'https://platform.claude.com/docs/en/about-claude/pricing';
+export const ANTHROPIC_MODEL_IDS_SOURCE_URL =
+  'https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions';
+export const LONG_CONTEXT_INPUT_TOKEN_THRESHOLD = 272_000;
+export const XAI_LONG_CONTEXT_INPUT_TOKEN_THRESHOLD = 200_000;
+
+export interface TokenRates {
+  input: number;
+  cachedInput: number;
+  /** Omitted means Auto: use the selected tier's input rate. Explicit 0 is free. */
+  cacheWrite?: number;
+  output: number;
+}
+
+export interface LongContextPricing {
+  thresholdTokens: number;
+  basis: 'inputTokens';
+  appliesTo: 'entireRequest';
+  rates: TokenRates;
+}
+
+export interface StandardPricing {
+  short: TokenRates;
+  long?: LongContextPricing;
+}
+
+/** Explicit Fast bands share Standard's context threshold; legacy flat cards omit long. */
+export type FastPricing =
+  | { short: TokenRates; long?: TokenRates; multiplier?: never; longSupported: boolean }
+  | { short?: never; long?: never; multiplier: number; longSupported: boolean };
+
+export interface PriceCatalogEntry {
+  canonicalModel: string;
+  aliases: readonly string[];
+  currency: typeof PRICE_CURRENCY;
+  standard: StandardPricing;
+  fast?: FastPricing;
+  sourceUrl: string;
+  pricingNotesUrl?: string;
+  asOf: string;
+}
+
+const rateCard = (
+  input: number,
+  cachedInput: number,
+  cacheWrite: number | undefined,
+  output: number
+): TokenRates => ({
+  input,
+  cachedInput,
+  ...(cacheWrite === undefined ? {} : { cacheWrite }),
+  output,
+});
+
+const longCard = (
+  rates: TokenRates,
+  // The engine threshold is inclusive, while every official OpenAI model page
+  // words the uplift as strictly above 272K input tokens, so 272001 is the
+  // first long-context request.
+  thresholdTokens = LONG_CONTEXT_INPUT_TOKEN_THRESHOLD + 1
+): LongContextPricing => ({
+  thresholdTokens,
+  basis: 'inputTokens',
+  appliesTo: 'entireRequest',
+  rates,
+});
+
+const modelPricingNotesUrl = (model: string): string =>
+  `https://developers.openai.com/api/docs/models/${model}`;
+
+const kimiPricingSourceUrl = (model: 'k3' | 'k27-code'): string =>
+  `${KIMI_PRICING_SOURCE_URL}-${model}`;
+
+const kimiModelNotesUrl = (model: 'k3' | 'k2-7-code'): string =>
+  `https://platform.kimi.ai/docs/guide/kimi-${model}-quickstart`;
+
+/**
+ * Official provider rate cards, each carrying its own verification date and source.
+ * OpenAI model notes define the 272K long-context uplift when their aggregate table omits it.
+ */
+export const PRICE_CATALOG: readonly PriceCatalogEntry[] = [
+  {
+    canonicalModel: 'gpt-6-astra',
+    aliases: [],
+    currency: 'USD',
+    standard: {
+      short: rateCard(10, 1, 12.5, 50),
+      long: longCard(rateCard(20, 2, 25, 75)),
+    },
+    fast: {
+      short: rateCard(20, 2, 25, 100),
+      long: rateCard(40, 4, 50, 150),
+      longSupported: true,
+    },
+    sourceUrl: OPENAI_PRICING_SOURCE_URL,
+    pricingNotesUrl: modelPricingNotesUrl('gpt-6-astra'),
+    asOf: GPT6_ASTRA_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'gpt-6.1-terra',
+    aliases: [],
+    currency: 'USD',
+    standard: {
+      short: rateCard(1, 0.05, 1.25, 5),
+      long: longCard(rateCard(2, 0.1, 2.5, 7.5)),
+    },
+    fast: {
+      short: rateCard(2, 0.1, 2.5, 10),
+      long: rateCard(4, 0.2, 5, 15),
+      longSupported: true,
+    },
+    sourceUrl: OPENAI_PRICING_SOURCE_URL,
+    pricingNotesUrl: modelPricingNotesUrl('gpt-6.1-terra'),
+    asOf: '2026-11-07',
+  },
+  {
+    canonicalModel: 'gpt-6.1-sol',
+    aliases: [],
+    currency: 'USD',
+    standard: {
+      short: rateCard(2, 0.1, 2.5, 10),
+      long: longCard(rateCard(4, 0.2, 5, 15)),
+    },
+    fast: {
+      short: rateCard(4, 0.2, 5, 20),
+      long: rateCard(8, 0.4, 10, 30),
+      longSupported: true,
+    },
+    sourceUrl: OPENAI_PRICING_SOURCE_URL,
+    asOf: OPENAI_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'gpt-6-sol',
+    aliases: [],
+    currency: 'USD',
+    standard: {
+      short: rateCard(2, 0.2, 2.5, 10),
+      long: longCard(rateCard(4, 0.4, 5, 15)),
+    },
+    fast: {
+      short: rateCard(4, 0.4, 5, 20),
+      long: rateCard(8, 0.8, 10, 30),
+      longSupported: true,
+    },
+    sourceUrl: OPENAI_PRICING_SOURCE_URL,
+    pricingNotesUrl: modelPricingNotesUrl('gpt-6-sol'),
+    asOf: OPENAI_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'gpt-6-luna',
+    aliases: [],
+    currency: 'USD',
+    standard: {
+      short: rateCard(0.1, 0.01, 0.125, 0.5),
+      long: longCard(rateCard(0.2, 0.02, 0.25, 0.75)),
+    },
+    fast: {
+      short: rateCard(0.2, 0.02, 0.25, 1),
+      long: rateCard(0.4, 0.04, 0.5, 1.5),
+      longSupported: true,
+    },
+    sourceUrl: OPENAI_PRICING_SOURCE_URL,
+    pricingNotesUrl: modelPricingNotesUrl('gpt-6-luna'),
+    asOf: OPENAI_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'gpt-5.6-sol',
+    // gpt-5.6 与 gpt-daybreak-blue-latest 均为官方别名（Daybreak 已标注弃用，
+    // 快照版本指向本模型）；目录别名复用本条目的价格与 canonical override。
+    aliases: ['gpt-5.6', 'gpt-daybreak-blue-latest'],
+    currency: 'USD',
+    // 用户提供的价格表：促销价至少持续至 2026-11-21，不推测到期后的价格。
+    standard: { short: rateCard(4, 0.4, 5, 20), long: longCard(rateCard(8, 0.8, 10, 30)) },
+    fast: {
+      short: rateCard(8, 0.8, 10, 40),
+      long: rateCard(16, 1.6, 20, 60),
+      longSupported: true,
+    },
+    sourceUrl: OPENAI_PRICING_SOURCE_URL,
+    pricingNotesUrl: modelPricingNotesUrl('gpt-5.6-sol'),
+    asOf: OPENAI_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'gpt-5.6-terra',
+    aliases: [],
+    currency: 'USD',
+    standard: {
+      short: rateCard(2, 0.2, 2.5, 12),
+      long: longCard(rateCard(4, 0.4, 5, 18)),
+    },
+    fast: {
+      short: rateCard(4, 0.4, 5, 24),
+      long: rateCard(8, 0.8, 10, 36),
+      longSupported: true,
+    },
+    sourceUrl: OPENAI_PRICING_SOURCE_URL,
+    pricingNotesUrl: modelPricingNotesUrl('gpt-5.6-terra'),
+    asOf: OPENAI_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'gpt-5.6-luna',
+    aliases: [],
+    currency: 'USD',
+    standard: {
+      short: rateCard(0.2, 0.02, 0.25, 1.2),
+      long: longCard(rateCard(0.4, 0.04, 0.5, 1.8)),
+    },
+    fast: {
+      short: rateCard(0.4, 0.04, 0.5, 2.4),
+      long: rateCard(0.8, 0.08, 1, 3.6),
+      longSupported: true,
+    },
+    sourceUrl: OPENAI_PRICING_SOURCE_URL,
+    pricingNotesUrl: modelPricingNotesUrl('gpt-5.6-luna'),
+    asOf: OPENAI_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'gpt-5.5',
+    aliases: [],
+    currency: 'USD',
+    standard: {
+      short: rateCard(5, 0.5, undefined, 30),
+      long: longCard(rateCard(10, 1, undefined, 45)),
+    },
+    fast: { multiplier: 2.5, longSupported: false },
+    sourceUrl: OPENAI_PRICING_SOURCE_URL,
+    pricingNotesUrl: modelPricingNotesUrl('gpt-5.5'),
+    asOf: OPENAI_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'gpt-5.4',
+    aliases: [],
+    currency: 'USD',
+    standard: {
+      short: rateCard(2.5, 0.25, undefined, 15),
+      long: longCard(rateCard(5, 0.5, undefined, 22.5)),
+    },
+    fast: { multiplier: 2, longSupported: false },
+    sourceUrl: OPENAI_PRICING_SOURCE_URL,
+    pricingNotesUrl: modelPricingNotesUrl('gpt-5.4'),
+    asOf: OPENAI_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'gpt-5.4-mini',
+    aliases: [],
+    currency: 'USD',
+    standard: { short: rateCard(0.75, 0.075, undefined, 4.5) },
+    fast: { multiplier: 2, longSupported: false },
+    sourceUrl: OPENAI_PRICING_SOURCE_URL,
+    asOf: OPENAI_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'gpt-5.3-codex-spark',
+    aliases: [],
+    currency: 'USD',
+    // This model is free. Use explicit zeroes so none of the token categories
+    // fall back to Auto pricing (including cache writes).
+    standard: { short: rateCard(0, 0, 0, 0) },
+    sourceUrl: OPENAI_PRICING_SOURCE_URL,
+    asOf: CODEX_SPARK_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'claude-haiku-4-5-20251001',
+    aliases: ['claude-haiku-4-5'],
+    currency: 'USD',
+    // Anthropic cacheWrite values use the requested 5-minute rate; 1-hour caching is out of scope.
+    standard: { short: rateCard(1, 0.1, 1.25, 5) },
+    sourceUrl: ANTHROPIC_PRICING_SOURCE_URL,
+    pricingNotesUrl: ANTHROPIC_MODEL_IDS_SOURCE_URL,
+    asOf: ANTHROPIC_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'claude-sonnet-4-5-20250929',
+    aliases: ['claude-sonnet-4-5'],
+    currency: 'USD',
+    standard: { short: rateCard(3, 0.3, 3.75, 15) },
+    sourceUrl: ANTHROPIC_PRICING_SOURCE_URL,
+    pricingNotesUrl: ANTHROPIC_MODEL_IDS_SOURCE_URL,
+    asOf: ANTHROPIC_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'claude-sonnet-4-6',
+    aliases: [],
+    currency: 'USD',
+    standard: { short: rateCard(3, 0.3, 3.75, 15) },
+    sourceUrl: ANTHROPIC_PRICING_SOURCE_URL,
+    pricingNotesUrl: ANTHROPIC_MODEL_IDS_SOURCE_URL,
+    asOf: ANTHROPIC_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'claude-sonnet-5',
+    aliases: [],
+    currency: 'USD',
+    // Keep the post-promotion standard rate instead of a time-dependent introductory price.
+    standard: { short: rateCard(3, 0.3, 3.75, 15) },
+    sourceUrl: ANTHROPIC_PRICING_SOURCE_URL,
+    pricingNotesUrl: ANTHROPIC_MODEL_IDS_SOURCE_URL,
+    asOf: ANTHROPIC_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'claude-opus-4-5-20251101',
+    aliases: ['claude-opus-4-5'],
+    currency: 'USD',
+    standard: { short: rateCard(5, 0.5, 6.25, 25) },
+    sourceUrl: ANTHROPIC_PRICING_SOURCE_URL,
+    pricingNotesUrl: ANTHROPIC_MODEL_IDS_SOURCE_URL,
+    asOf: ANTHROPIC_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'claude-opus-4-6',
+    aliases: [],
+    currency: 'USD',
+    standard: { short: rateCard(5, 0.5, 6.25, 25) },
+    sourceUrl: ANTHROPIC_PRICING_SOURCE_URL,
+    pricingNotesUrl: ANTHROPIC_MODEL_IDS_SOURCE_URL,
+    asOf: ANTHROPIC_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'claude-opus-4-7',
+    aliases: [],
+    currency: 'USD',
+    standard: { short: rateCard(5, 0.5, 6.25, 25) },
+    sourceUrl: ANTHROPIC_PRICING_SOURCE_URL,
+    pricingNotesUrl: ANTHROPIC_MODEL_IDS_SOURCE_URL,
+    asOf: ANTHROPIC_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'claude-opus-4-8',
+    aliases: [],
+    currency: 'USD',
+    standard: { short: rateCard(5, 0.5, 6.25, 25) },
+    sourceUrl: ANTHROPIC_PRICING_SOURCE_URL,
+    pricingNotesUrl: ANTHROPIC_MODEL_IDS_SOURCE_URL,
+    asOf: ANTHROPIC_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'claude-opus-5',
+    aliases: [],
+    currency: 'USD',
+    standard: { short: rateCard(5, 0.5, 6.25, 25) },
+    sourceUrl: ANTHROPIC_PRICING_SOURCE_URL,
+    pricingNotesUrl: ANTHROPIC_MODEL_IDS_SOURCE_URL,
+    asOf: ANTHROPIC_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'claude-fable-5',
+    aliases: [],
+    currency: 'USD',
+    standard: { short: rateCard(10, 1, 12.5, 50) },
+    sourceUrl: ANTHROPIC_PRICING_SOURCE_URL,
+    pricingNotesUrl: ANTHROPIC_MODEL_IDS_SOURCE_URL,
+    asOf: ANTHROPIC_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'glm-5.2',
+    aliases: [],
+    currency: 'USD',
+    // Z.AI lists cached-input storage as limited-time free. Explicit zero must
+    // remain distinct from Auto, which inherits the selected Input rate.
+    standard: { short: rateCard(1.4, 0.26, 0, 4.4) },
+    sourceUrl: ZAI_PRICING_SOURCE_URL,
+    pricingNotesUrl: 'https://docs.z.ai/guides/llm/glm-5.2',
+    asOf: ZAI_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'glm-5.3',
+    aliases: ['glm-5.3-1m'],
+    currency: 'USD',
+    // 用户确认的原价；未提供缓存写入单价，保持 Auto 继承输入价。
+    standard: { short: rateCard(1.4, 0.26, undefined, 4.4) },
+    sourceUrl: ZAI_PRICING_SOURCE_URL,
+    asOf: '2026-09-03',
+  },
+  {
+    canonicalModel: 'glm-5.3-flash',
+    aliases: ['ox-alpha', 'glm-5.3-flash-1m'],
+    currency: 'USD',
+    // 用户确认采用五折促销前的原价；ox-alpha 为同价别名。
+    standard: { short: rateCard(0.15, 0.03, undefined, 0.5) },
+    sourceUrl: ZAI_PRICING_SOURCE_URL,
+    asOf: '2026-09-03',
+  },
+  {
+    canonicalModel: 'glm-5.3-flashx',
+    aliases: ['glm-5.3-flashx-legal'],
+    currency: 'USD',
+    // Z.AI 官方价目：FlashX 约为 Flash 的 2.5 倍，输入 $0.37 是页面原文而非四舍五入。
+    // 缓存存储限时免费，未公布缓存写入单价，保持 Auto 继承输入价。
+    standard: { short: rateCard(0.37, 0.075, undefined, 1.25) },
+    sourceUrl: ZAI_PRICING_SOURCE_URL,
+    asOf: '2026-11-07',
+  },
+  // Kimi keeps one flat rate per model id. Do not add long-context bands for the
+  // same Kimi model; reduced-context SKUs such as kimi-k3-256k are separate models.
+  {
+    canonicalModel: 'kimi-k3',
+    aliases: ['k3'],
+    currency: 'USD',
+    standard: { short: rateCard(3, 0.3, undefined, 15) },
+    sourceUrl: kimiPricingSourceUrl('k3'),
+    pricingNotesUrl: kimiModelNotesUrl('k3'),
+    asOf: KIMI_CATALOG_AS_OF,
+  },
+  {
+    // Half of kimi-k3 because this SKU trims context and drops video; not a context band of k3.
+    canonicalModel: 'kimi-k3-256k',
+    aliases: ['k3-256k'],
+    currency: 'USD',
+    standard: { short: rateCard(1.5, 0.15, undefined, 7.5) },
+    sourceUrl: kimiPricingSourceUrl('k3'),
+    pricingNotesUrl: kimiModelNotesUrl('k3'),
+    asOf: KIMI_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'kimi-k2.7-code',
+    aliases: ['kimi-for-coding'],
+    currency: 'USD',
+    standard: { short: rateCard(0.95, 0.19, undefined, 4) },
+    sourceUrl: kimiPricingSourceUrl('k27-code'),
+    pricingNotesUrl: kimiModelNotesUrl('k2-7-code'),
+    asOf: KIMI_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'kimi-k2.7-code-highspeed',
+    aliases: ['kimi-for-coding-highspee', 'kimi-for-coding-highspeed'],
+    currency: 'USD',
+    standard: { short: rateCard(1.9, 0.38, undefined, 8) },
+    sourceUrl: kimiPricingSourceUrl('k27-code'),
+    pricingNotesUrl: kimiModelNotesUrl('k2-7-code'),
+    asOf: KIMI_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'grok-4.5',
+    aliases: ['grok-4.5-latest', 'grok-build-latest'],
+    currency: 'USD',
+    standard: {
+      short: rateCard(2, 0.3, undefined, 6),
+      long: longCard(rateCard(4, 0.6, undefined, 12), XAI_LONG_CONTEXT_INPUT_TOKEN_THRESHOLD),
+    },
+    sourceUrl: XAI_PRICING_SOURCE_URL,
+    asOf: XAI_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'grok-4.6',
+    aliases: [],
+    currency: 'USD',
+    standard: {
+      short: rateCard(2, 0.5, undefined, 6),
+      long: longCard(rateCard(4, 1, undefined, 12), XAI_LONG_CONTEXT_INPUT_TOKEN_THRESHOLD),
+    },
+    sourceUrl: XAI_GROK_46_PRICING_SOURCE_URL,
+    asOf: XAI_GROK_46_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'grok-4.3',
+    aliases: [],
+    currency: 'USD',
+    standard: {
+      short: rateCard(1.25, 0.2, undefined, 2.5),
+      long: longCard(rateCard(2.5, 0.4, undefined, 5), XAI_LONG_CONTEXT_INPUT_TOKEN_THRESHOLD),
+    },
+    sourceUrl: XAI_GROK_43_PRICING_SOURCE_URL,
+    asOf: XAI_GROK_43_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'grok-4.7',
+    aliases: [],
+    currency: 'USD',
+    standard: {
+      short: rateCard(2, 0.5, undefined, 6),
+      long: longCard(rateCard(4, 1, undefined, 12), XAI_LONG_CONTEXT_INPUT_TOKEN_THRESHOLD),
+    },
+    sourceUrl: XAI_GROK_47_PRICING_SOURCE_URL,
+    asOf: XAI_GROK_47_CATALOG_AS_OF,
+  },
+  {
+    // Cursor / Grok Build 的独立产品价格；不表示公共 API 的 Priority 档。
+    // 官方规定超过 200K 提示词 token 才提价；引擎使用包含边界的门槛。
+    canonicalModel: 'grok-4.7-fast',
+    aliases: ['grok-4.7-build-fast'],
+    currency: 'USD',
+    standard: {
+      short: rateCard(4, 1, undefined, 12),
+      long: longCard(rateCard(6, 1.5, undefined, 18), XAI_LONG_CONTEXT_INPUT_TOKEN_THRESHOLD + 1),
+    },
+    sourceUrl: XAI_GROK_47_FAST_PRICING_SOURCE_URL,
+    asOf: XAI_GROK_47_FAST_CATALOG_AS_OF,
+  },
+  {
+    // Volcano Ark quotes CNY list prices; these USD rates are the confirmed
+    // CNY 6 / 1.2 / 30 per 1M tokens converted at 6.8, standard
+    // online-inference tier (the cheaper low-priority tier is not applied).
+    canonicalModel: 'gemini-4-argon',
+    aliases: [],
+    currency: 'USD',
+    // 官方现价有效至 2026-11-30；2026-12-01 起翻倍，不在此推测到期后的价格。
+    // 仅有隐式缓存，无长上下文分档。
+    standard: { short: rateCard(2, 0.1, undefined, 10) },
+    sourceUrl: GEMINI_PRICING_SOURCE_URL,
+    asOf: GEMINI_CATALOG_AS_OF,
+  },
+  {
+    canonicalModel: 'doubao-seed-2.1-pro',
+    aliases: [],
+    currency: 'USD',
+    standard: { short: rateCard(0.882, 0.176, undefined, 4.412) },
+    sourceUrl: DOUBAO_PRICING_SOURCE_URL,
+    asOf: DOUBAO_CATALOG_AS_OF,
+  },
+];

@@ -1,0 +1,114 @@
+@use '../../styles/mixins' as *;
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-height: 0;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  scroll-margin-top: calc(var(--header-height, 64px) + 18px);
+
+  @media (min-width: 769px) and (max-width: 1180px) {
+    scroll-margin-top: calc(var(--header-height, 64px) + 108px);
+  }
+
+  @include mobile {
+    gap: 14px;
+    min-height: 0;
+    padding: 0;
+    scroll-margin-top: calc(var(--header-height, 64px) + 176px);
+  }
+}
+
+.header {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  padding: 0 0 18px;
+  border-bottom: 1px solid var(--border-color);
+
+  @include mobile {
+    gap: 9px;
+    padding: 0 0 14px;
+  }
+}
+
+.titleRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.indexBadge {
+  display: inline-flex;
+  align-items: center;
+  min-width: 26px;
+  height: 28px;
+  color: #a8792e;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+}
+
+.iconBadge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  background: var(--config-accent-surface);
+  color: var(--config-accent-strong);
+  flex: 0 0 auto;
+}
+
+.headingGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.title {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: clamp(18px, 1.6vw, 22px);
+  font-weight: 700;
+  line-height: 1.18;
+  letter-spacing: 0;
+}
+
+.description {
+  margin: 0;
+  max-width: 72ch;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.65;
+
+  @include mobile {
+    max-width: none;
+  }
+}
+
+.content {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  width: 100%;
+  min-width: 0;
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .section {
+    background: transparent;
+  }
+}

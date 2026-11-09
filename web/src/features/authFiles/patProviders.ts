@@ -1,0 +1,198 @@
+export type PatProvider = 'codebuddy' | 'qoder';
+
+// 添加账号表单支持的 provider：两家 PAT + zcode-coding-plan（内联 API key）。
+export type AccountFormProvider = PatProvider | 'zcode-coding-plan';
+
+export const isPatProvider = (value: unknown): value is PatProvider =>
+  value === 'codebuddy' || value === 'qoder';
+
+export const isAccountFormProvider = (value: unknown): value is AccountFormProvider =>
+  isPatProvider(value) || value === 'zcode-coding-plan';
+
+export function newPatAuthFileName(provider: AccountFormProvider): string {
+  // getRandomValues 在普通 HTTP 管理页面也可用；randomUUID 仅限安全上下文。
+  const id = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
+    byte.toString(16).padStart(2, '0')
+  ).join('');
+  return `${provider}-${id}.json`;
+}
+
+export function buildPatAuth(
+  provider: PatProvider,
+  label: string,
+  value: string,
+  previous?: Record<string, unknown>
+): Record<string, unknown> {
+  const pat = value.trim();
+  if (
+    !pat ||
+    pat.includes('\n') ||
+    pat.includes('\r') ||
+    pat.includes('\0') ||
+    (provider === 'qoder' && !pat.startsWith('pt-'))
+  ) {
+    throw new Error('invalid_pat');
+  }
+  if (previous && previous.type !== provider) throw new Error('provider_mismatch');
+  const previousMode = typeof previous?.auth_mode === 'string' ? previous.auth_mode : '';
+  if (
+    previousMode &&
+    previousMode !== 'pat' &&
+    !(provider === 'codebuddy' && previousMode === 'api_key')
+  ) {
+    throw new Error('unsupported_auth_mode');
+  }
+  const auth = { ...previous, type: provider, auth_mode: 'pat', pat, label: label.trim() };
+  // 更新长期凭据时不能留下与新 PAT 冲突的旧凭据；其余账号配置保持不变。
+  // transport/profile_id/config_dir 是旧 Qoder 插件的运行字段：旧 Core 上账号级
+  // transport 优先于插件默认（sdk_cli），删除会把 direct_openai 账号切回 runner；
+  // 新 Core 0.3.0 则把它们当作兼容输入。Panel 无法感知 Core 版本，因此一律保留。
+  delete (auth as Record<string, unknown>).access_token;
+  delete (auth as Record<string, unknown>).api_key;
+  return auth;
+}
+
+export function generateDeviceId(): string {
+  // getRandomValues 在普通 HTTP 管理页面也可用；randomUUID 仅限安全上下文。
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20),
+  ].join('-');
+}
+
+export function normalizeAccountExtraModels(value: unknown): string[] {
+  if (value === undefined || value === null) return [];
+  if (
+    !Array.isArray(value) ||
+    value.some((model) => typeof model !== 'string' || !model.trim() || /[<>\r\n]/.test(model))
+  ) {
+    throw new Error('invalid_extra_models');
+  }
+  return [...new Set((value as string[]).map((model) => model.trim()))];
+}
+
+export function buildAccountAuth(
+  provider: AccountFormProvider,
+  label: string,
+  value: string,
+  deviceId: string,
+  previous?: Record<string, unknown>,
+  extraModels?: string[]
+): Record<string, unknown> {
+  if (provider === 'zcode-coding-plan') {
+    if (previous && previous.type !== provider) throw new Error('provider_mismatch');
+    const previousKey = typeof previous?.api_key === 'string' ? previous.api_key : '';
+    const apiKey = value.trim() || previousKey.trim();
+    const parts = apiKey.split('.');
+    if (
+      !apiKey ||
+      /[\r\n\0<]/.test(apiKey) ||
+      /\s/.test(apiKey) ||
+      parts.length !== 2 ||
+      !parts[0] ||
+      !parts[1]
+    ) {
+      throw new Error('invalid_api_key');
+    }
+    // 与插件的运行时契约一致，保存时归一为零次重试。
+    const auth: Record<string, unknown> = {
+      ...previous,
+      type: provider,
+      api_key: apiKey,
+      label: label.trim(),
+      request_retry: 0,
+    };
+    // 编辑既有账号且未改动设备标识时保留原值，避免静默轮换设备身份。
+    const previousDeviceId = typeof previous?.device_id === 'string' ? previous.device_id : '';
+    const device = deviceId.trim() || previousDeviceId.trim() || generateDeviceId();
+    if (/[\r\n\0<]/.test(device)) throw new Error('invalid_device_id');
+    auth.device_id = device;
+    // undefined 表示未编辑（例如旧插件）；显式空数组表示清除额外模型。
+    if (extraModels !== undefined) auth.exmodel = normalizeAccountExtraModels(extraModels);
+    // 已改为内联凭据；保留旧引用会被插件拒绝，其他账号设置继续沿用。
+    delete auth.config_file;
+    delete auth.pat;
+    delete auth.access_token;
+    return auth;
+  }
+  return buildPatAuth(provider, label, value, previous);
+}
+
+export interface PatQuotaValues {
+  name: string;
+  status: string;
+  unit: string;
+  total: string;
+  used: string;
+  remaining: string;
+  expiresAt: string;
+  available?: boolean;
+}
+
+export interface PatSummary {
+  label: string;
+  accountName: string;
+  accountStatus: string;
+  planName: string;
+  planStatus: string;
+  quota: PatQuotaValues;
+  packages: PatQuotaValues[];
+  updatedAt: string;
+  cached: boolean;
+}
+
+const record = (value: unknown): Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+const text = (value: unknown): string => (typeof value === 'string' ? value : '');
+const amount = (value: Record<string, unknown>, key: string): string => {
+  const exact = text(value[`${key}_exact`]);
+  if (/^-?\d+(?:\.\d+)?$/.test(exact)) return exact;
+  const number = value[key];
+  return typeof number === 'number' && Number.isFinite(number) ? String(number) : '—';
+};
+const quotaValues = (input: unknown): PatQuotaValues => {
+  const value = record(input);
+  return {
+    name: text(value.name),
+    status: text(value.status) || 'unknown',
+    unit: text(value.unit),
+    total: amount(value, 'total'),
+    used: amount(value, 'used'),
+    remaining: amount(value, 'remaining'),
+    expiresAt: text(value.expires_at) || text(value.cycle_end),
+    available: typeof value.available === 'boolean' ? value.available : undefined,
+  };
+};
+
+export function parsePatSummary(
+  input: unknown,
+  provider: PatProvider,
+  authIndex: string
+): PatSummary {
+  const source = record(input);
+  if (source.provider !== provider || source.auth_index !== authIndex)
+    throw new Error('invalid_summary');
+  const account = record(source.account);
+  const plan = record(source.plan);
+  const quota = record(source.quota);
+  return {
+    label: text(source.label),
+    accountName: text(account.name) || text(account.email),
+    accountStatus: text(account.status) || 'unknown',
+    planName: text(plan.name) || text(plan.plan_tier),
+    planStatus: text(plan.status) || 'unknown',
+    quota: quotaValues(quota),
+    packages: Array.isArray(quota.packages) ? quota.packages.map(quotaValues) : [],
+    updatedAt: text(source.updated_at),
+    cached: source.cached === true,
+  };
+}

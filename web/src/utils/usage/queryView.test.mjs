@@ -1,0 +1,290 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { build } from 'esbuild';
+
+const bundle = await build({
+  entryPoints: [new URL('./queryView.ts', import.meta.url).pathname],
+  bundle: true,
+  format: 'esm',
+  platform: 'node',
+  write: false,
+});
+const query = await import(
+  `data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].contents).toString('base64')}`
+);
+const pricingBundle = await build({
+  entryPoints: [new URL('./pricing/index.ts', import.meta.url).pathname],
+  bundle: true,
+  format: 'esm',
+  platform: 'node',
+  write: false,
+});
+const pricing = await import(
+  `data:text/javascript;base64,${Buffer.from(pricingBundle.outputFiles[0].contents).toString('base64')}`
+);
+
+test('query price classes preserve dynamic prices, thresholds, Auto versus zero and unknown tiers', () => {
+  const profile = pricing.createDefaultPriceProfileV3();
+  profile.overrides['gpt-query-test'] = {
+    standard: {
+      short: { input: 3, cachedInput: 0.3, output: 5, cacheWrite: 0 },
+      long: {
+        thresholdTokens: 1000,
+        basis: 'inputTokens',
+        appliesTo: 'entireRequest',
+        rates: { input: 6, cachedInput: 0.6, output: 10 },
+      },
+    },
+    fast: { multiplier: 2, longSupported: false },
+  };
+  const groups = [];
+  const expected = [];
+  for (const model of ['gpt-query-test', 'unmatched-query-test']) {
+    for (const input of [100, 1000, 5000]) {
+      for (const tier of ['std', 'fast']) {
+        for (const evidence of ['assumed', 'request', 'response']) {
+          const tokens = {
+            input_tokens: input,
+            output_tokens: 100,
+            cache_read_tokens: 10,
+            cache_creation_tokens: 20,
+          };
+          const estimate = pricing.estimateUsageCost(model, tokens, profile, {
+            tier,
+            evidence,
+            rawRequest: null,
+            rawOutbound: null,
+            rawResponse: null,
+            rawEffective: null,
+          });
+          const count = 7;
+          groups.push({
+            model,
+            tier,
+            evidence,
+            band: estimate.contextBand,
+            requests: count,
+            tokens: (input + 100) * count,
+            prompt: Math.max(input - 30, 0) * count,
+            cache_read: 10 * count,
+            cache_write: 20 * count,
+            output: 100 * count,
+          });
+          for (let i = 0; i < count; i++)
+            expected.push({ modelName: model, tokenCount: input + 100, estimate });
+        }
+      }
+    }
+  }
+  const actual = query.queryCoverage({ prices: groups }, profile);
+  const legacy = pricing.aggregateCostEstimateCoverage(expected);
+  assert.ok(Math.abs(actual.estimatedAmount - legacy.estimatedAmount) < 1e-10);
+  assert.deepEqual({ ...actual, estimatedAmount: 0 }, { ...legacy, estimatedAmount: 0 });
+  profile.overrides['gpt-query-test'].standard.short.input = 30;
+  assert.notEqual(
+    query.queryCoverage({ prices: groups }, profile).estimatedAmount,
+    actual.estimatedAmount
+  );
+  assert.equal(
+    query.buildQueryPriceRules(['gpt-query-test'], profile)['gpt-query-test'].long_threshold,
+    1000
+  );
+  profile.assumptions.gptLongContext = 'shortOnly';
+  assert.deepEqual(query.buildQueryPriceRules(['gpt-query-test'], profile), {
+    'gpt-query-test': {},
+  });
+});
+
+test('query pricing preserves GPT-6.1 Sol and nonuniform Fast rates in both context bands', () => {
+  const profile = pricing.createDefaultPriceProfileV3();
+  profile.overrides['explicit-query-test'] = {
+    standard: pricing.findCatalogEntry('gpt-6.1-sol').standard,
+    fast: {
+      short: { input: 3, cachedInput: 0.02, cacheWrite: 0, output: 17 },
+      long: { input: 9, cachedInput: 0.07, cacheWrite: 13, output: 37 },
+      longSupported: true,
+    },
+  };
+  const groups = [];
+  const expected = [];
+  for (const model of ['gpt-6.1-sol', 'explicit-query-test']) {
+    for (const input of [272_000, 272_001]) {
+      for (const tier of ['std', 'fast']) {
+        const tokens = { input_tokens: input, cache_read_tokens: 30_000,
+          cache_creation_tokens: 40_000, output_tokens: 100_000 };
+        const estimate = pricing.estimateUsageCost(model, tokens, profile, {
+          tier, evidence: 'effective', rawRequest: null, rawOutbound: null,
+          rawResponse: null, rawEffective: null,
+        });
+        groups.push({ model, tier, evidence: 'effective', band: estimate.contextBand,
+          requests: 3, tokens: (input + 100_000) * 3, prompt: (input - 70_000) * 3,
+          cache_read: 90_000, cache_write: 120_000, output: 300_000 });
+        expected.push({ modelName: model, tokenCount: (input + 100_000) * 3,
+          requestCount: 3, estimate: { ...estimate, amount: estimate.amount * 3 } });
+      }
+    }
+  }
+  assert.deepEqual(query.buildQueryPriceRules(['gpt-6.1-sol', 'explicit-query-test'], profile), {
+    'gpt-6.1-sol': { long_threshold: 272_001 }, 'explicit-query-test': { long_threshold: 272_001 },
+  });
+  const actual = query.queryCoverage({ prices: groups }, profile);
+  const detail = pricing.aggregateCostEstimateCoverage(expected);
+  assert.ok(Math.abs(actual.estimatedAmount - detail.estimatedAmount) < 1e-12);
+  assert.deepEqual({ ...actual, estimatedAmount: 0 }, { ...detail, estimatedAmount: 0 });
+});
+
+test('prepared pricing is a separate immutable configuration with reusable per-model results', () => {
+  const profile = pricing.createDefaultPriceProfileV3();
+  const prepared = pricing.preparePriceProfile(profile);
+  assert.notEqual(profile, prepared);
+  assert.equal(pricing.preparePriceProfile(prepared), prepared);
+  assert.equal(
+    pricing.resolvePriceProfile('gpt-5.6-sol', prepared),
+    pricing.resolvePriceProfile('gpt-5.6-sol', prepared)
+  );
+  assert.ok(Object.isFrozen(prepared.overrides));
+  assert.ok(!Object.isFrozen(profile));
+});
+
+test('query views are tagged summaries, never full snapshots or synthetic request records', () => {
+  const view = query.makeUsageQueryView({
+    version: 1,
+    bound: 'test',
+    now_ms: Date.now(),
+    totals: { requests: 10000, success: 9000, failure: 1000, tokens: 100000 },
+    groups: {},
+  });
+  assert.equal(view.kind, 'usage-query-v1');
+  assert.equal(view.total_requests, 10000);
+  assert.equal('apis' in view, false);
+  assert.equal('details' in view, false);
+});
+
+test('API model rows carry the cost that sums to the endpoint total', () => {
+  const profile = pricing.createDefaultPriceProfileV3();
+  const priceGroup = (model, prompt, output, requests) => ({
+    model,
+    tier: 'std',
+    evidence: 'effective',
+    band: 'short',
+    requests,
+    tokens: (prompt + output) * requests,
+    prompt: prompt * requests,
+    cache_read: 0,
+    cache_write: 0,
+    output: output * requests,
+  });
+  const group = (model, prompt, output, requests, success, failure, withPrices) => ({
+    api: 'caller-key',
+    model,
+    metrics: {
+      requests,
+      success,
+      failure,
+      tokens: (prompt + output) * requests,
+      ...(withPrices ? { prices: [priceGroup(model, prompt, output, requests)] } : {}),
+    },
+  });
+  const rows = [
+    ['glm-5.3-flashx', 800_000, 200_000, 4, 4, 0],
+    ['unknown-model', 500_000, 100_000, 2, 1, 1],
+  ];
+  const summary = (withPrices) => ({
+    version: 1,
+    bound: 'test',
+    now_ms: 0,
+    totals: { requests: 6, success: 5, failure: 1, tokens: 5_200_000 },
+    groups: {
+      api_models: rows.map(([model, prompt, output, requests, success, failure]) =>
+        group(model, prompt, output, requests, success, failure, withPrices)
+      ),
+    },
+  });
+  const view = query.makeUsageQueryView(summary(false), summary(true));
+  const [api] = query.queryApiStats(view, profile);
+  assert.equal(api.endpoint.includes('caller-key'), false);
+  const flashx = api.models['glm-5.3-flashx'];
+  assert.equal(flashx.requests, 4);
+  assert.equal(flashx.successCount, 4);
+  assert.equal(flashx.failureCount, 0);
+  assert.ok(Math.abs(flashx.cost - (800_000 * 0.37 + 200_000 * 1.25) * 4 / 1_000_000) < 1e-9);
+  assert.equal(flashx.pricingCoverage.pricedRequests, 4);
+  const unknown = api.models['unknown-model'];
+  assert.equal(unknown.cost, 0);
+  assert.equal(unknown.pricingCoverage.pricedRequests, 0);
+  assert.equal(unknown.pricingCoverage.unmatchedRequests, 2);
+  assert.ok(Math.abs(api.totalCost - flashx.cost) < 1e-9);
+  assert.equal(api.pricingCoverage.pricedRequests, 4);
+  assert.equal(api.pricingCoverage.totalRequests, 6);
+});
+
+test('credential pricing coverage is keyed by normalized source and auth index', () => {
+  const profile = pricing.createDefaultPriceProfileV3();
+  const priceGroup = (model, prompt, output, requests) => ({
+    model,
+    tier: 'std',
+    evidence: 'effective',
+    band: 'short',
+    requests,
+    tokens: (prompt + output) * requests,
+    prompt: prompt * requests,
+    cache_read: 0,
+    cache_write: 0,
+    output: output * requests,
+  });
+  const credentialGroup = (source, authIndex, model, prompt, output, requests, withPrices) => ({
+    source,
+    auth_index: authIndex,
+    metrics: {
+      requests,
+      success: requests,
+      failure: 0,
+      tokens: (prompt + output) * requests,
+      input: prompt * requests,
+      output: output * requests,
+      ...(withPrices ? { prices: [priceGroup(model, prompt, output, requests)] } : {}),
+    },
+  });
+  const rows = [
+    ['zcode-coding-plan', 'zcode-coding-plan-a.json', 'glm-5.3-flashx', 800_000, 200_000, 4],
+    ['zcode-coding-plan', 'zcode-coding-plan-b.json', 'glm-5.3-flashx', 500_000, 100_000, 2],
+    ['codex', 'codex-a.json', 'unknown-model', 500_000, 100_000, 3],
+  ];
+  const summary = (withPrices) => ({
+    version: 1,
+    bound: 'test',
+    now_ms: 0,
+    totals: { requests: 9, success: 9, failure: 0, tokens: 0 },
+    groups: {
+      credentials: rows.map(([source, authIndex, model, prompt, output, requests]) =>
+        credentialGroup(source, authIndex, model, prompt, output, requests, withPrices)
+      ),
+    },
+  });
+  const view = query.makeUsageQueryView(summary(false), summary(true));
+  const coverageByKey = query.queryCredentialPricing(view, profile);
+  assert.equal(coverageByKey.size, 3);
+  // normalizeUsageSourceId 给非密钥文本加 t: 前缀，与 Core 侧 source 规范一致。
+  const priced = coverageByKey.get(
+    JSON.stringify(['t:zcode-coding-plan', 'zcode-coding-plan-a.json'])
+  );
+  assert.ok(priced);
+  assert.equal(priced.pricedRequests, 4);
+  assert.equal(priced.totalRequests, 4);
+  assert.ok(
+    Math.abs(priced.estimatedAmount - (800_000 * 0.37 + 200_000 * 1.25) * 4 / 1_000_000) < 1e-9
+  );
+  const unmatched = coverageByKey.get(JSON.stringify(['t:codex', 'codex-a.json']));
+  assert.ok(unmatched);
+  assert.equal(unmatched.pricedRequests, 0);
+  assert.equal(unmatched.unmatchedRequests, 3);
+  // 无 pricing 查询时 coverage 存在但为空，消费方据此显示 "--"。
+  const plainView = query.makeUsageQueryView(summary(false), null);
+  const plainCoverage = query.queryCredentialPricing(plainView, profile);
+  const plainPriced = plainCoverage.get(
+    JSON.stringify(['t:zcode-coding-plan', 'zcode-coding-plan-a.json'])
+  );
+  assert.ok(plainPriced);
+  assert.equal(plainPriced.pricedRequests, 0);
+  assert.equal(plainPriced.totalRequests, 0);
+});

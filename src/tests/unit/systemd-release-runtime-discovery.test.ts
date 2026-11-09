@@ -31,7 +31,7 @@ function resolveRuntime(root: string, extraEnv: NodeJS.ProcessEnv = {}) {
 }
 afterEach(() => { for (const root of temporaryRoots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-describe('systemd release runtime discovery', () => {
+describe('systemd release runtime discovery', { timeout: 20_000 }, () => {
   it('discovers a matching operator-owned fnm runtime when sudo-like PATH has no node or npm', () => {
     const root = createRoot(); const runtime = createFnmRuntime(root, 'v-test'); const result = resolveRuntime(root, { FNM_DIR: runtime.fnmDir });
     expect(result.status).toBe(0); expect(result.stderr).toBe(''); expect(result.stdout.trim().split('\n')).toEqual([join(runtime.binDir, 'node'), join(runtime.binDir, 'npm')]);

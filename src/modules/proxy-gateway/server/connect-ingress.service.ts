@@ -180,7 +180,7 @@ export class ConnectIngressService {
         },
       },
       (req, res) => {
-        observeNativeRequest(req, res);
+        observeNativeRequest(req, res, () => {
         this.pendingRequests++;
         const admitted = this.admission.runResponse(res, () => this.failoverGateway.handleRequest(req, res).catch((err: unknown) => {
           logger.error(formatSafeEvent('connect_ingress_gateway_failure', {
@@ -218,6 +218,7 @@ export class ConnectIngressService {
           res.writeHead(503, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: 'release admission closed' }));
         }
+        });
       },
     );
     (this.h2Server as any).keepAliveTimeout = 120000;

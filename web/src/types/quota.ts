@@ -1,0 +1,723 @@
+/**
+ * Quota management types.
+ */
+
+// Theme types
+export type ThemeColors = { bg: string; text: string; border?: string };
+
+// API payload types
+export interface GeminiCliQuotaBucket {
+  modelId?: string;
+  model_id?: string;
+  tokenType?: string;
+  token_type?: string;
+  remainingFraction?: number | string;
+  remaining_fraction?: number | string;
+  remainingAmount?: number | string;
+  remaining_amount?: number | string;
+  resetTime?: string;
+  reset_time?: string;
+}
+
+export interface GeminiCliQuotaPayload {
+  buckets?: GeminiCliQuotaBucket[];
+}
+
+export interface GeminiCliCredits {
+  creditType?: string;
+  credit_type?: string;
+  creditAmount?: string | number;
+  credit_amount?: string | number;
+}
+
+export interface GeminiCliUserTier {
+  id?: string;
+  name?: string;
+  description?: string;
+  availableCredits?: GeminiCliCredits[];
+  available_credits?: GeminiCliCredits[];
+}
+
+export interface GeminiCliCodeAssistPayload {
+  currentTier?: GeminiCliUserTier | null;
+  current_tier?: GeminiCliUserTier | null;
+  paidTier?: GeminiCliUserTier | null;
+  paid_tier?: GeminiCliUserTier | null;
+}
+
+export interface AntigravityQuotaSummaryBucketPayload {
+  bucketId?: string;
+  bucket_id?: string;
+  displayName?: string;
+  display_name?: string;
+  window?: string;
+  resetTime?: string;
+  reset_time?: string;
+  remainingFraction?: number | string;
+  remaining_fraction?: number | string;
+  description?: string;
+}
+
+export interface AntigravityQuotaSummaryGroupPayload {
+  displayName?: string;
+  display_name?: string;
+  description?: string;
+  buckets?: AntigravityQuotaSummaryBucketPayload[];
+}
+
+export interface AntigravityQuotaSummaryPayload {
+  groups?: AntigravityQuotaSummaryGroupPayload[];
+}
+
+export interface GeminiCliQuotaGroupDefinition {
+  id: string;
+  label: string;
+  preferredModelId?: string;
+  modelIds: string[];
+}
+
+export interface GeminiCliParsedBucket {
+  modelId: string;
+  tokenType: string | null;
+  remainingFraction: number | null;
+  remainingAmount: number | null;
+  resetTime: string | undefined;
+}
+
+export interface CodexUsageWindow {
+  used_percent?: number | string;
+  usedPercent?: number | string;
+  limit_window_seconds?: number | string;
+  limitWindowSeconds?: number | string;
+  reset_after_seconds?: number | string;
+  resetAfterSeconds?: number | string;
+  reset_at?: number | string;
+  resetAt?: number | string;
+}
+
+export interface CodexRateLimitInfo {
+  allowed?: boolean;
+  limit_reached?: boolean;
+  limitReached?: boolean;
+  primary_window?: CodexUsageWindow | null;
+  primaryWindow?: CodexUsageWindow | null;
+  secondary_window?: CodexUsageWindow | null;
+  secondaryWindow?: CodexUsageWindow | null;
+}
+
+export interface CodexAdditionalRateLimit {
+  limit_name?: string;
+  limitName?: string;
+  metered_feature?: string;
+  meteredFeature?: string;
+  rate_limit?: CodexRateLimitInfo | null;
+  rateLimit?: CodexRateLimitInfo | null;
+}
+
+export interface CodexRateLimitResetCredit {
+  id?: string;
+  reset_type?: string;
+  resetType?: string;
+  status?: string;
+  granted_at?: string | number;
+  grantedAt?: string | number;
+  expires_at?: string | number;
+  expiresAt?: string | number;
+  redeem_started_at?: string | number | null;
+  redeemStartedAt?: string | number | null;
+  redeemed_at?: string | number | null;
+  redeemedAt?: string | number | null;
+  profile_image_url?: string;
+  profileImageUrl?: string;
+  profile_user_id?: string;
+  profileUserId?: string;
+  title?: string;
+  description?: string;
+}
+
+export interface CodexRateLimitResetCredits {
+  credits?: CodexRateLimitResetCredit[];
+  available_count?: number | string;
+  availableCount?: number | string;
+  total_earned_count?: number | string;
+  totalEarnedCount?: number | string;
+}
+
+export interface CodexUsagePayload {
+  credits?: { has_credits?: boolean; unlimited?: boolean; balance?: string | number | null } | null;
+  user_id?: string;
+  userId?: string;
+  account_id?: string;
+  accountId?: string;
+  email?: string;
+  plan_type?: string;
+  planType?: string;
+  rate_limit?: CodexRateLimitInfo | null;
+  rateLimit?: CodexRateLimitInfo | null;
+  code_review_rate_limit?: CodexRateLimitInfo | null;
+  codeReviewRateLimit?: CodexRateLimitInfo | null;
+  additional_rate_limits?: CodexAdditionalRateLimit[] | null;
+  additionalRateLimits?: CodexAdditionalRateLimit[] | null;
+  rate_limit_reset_credits?: CodexRateLimitResetCredits | null;
+  rateLimitResetCredits?: CodexRateLimitResetCredits | null;
+}
+
+export interface CodexDailyUsageMetrics {
+  credits?: number | string;
+  users?: number | string;
+  threads?: number | string;
+  turns?: number | string;
+  text_total_tokens?: number | string;
+  textTotalTokens?: number | string;
+  cached_text_input_tokens?: number | string;
+  cachedTextInputTokens?: number | string;
+  uncached_text_input_tokens?: number | string;
+  uncachedTextInputTokens?: number | string;
+  text_output_tokens?: number | string;
+  textOutputTokens?: number | string;
+}
+
+export interface CodexDailyUsageClient extends CodexDailyUsageMetrics {
+  client_id?: string;
+  clientId?: string;
+}
+
+export interface CodexDailyUsageDay {
+  date?: string;
+  totals?: CodexDailyUsageMetrics;
+  clients?: CodexDailyUsageClient[];
+}
+
+export interface CodexDailyUsagePayload {
+  data?: CodexDailyUsageDay[];
+}
+
+export interface CodexUsageLeaderboardRow {
+  rank?: number | string;
+  user_id?: string;
+  userId?: string;
+  name?: string;
+  email?: string;
+  credits?: number | string;
+  n_threads?: number | string;
+  nThreads?: number | string;
+  n_turns?: number | string;
+  nTurns?: number | string;
+  current_streak?: number | string;
+  currentStreak?: number | string;
+  text_tokens?: number | string;
+  textTokens?: number | string;
+}
+
+export interface CodexUsageLeaderboardPayload {
+  data?: CodexUsageLeaderboardRow[];
+  total_users?: number | string;
+  totalUsers?: number | string;
+  has_more?: boolean;
+  hasMore?: boolean;
+  next_page?: number | string | null;
+  nextPage?: number | string | null;
+  next_cursor?: string | null;
+  nextCursor?: string | null;
+}
+
+// Claude API payload types
+export interface ClaudeUsageWindow {
+  utilization: number | null;
+  resets_at: string | null;
+  limit_dollars?: number | null;
+  used_dollars?: number | null;
+  remaining_dollars?: number | null;
+}
+
+export interface ClaudeUsageLimit {
+  kind?: string | null;
+  group?: string | null;
+  percent?: number | null;
+  resets_at?: string | null;
+  is_active?: boolean | null;
+  scope?: {
+    model?: {
+      id?: string | null;
+      display_name?: string | null;
+    } | null;
+  } | null;
+}
+
+export interface ClaudeExtraUsagePayload {
+  is_enabled?: boolean | null;
+  monthly_limit?: number | null;
+  used_credits?: number | null;
+  utilization?: number | null;
+  currency?: string | null;
+  disabled_reason?: string | null;
+  user_disabled?: boolean | null;
+  spend_limit_reached?: boolean | null;
+}
+
+/** Amounts are in minor currency units, unlike the separate dollar windows. */
+export interface ClaudeExtraUsage {
+  isEnabled: boolean | null;
+  monthlyLimit: number | null;
+  usedCredits: number | null;
+  utilization: number | null;
+  currency: string | null;
+  disabledReason: string | null;
+  userDisabled: boolean | null;
+  spendLimitReached: boolean | null;
+}
+
+export interface ClaudeDollarWindow {
+  /** Original upstream key; never conflated with extra usage. */
+  key: string;
+  limitDollars: number | null;
+  usedDollars: number | null;
+  remainingDollars: number | null;
+  utilization: number | null;
+  resetsAt: string | null;
+}
+
+export interface ClaudeUsageSnapshot {
+  fiveHour: { utilization: number | null; resetsAt: string | null } | null;
+  sevenDay: { utilization: number | null; resetsAt: string | null } | null;
+  extraUsage: ClaudeExtraUsage | null;
+  dollarWindows: ClaudeDollarWindow[];
+}
+
+export interface ClaudeUsagePayload {
+  five_hour?: ClaudeUsageWindow | null;
+  seven_day?: ClaudeUsageWindow | null;
+  seven_day_oauth_apps?: ClaudeUsageWindow | null;
+  seven_day_opus?: ClaudeUsageWindow | null;
+  seven_day_sonnet?: ClaudeUsageWindow | null;
+  seven_day_cowork?: ClaudeUsageWindow | null;
+  iguana_necktie?: ClaudeUsageWindow | null;
+  limits?: ClaudeUsageLimit[] | null;
+  extra_usage?: ClaudeExtraUsagePayload | null;
+  [key: string]: unknown;
+}
+
+export interface ClaudeProfileResponse {
+  account?: {
+    uuid?: string;
+    full_name?: string;
+    display_name?: string;
+    email?: string;
+    has_claude_max?: boolean;
+    has_claude_pro?: boolean;
+    created_at?: string;
+  };
+  organization?: {
+    uuid?: string;
+    name?: string;
+    organization_type?: string;
+    billing_type?: string;
+    rate_limit_tier?: string;
+    has_extra_usage_enabled?: boolean;
+    subscription_status?: string;
+    subscription_created_at?: string;
+  };
+}
+
+export interface ClaudeQuotaWindow {
+  id: string;
+  label: string;
+  labelKey?: string;
+  usedPercent: number | null;
+  resetLabel: string;
+}
+
+export interface ClaudeQuotaState {
+  status: 'idle' | 'loading' | 'success' | 'error';
+  windows: ClaudeQuotaWindow[];
+  extraUsage?: ClaudeExtraUsage | null;
+  dollarWindows?: ClaudeDollarWindow[];
+  planType?: string | null;
+  error?: string;
+  errorStatus?: number;
+}
+
+// Quota state types
+export interface AntigravityQuotaGroup {
+  id: string;
+  label: string;
+  description?: string;
+  buckets: AntigravityQuotaBucket[];
+}
+
+export interface AntigravityQuotaSubscription {
+  plan: string | null;
+  tierName: string | null;
+  tierId: string | null;
+}
+
+export interface AntigravityQuotaBucket {
+  id: string;
+  label: string;
+  window?: string;
+  remainingFraction: number;
+  resetTime?: string;
+  description?: string;
+}
+
+export interface AntigravityQuotaState {
+  status: 'idle' | 'loading' | 'success' | 'error';
+  groups: AntigravityQuotaGroup[];
+  subscription?: AntigravityQuotaSubscription | null;
+  serverTimeOffsetMs?: number | null;
+  error?: string;
+  errorStatus?: number;
+}
+
+export interface GeminiCliQuotaBucketState {
+  id: string;
+  label: string;
+  remainingFraction: number | null;
+  remainingAmount: number | null;
+  resetTime: string | undefined;
+  tokenType: string | null;
+  modelIds?: string[];
+}
+
+export interface GeminiCliQuotaState {
+  status: 'idle' | 'loading' | 'success' | 'error';
+  buckets: GeminiCliQuotaBucketState[];
+  tierLabel?: string | null;
+  tierId?: string | null;
+  creditBalance?: number | null;
+  error?: string;
+  errorStatus?: number;
+}
+
+export interface CodexQuotaWindow {
+  id: string;
+  label: string;
+  labelKey?: string;
+  labelParams?: Record<string, string | number>;
+  usedPercent: number | null;
+  resetLabel: string;
+}
+
+export type CodexAnalyticsRangeId =
+  | 'since-reset'
+  | 'month-to-date'
+  | 'rolling'
+  | 'rolling-90'
+  | 'rolling-360';
+
+export interface CodexAnalyticsClientSummary {
+  clientId: string;
+  credits: number;
+  usd: number;
+  tokens: number;
+  threads: number;
+  turns: number;
+}
+
+export interface CodexAnalyticsRange {
+  id: CodexAnalyticsRangeId;
+  labelKey: string;
+  startDate: string;
+  endDateExclusive: string;
+  returnedDays: number;
+  firstDate: string;
+  lastDate: string;
+  credits: number;
+  usd: number;
+  tokens: number;
+  cachedInputTokens: number;
+  uncachedInputTokens: number;
+  outputTokens: number;
+  threads: number;
+  turns: number;
+  users: number;
+  topClients: CodexAnalyticsClientSummary[];
+  leaderboardTotalCredits?: number;
+  leaderboardTotalUsd?: number;
+  matchedEmail?: string | null;
+  matchedUserFound?: boolean;
+}
+
+export interface CodexWeeklyEstimate {
+  usedPercent: number;
+  usedRatio: number;
+  remainingRatio: number;
+  includedCredits: number;
+  resetDayCredits: number;
+  excludedCredits: number;
+  totalCreditsWithResetDay: number;
+  totalUsdWithResetDay: number;
+  totalCreditsWithoutResetDay: number;
+  totalUsdWithoutResetDay: number;
+  remainingCreditsWithResetDay: number;
+  remainingUsdWithResetDay: number;
+  remainingCreditsWithoutResetDay: number;
+  remainingUsdWithoutResetDay: number;
+  source?: 'daily-buckets' | 'leaderboard-range';
+}
+
+export interface CodexAnalyticsState {
+  dateBucket: 'UTC';
+  source?: 'daily-workspace' | 'team-leaderboard' | 'daily-workspace-fallback';
+  backendNowLabel: string;
+  windowStartLabel: string;
+  resetAtLabel: string;
+  weeklyEstimate: CodexWeeklyEstimate | null;
+  ranges: CodexAnalyticsRange[];
+  fallbackReason?: string | null;
+}
+
+export interface CodexQuotaState {
+  status: 'idle' | 'loading' | 'success' | 'error';
+  windows: CodexQuotaWindow[];
+  planType?: string | null;
+  accountEmail?: string | null;
+  subscriptionActiveUntil?: string | number | null;
+  creditBalance?: string | null;
+  creditsUnlimited?: boolean;
+  rateLimitResetCreditsAvailableCount?: number | null;
+  rateLimitResetCreditExpiresAt?: string | number | null;
+  rateLimitResetCredits?: CodexRateLimitResetCredit[];
+  analytics?: CodexAnalyticsState | null;
+  analyticsError?: string | null;
+  error?: string;
+  errorStatus?: number;
+}
+
+// Kimi API payload types
+export interface KimiUsageDetail {
+  used?: number;
+  limit?: number;
+  remaining?: number;
+  name?: string;
+  title?: string;
+  resetAt?: string;
+  reset_at?: string;
+  resetTime?: string;
+  reset_time?: string;
+  resetIn?: number;
+  reset_in?: number;
+  ttl?: number;
+}
+
+export interface KimiLimitWindow {
+  duration?: number;
+  timeUnit?: string;
+  time_unit?: string;
+}
+
+export interface KimiLimitItem {
+  name?: string;
+  title?: string;
+  scope?: string;
+  detail?: KimiUsageDetail;
+  window?: KimiLimitWindow;
+  used?: number;
+  limit?: number;
+  remaining?: number;
+  duration?: number;
+  timeUnit?: string;
+  time_unit?: string;
+  resetAt?: string;
+  reset_at?: string;
+  resetIn?: number;
+  reset_in?: number;
+  ttl?: number;
+}
+
+export interface KimiUsagePayload {
+  usage?: KimiUsageDetail;
+  limits?: KimiLimitItem[];
+  usages?: {
+    limit_month_total?: { used_ratio?: number | string; reset_time?: string };
+  };
+}
+
+export interface KimiQuotaRow {
+  id: string;
+  label?: string;
+  labelKey?: string;
+  labelParams?: Record<string, string | number>;
+  used: number;
+  limit: number;
+  resetHint?: string;
+  resetAtMs?: number | null;
+}
+
+export interface KimiQuotaState {
+  status: 'idle' | 'loading' | 'success' | 'error';
+  rows: KimiQuotaRow[];
+  error?: string;
+  errorStatus?: number;
+}
+
+// xAI/Grok API payload types
+export interface XaiBillingCent {
+  val?: number | string;
+}
+
+export interface XaiBillingPeriod {
+  type?: string;
+  start?: string;
+  end?: string;
+}
+
+export interface XaiBillingProductUsage {
+  product?: string;
+  usagePercent?: number | string | null;
+  usage_percent?: number | string | null;
+}
+
+export interface XaiBillingPeriodUsage {
+  billingCycle?: { year?: number | string; month?: number | string } | null;
+  billing_cycle?: { year?: number | string; month?: number | string } | null;
+  includedUsed?: XaiBillingCent | number | string | null;
+  included_used?: XaiBillingCent | number | string | null;
+  onDemandUsed?: XaiBillingCent | number | string | null;
+  on_demand_used?: XaiBillingCent | number | string | null;
+  totalUsed?: XaiBillingCent | number | string | null;
+  total_used?: XaiBillingCent | number | string | null;
+}
+
+export interface XaiBillingConfig {
+  currentPeriod?: XaiBillingPeriod | null;
+  current_period?: XaiBillingPeriod | null;
+  creditUsagePercent?: number | string | null;
+  credit_usage_percent?: number | string | null;
+  productUsage?: XaiBillingProductUsage[] | null;
+  product_usage?: XaiBillingProductUsage[] | null;
+  monthlyLimit?: XaiBillingCent | number | string | null;
+  monthly_limit?: XaiBillingCent | number | string | null;
+  used?: XaiBillingCent | number | string | null;
+  onDemandCap?: XaiBillingCent | number | string | null;
+  on_demand_cap?: XaiBillingCent | number | string | null;
+  onDemandUsed?: XaiBillingCent | number | string | null;
+  on_demand_used?: XaiBillingCent | number | string | null;
+  prepaidBalance?: XaiBillingCent | number | string | null;
+  prepaid_balance?: XaiBillingCent | number | string | null;
+  isUnifiedBillingUser?: boolean | null;
+  is_unified_billing_user?: boolean | null;
+  history?: XaiBillingPeriodUsage[] | null;
+  billingPeriodStart?: string;
+  billing_period_start?: string;
+  billingPeriodEnd?: string;
+  billing_period_end?: string;
+}
+
+export interface XaiBillingPayload {
+  config?: XaiBillingConfig | null;
+  onDemandEnabled?: boolean | null;
+  on_demand_enabled?: boolean | null;
+  subscriptionTier?: string | null;
+  subscription_tier?: string | null;
+}
+
+export interface XaiAutoTopupRule {
+  enabled?: boolean | null;
+  minBeforeHittingSl?: XaiBillingCent | number | string | null;
+  min_before_hitting_sl?: XaiBillingCent | number | string | null;
+  topupAmount?: XaiBillingCent | number | string | null;
+  topup_amount?: XaiBillingCent | number | string | null;
+  maxAmountPerMonth?: XaiBillingCent | number | string | null;
+  max_amount_per_month?: XaiBillingCent | number | string | null;
+}
+
+export interface XaiAutoTopupPayload {
+  rule?: XaiAutoTopupRule | null;
+}
+
+export type XaiBillingPeriodType = 'weekly' | 'monthly' | 'unknown';
+
+export interface XaiProductUsageSummary {
+  product: string;
+  usagePercent: number | null;
+}
+
+export interface XaiBillingSummary {
+  periodType: XaiBillingPeriodType;
+  usagePercent: number | null;
+  periodStart?: string;
+  periodEnd?: string;
+  productUsage: XaiProductUsageSummary[];
+  monthlyLimitCents: number | null;
+  usedCents: number | null;
+  includedUsedCents: number | null;
+  onDemandCapCents: number | null;
+  onDemandUsedCents: number | null;
+  onDemandUsedPercent: number | null;
+  billingPeriodStart?: string;
+  billingPeriodEnd?: string;
+  usedPercent: number | null;
+  prepaidBalanceCents: number | null;
+  isUnifiedBillingUser: boolean | null;
+  onDemandEnabled: boolean | null;
+  subscriptionTier: string | null;
+  historyCount: number;
+  autoTopupEnabled: boolean | null;
+  autoTopupMinBeforeCents: number | null;
+  autoTopupAmountCents: number | null;
+  autoTopupMaxPerMonthCents: number | null;
+}
+
+export interface XaiQuotaFetchResult {
+  billing: XaiBillingSummary;
+  preserveAutoTopup: boolean;
+}
+
+export interface XaiQuotaState {
+  status: 'idle' | 'loading' | 'success' | 'error';
+  billing: XaiBillingSummary | null;
+  error?: string;
+  errorStatus?: number;
+}
+
+export interface PluginQuotaMetric {
+  key: string;
+  label: string;
+  value: number;
+  unit?: string;
+  format?: 'currency' | 'number';
+  currency?: string;
+}
+export interface PluginQuotaState {
+  status: 'idle' | 'loading' | 'success' | 'error';
+  groups: AntigravityQuotaGroup[];
+  subscription: AntigravityQuotaSubscription | null;
+  summary: PluginQuotaMetric[];
+  error?: string;
+  errorStatus?: number;
+}
+
+export interface DevinQuotaWindow {
+  id: 'daily' | 'weekly';
+  label?: string;
+  remainingPercent: number | null;
+  resetAtMs: number | null;
+  periodHours: number;
+}
+
+export interface DevinQuotaData {
+  windows: DevinQuotaWindow[];
+  observedAtMs: number | null;
+  plan: string | null;
+  planStartMs: number | null;
+  planEndMs: number | null;
+}
+
+export interface MetaQuotaWindow {
+  id: 'window' | 'weekly';
+  usedPercent: number | null;
+  /** Reset instant as Unix seconds, matching the upstream contract. */
+  resetAt?: number;
+  durationMinutes?: number;
+}
+
+export interface MetaQuotaData {
+  planName?: string;
+  isSubscriptionActive?: boolean;
+  windows: MetaQuotaWindow[];
+}
+
+export interface DevinQuotaState { status: 'idle' | 'loading' | 'success' | 'error'; data?: DevinQuotaData; error?: string; errorStatus?: number }
+
+export interface MetaQuotaState { status: 'idle' | 'loading' | 'success' | 'error'; data?: MetaQuotaData; error?: string; errorStatus?: number }

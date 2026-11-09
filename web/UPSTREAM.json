@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/BlueSkyXN/CPA-Panel-LTS",
+  "revision": "72247c812be814f2158927c2f8d3ffded7c688c1",
+  "license": "MIT",
+  "adaptation": "Antigravity Proxy management adapters; preserve upstream license"
+}

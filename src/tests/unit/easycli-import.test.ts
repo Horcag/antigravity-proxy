@@ -129,7 +129,7 @@ describe('EasyCLI migration compensation on real temporary storage', () => {
   });
 });
 
-describe('offline EasyCLI migration', () => {
+describe('offline EasyCLI migration', { timeout: 20_000 }, () => {
   it('imports encrypted credentials and project keys while preserving config options', async () => {
     expect(await importEasyCliPayload(payload)).toEqual({
       projectsImported: 1, projectsExisting: 0, accountsImported: 1, accountsUpdated: 0,

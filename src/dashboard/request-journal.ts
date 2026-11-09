@@ -1,38 +1,18 @@
+import { logger } from '../shared/logging/logger';
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { getServerConfig } from '../server/server-config';
 import { extractApiKeyToken, resolveApiProject } from '../modules/proxy-gateway/server/guards/api-key-auth.util';
 
-export function safeLabel(value: unknown, fallback = 'unknown', privateValues: string[] = []): string {
-  const config = getServerConfig();
-  const secrets = [...privateValues, config?.api_key, config?.admin_api_key, ...(config?.projects ?? []).map((project) => project.api_key)];
-  if (typeof value === 'string' && secrets.some((secret) => secret && value.includes(secret))) return fallback;
-  return typeof value === 'string' && /^[\p{L}\p{N}_. @:+-]{1,100}$/u.test(value) ? value : fallback;
-}
+import { safeLabel, normalizedRoute } from '../observability/metadata';
+import { getRequestHistoryStore, closeRequestHistory, type HistoryInput } from '../observability/request-history';
+import { createRequestObservation, runWithRequestObservation, observeResponseUsage, type RequestObservation } from '../observability/request-context';
+export { safeLabel, normalizedRoute };
 
-export function normalizedRoute(value: unknown): string {
-  const path = typeof value === 'string' ? value.split('?')[0] : '';
-  if (/^\/v1internal:(?:streamGenerateContent|generateContent|countTokens)$/.test(path)) return path;
-  if (path === '/google.gca.aicode.v1alpha.PredictionService/BidiGenerateContent') return path;
-  if (/^\/(?:v1|v1beta)\/models\/[^/]+:(?:streamGenerateContent|generateContent)$/.test(path)) {
-    return '/v1beta/models/:model:generateContent';
-  }
-  return ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/v1/audio/transcriptions', '/v1/audio/translations', '/v1/audio/speech'].includes(path) ? path : 'other';
-}
-
-export interface JournalInput {
-  protocol: 'http' | 'connect';
-  route: string;
-  model?: unknown;
-  project_id?: unknown;
-  project_name?: unknown;
-  status: number;
-  grpc_status?: string;
-  duration_ms: number;
-  request_id?: unknown;
-}
+export type JournalInput = HistoryInput;
 
 export class RequestJournal {
+  constructor(private readonly persist?: (input: JournalInput) => void) {}
   private entries: ReturnType<RequestJournal['sanitize']>[] = [];
   private total = 0;
   private errors = 0;
@@ -40,7 +20,7 @@ export class RequestJournal {
 
   private sanitize(input: JournalInput) {
     return {
-      request_id: randomUUID(),
+      request_id: input.request_id && /^[\da-f-]{36}$/i.test(input.request_id) ? input.request_id : randomUUID(),
       time: new Date().toISOString(),
       protocol: input.protocol === 'connect' ? 'connect' : 'http',
       route: normalizedRoute(input.route),
@@ -55,6 +35,7 @@ export class RequestJournal {
 
   record(input: JournalInput): void {
     const entry = this.sanitize(input);
+    try { this.persist?.(input); } catch { logger.warn('Request history write failed; request telemetry was not persisted'); }
     this.total += 1;
     if (entry.status >= 400 || (entry.grpc_status !== undefined && entry.grpc_status !== '0')) this.errors += 1;
     this.entries.push(entry);
@@ -66,23 +47,43 @@ export class RequestJournal {
   }
 }
 
-export const requestJournal = new RequestJournal();
+export const requestJournal = new RequestJournal((input) => getRequestHistoryStore().record(input));
 const installed = new WeakSet<FastifyInstance>();
 
 export function installDashboardHooks(server: FastifyInstance): void {
   if (installed.has(server)) return;
   installed.add(server);
-  const starts = new WeakMap<FastifyRequest, number>();
-  server.addHook('onRequest', async (request) => { starts.set(request, performance.now()); });
-  server.addHook('onResponse', async (request, reply) => {
+  const contexts = new WeakMap<FastifyRequest, { started: number; context: RequestObservation; project: { id: string; name: string } | null }>();
+  server.addHook('onRequest', (request, reply, done) => {
+    const context = createRequestObservation();
+    const started = performance.now();
+    const project = resolveApiProject(getServerConfig(), extractApiKeyToken(request.headers));
+    contexts.set(request, { started, context, project });
+    reply.raw.once('close', () => {
+      if (!reply.raw.writableFinished) record(request, context.upstream_failed ? 502 : 499);
+    });
+    runWithRequestObservation(context, done);
+  });
+  server.addHook('onSend', async (_request, reply, payload) => {
+    if (reply.statusCode < 400 && typeof payload === 'string' && payload.length <= 1_048_576 && String(reply.getHeader('content-type')).includes('application/json')) {
+      try { observeResponseUsage(JSON.parse(payload)); } catch { /* Opaque/non-JSON responses have unknown usage. */ }
+    }
+    return payload;
+  });
+  const record = (request: FastifyRequest, status: number) => {
+    const state = contexts.get(request);
+    if (!state || state.context.finished) return;
+    const { context, started, project } = state;
+    if (context.upstream_failed && status < 400) status = 502;
+    context.finished = true;
+    contexts.delete(request);
     const route = normalizedRoute(request.url);
     if (route === 'other') return;
     const body = request.body && typeof request.body === 'object' ? request.body as Record<string, unknown> : {};
-    const project = resolveApiProject(getServerConfig(), extractApiKeyToken(request.headers));
     const model = body.model ?? request.url.split('?')[0].match(/\/models\/([^/:]+):/)?.[1];
-    requestJournal.record({ protocol: 'http', route: request.url, model, project_id: project?.id,
-      project_name: project?.name, status: reply.statusCode,
-      duration_ms: performance.now() - (starts.get(request) ?? performance.now()) });
-    starts.delete(request);
-  });
+    requestJournal.record({ ...context, protocol: 'http', route: request.url, model,
+      project_id: project?.id, project_name: project?.name, status, duration_ms: performance.now() - started });
+  };
+  server.addHook('onResponse', async (request, reply) => { record(request, reply.statusCode); });
+  server.addHook('onClose', async () => { closeRequestHistory(); });
 }
