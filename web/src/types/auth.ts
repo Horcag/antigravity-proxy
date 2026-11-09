@@ -1,0 +1,39 @@
+/**
+ * 认证相关类型定义
+ * 基于原项目 src/modules/login.js 和 src/core/connection.js
+ */
+
+// 登录凭据
+export interface LoginCredentials {
+  apiBase: string;
+  managementKey: string;
+  rememberPassword?: boolean;
+}
+
+// 认证状态
+export interface AuthState {
+  isAuthenticated: boolean;
+  apiBase: string;
+  managementKey: string;
+  rememberPassword: boolean;
+  serverVersion: string | null;
+  serverBuildDate: string | null;
+  serverRuntimeKind: ServerRuntimeKind;
+  supportsPlugin: boolean;
+  supportsReasoningEffortPolicy: boolean;
+  pluginSupportKnown: boolean;
+  pluginSupportSource: PluginSupportSource;
+  supportsFlowControl: boolean;
+  flowSupportKnown: boolean;
+}
+
+// 连接状态
+export type ConnectionStatus = 'connected' | 'disconnected' | 'connecting' | 'error';
+export type ServerRuntimeKind = 'unknown' | 'cpa' | 'home';
+export type PluginSupportSource = 'unknown' | 'header' | 'probe';
+
+export interface ConnectionInfo {
+  status: ConnectionStatus;
+  lastCheck: Date | null;
+  error: string | null;
+}

@@ -13,16 +13,21 @@
     "npm": ">=10"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
+    "build": "npm run build:server && npm run build:web && node scripts/copy-web-build.mjs",
     "start": "node dist/cli.js serve",
     "dev": "node --import tsx src/cli.ts serve",
-    "type-check": "tsc --noEmit -p tsconfig.json",
+    "type-check": "npm run type-check:server && npm --prefix web run type-check",
     "test": "vitest run",
     "quality:file-size": "tsx scripts/quality/check-file-size.ts",
     "quality:ratchet": "tsx scripts/quality/check-file-size.ts --update-baseline",
     "lint:debt": "tsx scripts/quality/check-debt-baseline.ts",
-    "lint": "eslint . && npm run lint:debt && npm run quality:file-size",
-    "check": "npm run type-check && npm run build && npm run lint && npm test"
+    "lint": "npm run lint:server && npm --prefix web run lint:agp",
+    "check": "npm run type-check && npm run build && npm run lint && npm test && npm --prefix web run test:agp",
+    "build:server": "tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
+    "build:web": "npm --prefix web run build",
+    "postinstall": "node -e \"if(require('node:fs').existsSync('web/package-lock.json'))require('node:child_process').execFileSync(process.platform==='win32'?'npm.cmd':'npm',['ci','--prefix','web'],{stdio:'inherit',shell:process.platform==='win32'})\"",
+    "lint:server": "eslint . && npm run lint:debt && npm run quality:file-size",
+    "type-check:server": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
     "@fastify/multipart": "^9.4.0",

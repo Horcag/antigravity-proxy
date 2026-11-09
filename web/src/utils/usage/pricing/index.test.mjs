@@ -1,0 +1,1488 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { loadTypeScript } from '../../../../scripts/testTypeScript.mjs';
+
+const pricing = loadTypeScript(fileURLToPath(new URL('./index.ts', import.meta.url)));
+
+const tier = (tierName = 'std', evidence = 'effective') => ({
+  tier: tierName,
+  evidence,
+  rawRequest: evidence === 'request' ? 'priority' : null,
+  rawResponse: null,
+  rawEffective: null,
+});
+
+const approx = (actual, expected) =>
+  assert.ok(Math.abs(actual - expected) < 1e-12, `cost = ${actual}, expected ${expected}`);
+
+test('catalog is versioned, self-describing, exact, and keeps provider rate boundaries explicit', () => {
+  const sol = pricing.findCatalogEntry('gpt-5.6-sol');
+  assert.equal(pricing.PRICE_CATALOG_AS_OF, '2026-10-03');
+  assert.equal(sol.currency, 'USD');
+  assert.deepEqual(sol.aliases, ['gpt-5.6', 'gpt-daybreak-blue-latest']);
+  assert.equal(sol.sourceUrl, 'https://developers.openai.com/api/docs/pricing');
+  assert.equal(sol.pricingNotesUrl, 'https://developers.openai.com/api/docs/models/gpt-5.6-sol');
+  assert.equal(sol.standard.long.basis, 'inputTokens');
+  assert.equal(sol.standard.long.appliesTo, 'entireRequest');
+  assert.deepEqual(sol.fast.short, { input: sol.standard.short.input * 2, cachedInput: sol.standard.short.cachedInput * 2, cacheWrite: sol.standard.short.cacheWrite * 2, output: sol.standard.short.output * 2 });
+  assert.equal(sol.fast.longSupported, true);
+  const terra = pricing.findCatalogEntry('gpt-5.6-terra');
+  assert.deepEqual(terra.standard.short, {
+    input: 2,
+    cachedInput: 0.2,
+    cacheWrite: 2.5,
+    output: 12,
+  });
+  assert.deepEqual(terra.standard.long.rates, {
+    input: 4,
+    cachedInput: 0.4,
+    cacheWrite: 5,
+    output: 18,
+  });
+  assert.equal(terra.asOf, '2026-10-03');
+  const luna = pricing.findCatalogEntry('gpt-5.6-luna');
+  assert.deepEqual(luna.standard.short, {
+    input: 0.2,
+    cachedInput: 0.02,
+    cacheWrite: 0.25,
+    output: 1.2,
+  });
+  assert.deepEqual(luna.standard.long.rates, {
+    input: 0.4,
+    cachedInput: 0.04,
+    cacheWrite: 0.5,
+    output: 1.8,
+  });
+  assert.equal(luna.asOf, '2026-10-03');
+  const gpt55 = pricing.findCatalogEntry('gpt-5.5');
+  assert.equal(gpt55.standard.long.basis, 'inputTokens');
+  assert.equal(gpt55.standard.long.appliesTo, 'entireRequest');
+  assert.equal(gpt55.fast.multiplier, 2.5);
+  assert.equal(pricing.findCatalogEntry('gpt-5.6-sol-preview'), null);
+  assert.equal(pricing.findCatalogEntry('tenant/gpt-5.6-sol'), null);
+  assert.equal(pricing.findCatalogEntry('gpt-5.6').canonicalModel, 'gpt-5.6-sol');
+
+  const glm = pricing.findCatalogEntry('glm-5.2');
+  assert.equal(glm.currency, 'USD');
+  assert.deepEqual(glm.aliases, []);
+  assert.deepEqual(glm.standard.short, {
+    input: 1.4,
+    cachedInput: 0.26,
+    cacheWrite: 0,
+    output: 4.4,
+  });
+  assert.equal(glm.standard.long, undefined);
+  assert.equal(glm.fast, undefined);
+  assert.equal(glm.sourceUrl, 'https://docs.z.ai/guides/overview/pricing');
+  assert.equal(glm.pricingNotesUrl, 'https://docs.z.ai/guides/llm/glm-5.2');
+  assert.equal(glm.asOf, '2026-07-22');
+
+  for (const [modelName, rates, sourceUrl, notesUrl, aliases] of [
+    [
+      'kimi-k3',
+      { input: 3, cachedInput: 0.3, output: 15 },
+      'https://platform.kimi.ai/docs/pricing/chat-k3',
+      'https://platform.kimi.ai/docs/guide/kimi-k3-quickstart',
+      ['k3'],
+    ],
+    [
+      'kimi-k3-256k',
+      { input: 1.5, cachedInput: 0.15, output: 7.5 },
+      'https://platform.kimi.ai/docs/pricing/chat-k3',
+      'https://platform.kimi.ai/docs/guide/kimi-k3-quickstart',
+      ['k3-256k'],
+    ],
+    [
+      'kimi-k2.7-code',
+      { input: 0.95, cachedInput: 0.19, output: 4 },
+      'https://platform.kimi.ai/docs/pricing/chat-k27-code',
+      'https://platform.kimi.ai/docs/guide/kimi-k2-7-code-quickstart',
+      ['kimi-for-coding'],
+    ],
+    [
+      'kimi-k2.7-code-highspeed',
+      { input: 1.9, cachedInput: 0.38, output: 8 },
+      'https://platform.kimi.ai/docs/pricing/chat-k27-code',
+      'https://platform.kimi.ai/docs/guide/kimi-k2-7-code-quickstart',
+      ['kimi-for-coding-highspee', 'kimi-for-coding-highspeed'],
+    ],
+  ]) {
+    const entry = pricing.findCatalogEntry(modelName);
+    assert.equal(entry.currency, 'USD');
+    assert.deepEqual(entry.aliases, aliases);
+    assert.deepEqual(entry.standard.short, rates);
+    assert.equal(entry.standard.long, undefined);
+    assert.equal(entry.fast, undefined);
+    assert.equal(entry.sourceUrl, sourceUrl);
+    assert.equal(entry.pricingNotesUrl, notesUrl);
+    assert.equal(entry.asOf, '2026-07-28');
+  }
+
+  const grok = pricing.findCatalogEntry('grok-4.5');
+  assert.equal(grok.currency, 'USD');
+  assert.deepEqual(grok.aliases, ['grok-4.5-latest', 'grok-build-latest']);
+  assert.deepEqual(grok.standard.short, { input: 2, cachedInput: 0.3, output: 6 });
+  assert.deepEqual(grok.standard.long, {
+    thresholdTokens: 200_000,
+    basis: 'inputTokens',
+    appliesTo: 'entireRequest',
+    rates: { input: 4, cachedInput: 0.6, output: 12 },
+  });
+  assert.equal(grok.fast, undefined);
+  assert.equal(grok.sourceUrl, 'https://docs.x.ai/developers/models/grok-4.5');
+  assert.equal(grok.pricingNotesUrl, undefined);
+  assert.equal(grok.asOf, '2026-07-23');
+
+  const grok46 = pricing.findCatalogEntry('grok-4.6');
+  assert.equal(grok46.currency, 'USD');
+  assert.deepEqual(grok46.aliases, []);
+  assert.deepEqual(grok46.standard.short, { input: 2, cachedInput: 0.5, output: 6 });
+  assert.deepEqual(grok46.standard.long, {
+    thresholdTokens: 200_000,
+    basis: 'inputTokens',
+    appliesTo: 'entireRequest',
+    rates: { input: 4, cachedInput: 1, output: 12 },
+  });
+  assert.equal(grok46.fast, undefined);
+  assert.equal(grok46.sourceUrl, 'https://docs.x.ai/developers/models/grok-4.6');
+  assert.equal(grok46.pricingNotesUrl, undefined);
+  assert.equal(grok46.asOf, '2026-08-18');
+
+  const grok43 = pricing.findCatalogEntry('grok-4.3');
+  assert.equal(grok43.currency, 'USD');
+  assert.deepEqual(grok43.aliases, []);
+  assert.deepEqual(grok43.standard.short, { input: 1.25, cachedInput: 0.2, output: 2.5 });
+  assert.deepEqual(grok43.standard.long, {
+    thresholdTokens: 200_000,
+    basis: 'inputTokens',
+    appliesTo: 'entireRequest',
+    rates: { input: 2.5, cachedInput: 0.4, output: 5 },
+  });
+  assert.equal(grok43.fast, undefined);
+  assert.equal(grok43.sourceUrl, 'https://docs.x.ai/developers/models/grok-4.3');
+  assert.equal(grok43.pricingNotesUrl, undefined);
+  assert.equal(grok43.asOf, '2026-10-10');
+
+  const grok47 = pricing.findCatalogEntry('grok-4.7');
+  assert.equal(grok47.currency, 'USD');
+  assert.deepEqual(grok47.aliases, []);
+  assert.deepEqual(grok47.standard.short, { input: 2, cachedInput: 0.5, output: 6 });
+  assert.deepEqual(grok47.standard.long, {
+    thresholdTokens: 200_000,
+    basis: 'inputTokens',
+    appliesTo: 'entireRequest',
+    rates: { input: 4, cachedInput: 1, output: 12 },
+  });
+  assert.equal(grok47.fast, undefined);
+  assert.equal(grok47.sourceUrl, 'https://docs.x.ai/developers/models/grok-4.7');
+  assert.equal(grok47.pricingNotesUrl, undefined);
+  assert.equal(grok47.asOf, '2026-10-10');
+
+  const grok47Fast = pricing.findCatalogEntry('grok-4.7-fast');
+  assert.equal(grok47Fast.currency, 'USD');
+  assert.deepEqual(grok47Fast.aliases, ['grok-4.7-build-fast']);
+  assert.deepEqual(grok47Fast.standard.short, { input: 4, cachedInput: 1, output: 12 });
+  assert.deepEqual(grok47Fast.standard.long, {
+    thresholdTokens: 200_001,
+    basis: 'inputTokens',
+    appliesTo: 'entireRequest',
+    rates: { input: 6, cachedInput: 1.5, output: 18 },
+  });
+  assert.equal(grok47Fast.fast, undefined);
+  assert.equal(grok47Fast.sourceUrl, 'https://docs.x.ai/developers/pricing#grok-47-fast-pricing-cursor-and-grok-build-only');
+  assert.equal(grok47Fast.pricingNotesUrl, undefined);
+  assert.equal(grok47Fast.asOf, '2026-10-13');
+
+  const doubao = pricing.findCatalogEntry('doubao-seed-2.1-pro');
+  assert.equal(doubao.currency, 'USD');
+  assert.deepEqual(doubao.aliases, []);
+  assert.deepEqual(doubao.standard.short, { input: 0.882, cachedInput: 0.176, output: 4.412 });
+  assert.equal(doubao.standard.long, undefined);
+  assert.equal(doubao.fast, undefined);
+  assert.equal(doubao.sourceUrl, 'https://www.volcengine.com/docs/82379/1099320');
+  assert.equal(doubao.pricingNotesUrl, undefined);
+  assert.equal(doubao.asOf, '2026-10-10');
+
+  const doubaoEstimate = pricing.estimateUsageCost(
+    'doubao-seed-2.1-pro',
+    { input_tokens: 1_000, cache_read_tokens: 500, output_tokens: 2_000 },
+    undefined,
+    tier()
+  );
+  assert.equal(doubaoEstimate.status, 'priced');
+  assert.equal(doubaoEstimate.contextBand, 'short');
+  assert.deepEqual(doubaoEstimate.rates, { input: 0.882, cachedInput: 0.176, output: 4.412 });
+});
+
+test('September GPT-5.6 rates price Standard and Fast in both context bands', () => {
+  for (const [model, short, long] of [
+    ['gpt-5.6-sol', [4, 0.4, 5, 20], [8, 0.8, 10, 30]],
+    ['gpt-5.6-terra', [2, 0.2, 2.5, 12], [4, 0.4, 5, 18]],
+    ['gpt-5.6-luna', [0.2, 0.02, 0.25, 1.2], [0.4, 0.04, 0.5, 1.8]],
+  ]) {
+    for (const [input, band, rates] of [
+      [200_000, 'short', short],
+      [300_000, 'long', long],
+    ]) {
+      for (const [serviceTier, multiplier] of [['std', 1], ['fast', 2]]) {
+        const estimate = pricing.estimateUsageCost(model, {
+          input_tokens: input,
+          cache_read_tokens: 30_000,
+          cache_creation_tokens: 40_000,
+          output_tokens: 100_000,
+        }, undefined, tier(serviceTier));
+        assert.equal(estimate.status, 'priced');
+        assert.equal(estimate.contextBand, band);
+        assert.deepEqual(estimate.rates, {
+          input: rates[0] * multiplier,
+          cachedInput: rates[1] * multiplier,
+          cacheWrite: rates[2] * multiplier,
+          output: rates[3] * multiplier,
+        });
+        approx(estimate.amount, (
+          (input - 70_000) * rates[0] + 30_000 * rates[1] +
+          40_000 * rates[2] + 100_000 * rates[3]
+        ) * multiplier / 1_000_000);
+      }
+    }
+  }
+});
+
+test('Sol pricing update preserves saved old rates instead of treating them as current presets', () => {
+  const { profile } = pricing.migrateModelPricesV2ToV3({
+    'gpt-5.6-sol': { prompt: 5, cache: 0.5, cacheWrite: 6.25, completion: 30 },
+  });
+  const before = JSON.stringify(profile);
+  const estimate = pricing.estimateUsageCost('gpt-5.6-sol', {
+    input_tokens: 200_000, output_tokens: 100_000,
+    cache_read_tokens: 30_000, cache_creation_tokens: 40_000,
+  }, profile, tier());
+  assert.equal(estimate.modelMatch, 'custom');
+  approx(estimate.amount, 3.915);
+  assert.deepEqual(pricing.restorePresetEquivalentOverrides(profile).restoredModels, []);
+  assert.equal(JSON.stringify(profile), before);
+});
+
+test('GPT-5.3 Codex Spark is a free preset across every billable token category', () => {
+  const spark = pricing.findCatalogEntry('gpt-5.3-codex-spark');
+  assert.equal(spark.currency, 'USD');
+  assert.deepEqual(spark.standard.short, {
+    input: 0,
+    cachedInput: 0,
+    cacheWrite: 0,
+    output: 0,
+  });
+
+  const estimate = pricing.estimateUsageCost(
+    'gpt-5.3-codex-spark',
+    {
+      input_tokens: 1_000_000,
+      output_tokens: 1_000_000,
+      cache_read_tokens: 200_000,
+      cache_creation_tokens: 300_000,
+    },
+    undefined,
+    tier()
+  );
+  assert.equal(estimate.status, 'priced');
+  assert.equal(estimate.amount, 0);
+  assert.deepEqual(estimate.rates, spark.standard.short);
+});
+
+test('Claude 4.5+ presets use official standard rates, exact aliases, and 5-minute cache writes', () => {
+  const sourceUrl = 'https://platform.claude.com/docs/en/about-claude/pricing';
+  const notesUrl = 'https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions';
+  const models = [
+    ['claude-haiku-4-5-20251001', ['claude-haiku-4-5'], [1, 0.1, 1.25, 5]],
+    ['claude-sonnet-4-5-20250929', ['claude-sonnet-4-5'], [3, 0.3, 3.75, 15]],
+    ['claude-sonnet-4-6', [], [3, 0.3, 3.75, 15]],
+    ['claude-sonnet-5', [], [3, 0.3, 3.75, 15]],
+    ['claude-opus-4-5-20251101', ['claude-opus-4-5'], [5, 0.5, 6.25, 25]],
+    ['claude-opus-4-6', [], [5, 0.5, 6.25, 25]],
+    ['claude-opus-4-7', [], [5, 0.5, 6.25, 25]],
+    ['claude-opus-4-8', [], [5, 0.5, 6.25, 25]],
+    ['claude-opus-5', [], [5, 0.5, 6.25, 25]],
+    ['claude-fable-5', [], [10, 1, 12.5, 50]],
+  ];
+
+  for (const [modelName, aliases, [input, cachedInput, cacheWrite, output]] of models) {
+    const entry = pricing.findCatalogEntry(modelName);
+    assert.equal(entry.canonicalModel, modelName);
+    assert.deepEqual(entry.aliases, aliases);
+    assert.deepEqual(entry.standard.short, { input, cachedInput, cacheWrite, output });
+    assert.equal(entry.standard.long, undefined);
+    assert.equal(entry.fast, undefined);
+    assert.equal(entry.sourceUrl, sourceUrl);
+    assert.equal(entry.pricingNotesUrl, notesUrl);
+    assert.equal(entry.asOf, '2026-07-26');
+
+    for (const alias of aliases) {
+      assert.equal(pricing.findCatalogEntry(alias).canonicalModel, modelName);
+    }
+  }
+
+  assert.equal(pricing.findCatalogEntry('tenant/claude-sonnet-4-6'), null);
+});
+
+test('Claude 4.6+ keeps one standard rate card across the full 1M context window', () => {
+  for (const [modelName, inputRate] of [
+    ['claude-sonnet-4-6', 3],
+    ['claude-sonnet-5', 3],
+    ['claude-opus-4-6', 5],
+    ['claude-opus-4-7', 5],
+    ['claude-opus-4-8', 5],
+    ['claude-opus-5', 5],
+    ['claude-fable-5', 10],
+  ]) {
+    const estimate = pricing.estimateUsageCost(
+      modelName,
+      { input_tokens: 900_000 },
+      undefined,
+      tier()
+    );
+    assert.equal(estimate.status, 'priced');
+    assert.equal(estimate.contextBand, 'short');
+    approx(estimate.amount, inputRate * 0.9);
+  }
+});
+
+test('Claude cost estimates apply cache hit and explicit 5-minute cache write rates', () => {
+  const estimate = pricing.estimateUsageCost(
+    'claude-sonnet-4-6',
+    {
+      input_tokens: 1_000_000,
+      output_tokens: 1_000_000,
+      cache_read_tokens: 200_000,
+      cache_creation_tokens: 300_000,
+    },
+    undefined,
+    tier()
+  );
+  assert.equal(estimate.status, 'priced');
+  assert.deepEqual(estimate.rates, {
+    input: 3,
+    cachedInput: 0.3,
+    cacheWrite: 3.75,
+    output: 15,
+  });
+  approx(estimate.amount, 17.685);
+});
+
+test('matches direct custom, canonical preset, explicit alias, and unmatched without fuzzy matching', () => {
+  const profile = {
+    ...pricing.createDefaultPriceProfileV3(),
+    aliases: { 'tenant/sol': 'gpt-5.6-sol' },
+    overrides: {
+      local: { standard: { short: { input: 1, cachedInput: 0.1, output: 2 } } },
+    },
+  };
+  assert.equal(pricing.resolvePriceProfile('local', profile).modelMatch, 'custom');
+  assert.equal(pricing.resolvePriceProfile('gpt-5.6-sol', profile).modelMatch, 'preset');
+  assert.equal(pricing.resolvePriceProfile('tenant/sol', profile).modelMatch, 'alias');
+  assert.equal(pricing.resolvePriceProfile('tenant/gpt-5.6-sol', profile).modelMatch, 'none');
+
+  for (const [alias, canonicalModel] of [
+    ['k3', 'kimi-k3'],
+    ['k3-256k', 'kimi-k3-256k'],
+    ['kimi-for-coding', 'kimi-k2.7-code'],
+    ['kimi-for-coding-highspee', 'kimi-k2.7-code-highspeed'],
+    ['kimi-for-coding-highspeed', 'kimi-k2.7-code-highspeed'],
+    ['grok-4.5-latest', 'grok-4.5'],
+    ['grok-build-latest', 'grok-4.5'],
+    ['gpt-daybreak-blue-latest', 'gpt-5.6-sol'],
+  ]) {
+    const resolved = pricing.resolvePriceProfile(alias, profile);
+    assert.equal(resolved.modelMatch, 'alias');
+    assert.equal(resolved.resolvedModel, canonicalModel);
+  }
+
+  // gpt-daybreak-blue-latest 是官方弃用别名（指向 gpt-5.6-sol），必须走目录
+  // 别名解析并继承 canonical 的自定义价格；对别名本身设置 override 仍然生效。
+  const solOverrideProfile = {
+    ...pricing.createDefaultPriceProfileV3(),
+    overrides: {
+      'gpt-5.6-sol': { standard: { short: { input: 1, cachedInput: 0, output: 2 } } },
+    },
+  };
+  const daybreakInherited = pricing.resolvePriceProfile('gpt-daybreak-blue-latest', solOverrideProfile);
+  assert.equal(daybreakInherited.modelMatch, 'alias');
+  assert.equal(daybreakInherited.resolvedModel, 'gpt-5.6-sol');
+  assert.equal(daybreakInherited.usesCustomOverride, true);
+  assert.deepEqual(daybreakInherited.standard.short, { input: 1, cachedInput: 0, output: 2 });
+  const daybreakDirect = pricing.resolvePriceProfile('gpt-daybreak-blue-latest', {
+    ...pricing.createDefaultPriceProfileV3(),
+    overrides: {
+      'gpt-daybreak-blue-latest': { standard: { short: { input: 3, cachedInput: 0, output: 4 } } },
+    },
+  });
+  assert.equal(daybreakDirect.modelMatch, 'custom');
+  assert.deepEqual(daybreakDirect.standard.short, { input: 3, cachedInput: 0, output: 4 });
+});
+
+test('v2 migration preserves Auto cache-write, explicit zero, and old string values', () => {
+  const { profile } = pricing.migrateModelPricesV2ToV3({
+    auto: { prompt: '10', completion: '20', cache: '1' },
+    zero: { prompt: 10, completion: 20, cache: 1, cacheWrite: 0 },
+  });
+  assert.deepEqual(profile.overrides.auto.standard.short, {
+    input: 10,
+    cachedInput: 1,
+    output: 20,
+  });
+  assert.deepEqual(profile.overrides.zero.standard.short, {
+    input: 10,
+    cachedInput: 1,
+    cacheWrite: 0,
+    output: 20,
+  });
+});
+
+test('v2 migration preserves matching rates until the user explicitly restores complete presets', () => {
+  const { profile } = pricing.migrateModelPricesV2ToV3({
+    'gpt-5.6-sol': {
+      prompt: 4,
+      completion: 20,
+      cache: 0.4,
+      cacheWrite: 5,
+    },
+    'gpt-5.4': {
+      prompt: 2.5,
+      completion: 15,
+      cache: 0.25,
+      cacheWrite: 2.5,
+    },
+    'gpt-5.6-terra': {
+      prompt: 2.75,
+      completion: 15,
+      cache: 0.25,
+      cacheWrite: 3.125,
+    },
+  });
+
+  assert.ok(profile.overrides['gpt-5.6-sol']);
+  assert.ok(profile.overrides['gpt-5.4']);
+  assert.equal(profile.overrides['gpt-5.6-terra'].standard.short.input, 2.75);
+  assert.equal(pricing.resolvePriceProfile('gpt-5.6-sol', profile).modelMatch, 'custom');
+
+  const recovery = pricing.restorePresetEquivalentOverrides(profile);
+  assert.deepEqual(recovery.restoredModels, ['gpt-5.6-sol', 'gpt-5.4']);
+  assert.equal(pricing.resolvePriceProfile('gpt-5.6-sol', recovery.profile).modelMatch, 'preset');
+  assert.deepEqual(pricing.resolvePriceProfile('gpt-5.6-sol', recovery.profile).fast, pricing.findCatalogEntry('gpt-5.6-sol').fast);
+  assert.equal(
+    pricing.resolvePriceProfile('gpt-5.6-sol', recovery.profile).standard.long.rates.output,
+    30
+  );
+});
+
+test('preset-equivalent v3 recovery is opt-in and preserves real custom overrides', () => {
+  const profile = {
+    ...pricing.createDefaultPriceProfileV3(),
+    aliases: { 'tenant/sol': 'gpt-5.6-sol' },
+    overrides: {
+      'gpt-5.6-sol': {
+        standard: {
+          short: { input: 4, cachedInput: 0.4, cacheWrite: 5, output: 20 },
+        },
+      },
+      'gpt-5.6-terra': {
+        standard: {
+          short: { input: 2.75, cachedInput: 0.25, cacheWrite: 3.125, output: 15 },
+        },
+      },
+      'gpt-5.4': {
+        standard: {
+          short: { input: 2.5, cachedInput: 0.25, output: 15 },
+          long: {
+            thresholdTokens: 300_000,
+            basis: 'inputTokens',
+            appliesTo: 'entireRequest',
+            rates: { input: 6, cachedInput: 0.6, output: 24 },
+          },
+        },
+      },
+      'gpt-5.6-luna': {
+        standard: {
+          short: { input: 1, cachedInput: 0.1, cacheWrite: 1.25, output: 6 },
+        },
+        fast: { multiplier: 3, longSupported: true },
+      },
+      'grok-4.5': {
+        standard: { short: { input: 2, cachedInput: 0, output: 6 } },
+      },
+    },
+  };
+
+  const recovery = pricing.restorePresetEquivalentOverrides(profile);
+  assert.deepEqual(recovery.restoredModels, ['gpt-5.6-sol']);
+  assert.equal(recovery.profile.overrides['gpt-5.6-sol'], undefined);
+  assert.ok(recovery.profile.overrides['gpt-5.6-terra']);
+  assert.ok(recovery.profile.overrides['gpt-5.4']);
+  assert.ok(recovery.profile.overrides['gpt-5.6-luna']);
+  assert.ok(recovery.profile.overrides['grok-4.5']);
+  assert.equal(recovery.profile.aliases['tenant/sol'], 'gpt-5.6-sol');
+  assert.equal(pricing.resolvePriceProfile('tenant/sol', recovery.profile).modelMatch, 'alias');
+  assert.deepEqual(pricing.resolvePriceProfile('tenant/sol', recovery.profile).fast, pricing.findCatalogEntry('gpt-5.6-sol').fast);
+  assert.ok(profile.overrides['gpt-5.6-sol']);
+});
+
+test('Fast preset and custom profiles derive rates from the selected Standard context band', () => {
+  const preset = pricing.estimateUsageCost(
+    'gpt-5.4-mini',
+    { input_tokens: 1_000_000, output_tokens: 100_000 },
+    undefined,
+    tier('fast')
+  );
+  approx(preset.amount, 2.4);
+
+  const multiplierProfile = {
+    ...pricing.createDefaultPriceProfileV3(),
+    overrides: {
+      local: {
+        standard: { short: { input: 2, cachedInput: 0.2, output: 4 } },
+        fast: { multiplier: 3, longSupported: true },
+      },
+    },
+  };
+  const multiplied = pricing.estimateUsageCost(
+    'local',
+    { input_tokens: 1_000_000, output_tokens: 100_000 },
+    multiplierProfile,
+    tier('fast')
+  );
+  approx(multiplied.amount, 7.2);
+
+  const legacy = pricing.migrateModelPricesV2ToV3({
+    local: { prompt: 10, completion: 20, cache: 1 },
+  }).profile;
+  const fallback = pricing.estimateUsageCost(
+    'local',
+    { input_tokens: 1_000_000, output_tokens: 100_000 },
+    legacy,
+    tier('fast')
+  );
+  approx(fallback.amount, 12);
+  assert.deepEqual(fallback.warnings, ['fallbackStandard']);
+});
+
+test('the full input_tokens count switches GPT-5.5 at 271999, 272000, and 272001', () => {
+  for (const [inputTokens, expectedBand, expectedInputRate] of [
+    [271_999, 'short', 5],
+    [272_000, 'short', 5],
+    [272_001, 'long', 10],
+  ]) {
+    const estimate = pricing.estimateUsageCost(
+      'gpt-5.5',
+      { input_tokens: inputTokens, output_tokens: 1 },
+      undefined,
+      tier()
+    );
+    assert.equal(estimate.contextBand, expectedBand);
+    assert.equal(estimate.rates.input, expectedInputRate);
+  }
+
+  const gpt56 = pricing.estimateUsageCost(
+    'gpt-5.6-terra',
+    { input_tokens: 300_000, output_tokens: 1 },
+    undefined,
+    tier()
+  );
+  assert.equal(gpt56.contextBand, 'long');
+  assert.equal(gpt56.rates.input, 4);
+});
+
+test('the GPT short-only assumption suppresses the long band without touching other providers', () => {
+  const shortOnly = pricing.createDefaultPriceProfileV3();
+  shortOnly.assumptions.gptLongContext = 'shortOnly';
+
+  const gpt = pricing.estimateUsageCost(
+    'gpt-5.5',
+    { input_tokens: 272_000, output_tokens: 1 },
+    shortOnly,
+    tier()
+  );
+  assert.equal(gpt.contextBand, 'short');
+  assert.equal(gpt.rates.input, 5);
+
+  const customGpt = pricing.createDefaultPriceProfileV3();
+  customGpt.assumptions.gptLongContext = 'shortOnly';
+  customGpt.overrides['tenant/gpt-5.5'] = {
+    standard: {
+      short: { input: 5, cachedInput: 0.5, output: 30 },
+      long: { thresholdTokens: 272_000, basis: 'inputTokens', appliesTo: 'entireRequest', rates: { input: 10, cachedInput: 1, output: 45 } },
+    },
+  };
+  const customEstimate = pricing.estimateUsageCost(
+    'tenant/gpt-5.5',
+    { input_tokens: 272_000, output_tokens: 1 },
+    customGpt,
+    tier()
+  );
+  assert.equal(customEstimate.status, 'priced');
+  assert.equal(customEstimate.contextBand, 'short');
+  assert.equal(customEstimate.rates.input, 5);
+
+  const grok = pricing.estimateUsageCost(
+    'grok-4.5',
+    { input_tokens: 200_000, output_tokens: 1 },
+    shortOnly,
+    tier()
+  );
+  assert.equal(grok.contextBand, 'long');
+  assert.equal(grok.rates.input, 4);
+
+  const auto = pricing.estimateUsageCost(
+    'gpt-5.5',
+    { input_tokens: 272_001, output_tokens: 1 },
+    undefined,
+    tier()
+  );
+  assert.equal(auto.contextBand, 'long');
+  assert.equal(auto.rates.input, 10);
+});
+
+test('normalization keeps the GPT long-context assumption backward compatible', () => {
+  const legacy = pricing.normalizePriceProfileV3({
+    schemaVersion: 3,
+    currency: 'USD',
+    assumptions: { historicalPricing: 'current', unknownServiceTier: 'standard' },
+    aliases: {},
+    overrides: {},
+  });
+  assert.equal(legacy.profile.assumptions.gptLongContext, 'auto');
+  assert.equal(legacy.profile.assumptions.fastLongContext, 'allow');
+  assert.deepEqual(legacy.warnings, []);
+
+  const invalid = pricing.normalizePriceProfileV3({
+    schemaVersion: 3,
+    currency: 'USD',
+    assumptions: {
+      historicalPricing: 'current',
+      unknownServiceTier: 'standard',
+      gptLongContext: 'bogus',
+    },
+    aliases: {},
+    overrides: {},
+  });
+  assert.equal(invalid.profile.assumptions.gptLongContext, 'auto');
+  assert.deepEqual(invalid.warnings, ['gpt-long-context-invalid']);
+
+  const official = pricing.normalizePriceProfileV3({
+    schemaVersion: 3,
+    currency: 'USD',
+    assumptions: {
+      historicalPricing: 'current',
+      unknownServiceTier: 'standard',
+      fastLongContext: 'official',
+    },
+    aliases: {},
+    overrides: {},
+  });
+  assert.equal(official.profile.assumptions.fastLongContext, 'official');
+  assert.deepEqual(official.warnings, []);
+
+  const invalidFast = pricing.normalizePriceProfileV3({
+    schemaVersion: 3,
+    currency: 'USD',
+    assumptions: {
+      historicalPricing: 'current',
+      unknownServiceTier: 'standard',
+      fastLongContext: 'bogus',
+    },
+    aliases: {},
+    overrides: {},
+  });
+  assert.equal(invalidFast.profile.assumptions.fastLongContext, 'allow');
+  assert.deepEqual(invalidFast.warnings, ['fast-long-context-invalid']);
+});
+
+test('GLM-5.2 keeps official Standard rates and explicit free cache write', () => {
+  const estimate = pricing.estimateUsageCost(
+    'glm-5.2',
+    {
+      input_tokens: 1_000_000,
+      output_tokens: 1_000_000,
+      cache_read_tokens: 200_000,
+      cache_creation_tokens: 300_000,
+    },
+    undefined,
+    tier()
+  );
+
+  assert.equal(estimate.status, 'priced');
+  assert.equal(estimate.contextBand, 'short');
+  assert.deepEqual(estimate.rates, {
+    input: 1.4,
+    cachedInput: 0.26,
+    cacheWrite: 0,
+    output: 4.4,
+  });
+  approx(estimate.amount, 5.152);
+});
+
+test('GLM-5.3 models use list prices, exact aliases and inherited cache-write rates', () => {
+  for (const [model, input, cachedInput, output, amount] of [
+    ['glm-5.3', 1.4, 0.26, 4.4, 5.572],
+    ['glm-5.3-1m', 1.4, 0.26, 4.4, 5.572],
+    ['glm-5.3-flash', 0.15, 0.03, 0.5, 0.626],
+    ['glm-5.3-flash-1m', 0.15, 0.03, 0.5, 0.626],
+    ['ox-alpha', 0.15, 0.03, 0.5, 0.626],
+  ]) {
+    const entry = pricing.findCatalogEntry(model);
+    assert.deepEqual(entry.standard.short, { input, cachedInput, output });
+    assert.equal(entry.asOf, '2026-09-03');
+    assert.equal(entry.sourceUrl, 'https://docs.z.ai/guides/overview/pricing');
+    assert.equal(entry.standard.long, undefined);
+    assert.equal(entry.fast, undefined);
+    const estimate = pricing.estimateUsageCost(model, {
+      input_tokens: 1_000_000,
+      output_tokens: 1_000_000,
+      cache_read_tokens: 200_000,
+      cache_creation_tokens: 300_000,
+    }, undefined, tier());
+    assert.equal(estimate.status, 'priced');
+    assert.equal(estimate.rates.cacheWrite, undefined);
+    assert.equal(estimate.modelMatch, model === entry.canonicalModel ? 'preset' : 'alias');
+    assert.equal(estimate.resolvedModel, input === 1.4 ? 'glm-5.3' : 'glm-5.3-flash');
+    approx(estimate.amount, amount);
+    const fast = pricing.estimateUsageCost(model, { input_tokens: 1_000 }, undefined, tier('fast'));
+    assert.equal(fast.status, 'unsupported');
+    assert.equal(fast.amount, null);
+  }
+  assert.equal(pricing.findCatalogEntry('ox-alpha').canonicalModel, 'glm-5.3-flash');
+  for (const model of ['glm-5.3-preview', 'tenant/glm-5.3', 'glm-5.3-2m', 'glm-5.3-flash-1m-preview']) {
+    assert.equal(pricing.findCatalogEntry(model), null);
+  }
+});
+
+test('GLM presets preserve explicit user prices for canonical models and aliases', () => {
+  const profile = pricing.createDefaultPriceProfileV3();
+  for (const model of ['glm-5.3', 'glm-5.3-1m', 'glm-5.3-flash', 'glm-5.3-flash-1m', 'ox-alpha']) {
+    profile.overrides[model] = { standard: { short: { input: 2, cachedInput: 0.1, output: 3 } } };
+    const estimate = pricing.estimateUsageCost(model, { input_tokens: 1_000_000 }, profile, tier());
+    assert.equal(estimate.modelMatch, 'custom');
+    approx(estimate.amount, 2);
+  }
+});
+
+test('GLM-5.2 Fast is unsupported and excluded from priced coverage', () => {
+  const estimate = pricing.estimateUsageCost(
+    'glm-5.2',
+    { input_tokens: 1_000_000, total_tokens: 1_000_000 },
+    undefined,
+    tier('fast', 'request')
+  );
+
+  assert.equal(estimate.status, 'unsupported');
+  assert.equal(estimate.amount, null);
+  assert.equal(estimate.rates, null);
+  assert.deepEqual(estimate.warnings, ['requestedEstimate']);
+
+  const coverage = pricing.aggregateCostEstimateCoverage([
+    { modelName: 'glm-5.2', tokenCount: 1_000_000, estimate },
+  ]);
+  assert.equal(coverage.totalRequests, 1);
+  assert.equal(coverage.pricedRequests, 0);
+  assert.equal(coverage.unsupportedRequests, 1);
+  assert.equal(coverage.totalTokens, 1_000_000);
+  assert.equal(coverage.pricedTokens, 0);
+  assert.equal(coverage.totalModels, 1);
+  assert.equal(coverage.pricedModels, 0);
+  assert.equal(coverage.estimatedAmount, 0);
+});
+
+test('Kimi presets map cache hit and miss rates without inventing Fast pricing', () => {
+  for (const [modelName, expectedRates, expectedAmount] of [
+    ['kimi-k3', { input: 3, cachedInput: 0.3, output: 15 }, 17.46],
+    ['kimi-k3-256k', { input: 1.5, cachedInput: 0.15, output: 7.5 }, 8.73],
+    ['kimi-k2.7-code', { input: 0.95, cachedInput: 0.19, output: 4 }, 4.798],
+    ['kimi-k2.7-code-highspeed', { input: 1.9, cachedInput: 0.38, output: 8 }, 9.596],
+  ]) {
+    const usage = {
+      input_tokens: 1_000_000,
+      output_tokens: 1_000_000,
+      cache_read_tokens: 200_000,
+      cache_creation_tokens: 300_000,
+    };
+    const standard = pricing.estimateUsageCost(modelName, usage, undefined, tier());
+    assert.equal(standard.status, 'priced');
+    assert.equal(standard.contextBand, 'short');
+    assert.deepEqual(standard.rates, expectedRates);
+    approx(standard.amount, expectedAmount);
+
+    const fast = pricing.estimateUsageCost(modelName, usage, undefined, tier('fast', 'request'));
+    assert.equal(fast.status, 'unsupported');
+    assert.equal(fast.amount, null);
+    assert.equal(fast.rates, null);
+  }
+});
+
+test('Grok 4.5 switches the entire request to long-context rates at 200K prompt tokens', () => {
+  for (const [inputTokens, contextBand, rates] of [
+    [199_999, 'short', { input: 2, cachedInput: 0.3, output: 6 }],
+    [200_000, 'long', { input: 4, cachedInput: 0.6, output: 12 }],
+    [200_001, 'long', { input: 4, cachedInput: 0.6, output: 12 }],
+  ]) {
+    const estimate = pricing.estimateUsageCost(
+      'grok-4.5',
+      { input_tokens: inputTokens, cache_read_tokens: 1_000, output_tokens: 10_000 },
+      undefined,
+      tier()
+    );
+    assert.equal(estimate.status, 'priced');
+    assert.equal(estimate.contextBand, contextBand);
+    assert.deepEqual(estimate.rates, rates);
+  }
+
+  const alias = pricing.estimateUsageCost(
+    'grok-4.5-latest',
+    { input_tokens: 1_000 },
+    undefined,
+    tier()
+  );
+  assert.equal(alias.status, 'priced');
+  assert.equal(alias.resolvedModel, 'grok-4.5');
+
+  const fast = pricing.estimateUsageCost(
+    'grok-4.5',
+    { input_tokens: 1_000 },
+    undefined,
+    tier('fast', 'request')
+  );
+  assert.equal(fast.status, 'unsupported');
+  assert.equal(fast.amount, null);
+  assert.equal(fast.rates, null);
+});
+
+test('Grok 4.6 switches the entire request to long-context rates at 200K prompt tokens', () => {
+  for (const [inputTokens, contextBand, rates] of [
+    [199_999, 'short', { input: 2, cachedInput: 0.5, output: 6 }],
+    [200_000, 'long', { input: 4, cachedInput: 1, output: 12 }],
+    [200_001, 'long', { input: 4, cachedInput: 1, output: 12 }],
+  ]) {
+    const estimate = pricing.estimateUsageCost(
+      'grok-4.6',
+      { input_tokens: inputTokens, cache_read_tokens: 1_000, output_tokens: 10_000 },
+      undefined,
+      tier()
+    );
+    assert.equal(estimate.status, 'priced');
+    assert.equal(estimate.contextBand, contextBand);
+    assert.deepEqual(estimate.rates, rates);
+  }
+
+  const unmatchedAlias = pricing.estimateUsageCost(
+    'grok-4.6-latest',
+    { input_tokens: 1_000 },
+    undefined,
+    tier()
+  );
+  assert.equal(unmatchedAlias.status, 'unmatched');
+  assert.equal(unmatchedAlias.resolvedModel, null);
+
+  const fast = pricing.estimateUsageCost(
+    'grok-4.6',
+    { input_tokens: 1_000 },
+    undefined,
+    tier('fast', 'request')
+  );
+  assert.equal(fast.status, 'unsupported');
+  assert.equal(fast.amount, null);
+  assert.equal(fast.rates, null);
+});
+
+test('Grok 4.3 and Grok 4.7 switch the entire request to long-context rates at 200K prompt tokens', () => {
+  for (const [model, shortRates, longRates] of [
+    ['grok-4.3', { input: 1.25, cachedInput: 0.2, output: 2.5 }, { input: 2.5, cachedInput: 0.4, output: 5 }],
+    ['grok-4.7', { input: 2, cachedInput: 0.5, output: 6 }, { input: 4, cachedInput: 1, output: 12 }],
+  ]) {
+    for (const [inputTokens, contextBand, rates] of [
+      [199_999, 'short', shortRates],
+      [200_000, 'long', longRates],
+      [200_001, 'long', longRates],
+    ]) {
+      const estimate = pricing.estimateUsageCost(
+        model,
+        { input_tokens: inputTokens, cache_read_tokens: 1_000, output_tokens: 10_000 },
+        undefined,
+        tier()
+      );
+      assert.equal(estimate.status, 'priced');
+      assert.equal(estimate.contextBand, contextBand);
+      assert.deepEqual(estimate.rates, rates);
+    }
+
+    const fast = pricing.estimateUsageCost(
+      model,
+      { input_tokens: 1_000 },
+      undefined,
+      tier('fast', 'request')
+    );
+    assert.equal(fast.status, 'unsupported');
+    assert.equal(fast.amount, null);
+    assert.equal(fast.rates, null);
+  }
+});
+
+test('Grok 4.7 Fast changes rates strictly above 200K prompt tokens without implying API Priority', () => {
+  const shortRates = { input: 4, cachedInput: 1, output: 12 };
+  const longRates = { input: 6, cachedInput: 1.5, output: 18 };
+  for (const [inputTokens, contextBand, rates] of [
+    [199_999, 'short', shortRates],
+    [200_000, 'short', shortRates],
+    [200_001, 'long', longRates],
+  ]) {
+    const estimate = pricing.estimateUsageCost(
+      'grok-4.7-fast',
+      { input_tokens: inputTokens, cache_read_tokens: 1_000, output_tokens: 10_000 },
+      undefined,
+      tier()
+    );
+    assert.equal(estimate.status, 'priced');
+    assert.equal(estimate.contextBand, contextBand);
+    assert.deepEqual(estimate.rates, rates);
+  }
+  const priority = pricing.estimateUsageCost(
+    'grok-4.7-fast', { input_tokens: 1_000 }, undefined, tier('fast', 'request')
+  );
+  assert.equal(priority.status, 'unsupported');
+  assert.equal(priority.amount, null);
+  assert.equal(pricing.findCatalogEntry('grok-4.7-fast-latest'), null);
+});
+
+test('Fast long context is estimated by default and only restricted under the official policy', () => {
+  const allowed = pricing.estimateUsageCost(
+    'gpt-5.5',
+    { input_tokens: 272_001 },
+    undefined,
+    tier('fast', 'request')
+  );
+  assert.equal(allowed.status, 'priced');
+  assert.equal(allowed.contextBand, 'long');
+  assert.deepEqual(allowed.rates, { input: 25, cachedInput: 2.5, output: 112.5 });
+  assert.deepEqual(allowed.warnings, ['requestedEstimate']);
+
+  const official = pricing.createDefaultPriceProfileV3();
+  official.assumptions.fastLongContext = 'official';
+  const unsupported = pricing.estimateUsageCost(
+    'gpt-5.5',
+    { input_tokens: 272_001 },
+    official,
+    tier('fast', 'request')
+  );
+  assert.equal(unsupported.status, 'unsupported');
+  assert.equal(unsupported.amount, null);
+  assert.deepEqual(unsupported.warnings, ['requestedEstimate']);
+
+  const assumed = pricing.estimateUsageCost(
+    'gpt-5.4-mini',
+    { input_tokens: 1 },
+    undefined,
+    tier('std', 'assumed')
+  );
+  assert.deepEqual(assumed.warnings, ['assumedStandard']);
+});
+
+test('the Fast long-context policy also governs explicit custom Fast cards', () => {
+  const profile = pricing.createDefaultPriceProfileV3();
+  profile.overrides['tenant/gpt-5.5'] = {
+    standard: {
+      short: { input: 5, cachedInput: 0.5, output: 30 },
+      long: {
+        thresholdTokens: 272_000,
+        basis: 'inputTokens',
+        appliesTo: 'entireRequest',
+        rates: { input: 10, cachedInput: 1, output: 45 },
+      },
+    },
+    fast: { multiplier: 2, longSupported: false },
+  };
+  const allowedByDefault = pricing.estimateUsageCost(
+    'tenant/gpt-5.5',
+    { input_tokens: 272_000 },
+    profile,
+    tier('fast', 'request')
+  );
+  assert.equal(allowedByDefault.status, 'priced');
+  assert.equal(allowedByDefault.contextBand, 'long');
+  assert.deepEqual(allowedByDefault.rates, { input: 20, cachedInput: 2, output: 90 });
+
+  profile.assumptions.fastLongContext = 'official';
+  const restricted = pricing.estimateUsageCost(
+    'tenant/gpt-5.5',
+    { input_tokens: 272_000 },
+    profile,
+    tier('fast', 'request')
+  );
+  assert.equal(restricted.status, 'unsupported');
+  assert.equal(restricted.amount, null);
+});
+
+test('cost uses the normalized cache split and honors Auto versus explicit free cache write', () => {
+  const usage = {
+    input_tokens: 200_000,
+    output_tokens: 100_000,
+    cache_read_tokens: 30_000,
+    cache_creation_tokens: 40_000,
+  };
+  const preset = pricing.estimateUsageCost('gpt-5.6-sol', usage, undefined, tier());
+  assert.deepEqual(preset.tokenSplit, {
+    inputTokens: 200_000,
+    outputTokens: 100_000,
+    cacheReadTokens: 30_000,
+    cacheWriteTokens: 40_000,
+    promptTokens: 130_000,
+  });
+  approx(preset.amount, 2.732);
+
+  const auto = pricing.migrateModelPricesV2ToV3({
+    local: { prompt: 10, completion: 20, cache: 1 },
+  }).profile;
+  const free = pricing.migrateModelPricesV2ToV3({
+    local: { prompt: 10, completion: 20, cache: 1, cacheWrite: 0 },
+  }).profile;
+  approx(pricing.estimateUsageCost('local', usage, auto, tier()).amount, 3.73);
+  approx(pricing.estimateUsageCost('local', usage, free, tier()).amount, 3.33);
+});
+
+test('strict import preflight rejects damaged data, alias collisions, and invalid targets; roundtrip stays valid', () => {
+  const valid = {
+    ...pricing.createDefaultPriceProfileV3(),
+    aliases: { tenant: 'gpt-5.6-sol' },
+    overrides: { local: { standard: { short: { input: 1, cachedInput: 0, output: 2 } } } },
+  };
+  const serialized = pricing.serializePriceProfileV3(valid);
+  assert.equal(pricing.importPriceProfileV3(serialized).valid, true);
+  assert.equal(pricing.preflightPriceProfileImportV3({ ...valid, currency: 'EUR' }).valid, false);
+  assert.equal(
+    pricing.preflightPriceProfileImportV3({ ...valid, aliases: { LOOP: 'loop' } }).valid,
+    false
+  );
+  assert.equal(
+    pricing.preflightPriceProfileImportV3({
+      ...valid,
+      aliases: { Tenant: 'gpt-5.6-sol', tenant: 'gpt-5.6-terra' },
+    }).valid,
+    false
+  );
+  assert.equal(
+    pricing.preflightPriceProfileImportV3({ ...valid, aliases: { local: 'gpt-5.6-sol' } }).valid,
+    false
+  );
+  assert.equal(
+    pricing.preflightPriceProfileImportV3({ ...valid, aliases: { unknown: 'not-a-model' } }).valid,
+    false
+  );
+  assert.equal(
+    pricing.preflightPriceProfileImportV3({
+      ...valid,
+      overrides: { bad: { standard: { short: { input: -1, cachedInput: 0, output: 1 } } } },
+    }).valid,
+    false
+  );
+  assert.equal(
+    pricing.preflightPriceProfileImportV3({
+      ...valid,
+      overrides: {
+        bad: {
+          standard: { short: { input: 1, cachedInput: 0, output: 1 } },
+          fast: { multiplier: 0, longSupported: true },
+        },
+      },
+    }).valid,
+    false
+  );
+});
+
+test('coverage reports request, token, model, amount, and assumed-tier completeness without turning gaps into zero', () => {
+  const priced = pricing.estimateUsageCost(
+    'gpt-5.4-mini',
+    { input_tokens: 1_000_000 },
+    undefined,
+    tier()
+  );
+  const unmatched = pricing.estimateUsageCost(
+    'unknown',
+    { input_tokens: 20 },
+    undefined,
+    tier('std', 'assumed')
+  );
+  const official = pricing.createDefaultPriceProfileV3();
+  official.assumptions.fastLongContext = 'official';
+  const unsupported = pricing.estimateUsageCost(
+    'gpt-5.5',
+    { input_tokens: 272_001 },
+    official,
+    tier('fast')
+  );
+  assert.deepEqual(
+    pricing.aggregateCostEstimateCoverage([
+      { modelName: 'gpt-5.4-mini', tokenCount: 1_000_000, estimate: priced },
+      { modelName: 'unknown', tokenCount: 20, estimate: unmatched },
+      { modelName: 'gpt-5.5', tokenCount: 272_001, estimate: unsupported },
+    ]),
+    {
+      totalRequests: 3,
+      pricedRequests: 1,
+      unmatchedRequests: 1,
+      unsupportedRequests: 1,
+      totalTokens: 1_272_021,
+      pricedTokens: 1_000_000,
+      totalModels: 3,
+      pricedModels: 1,
+      estimatedAmount: 0.75,
+      assumedTierRequests: 0,
+      pricedRequestRatio: 1 / 3,
+      pricedTokenRatio: 1_000_000 / 1_272_021,
+      pricedModelRatio: 1 / 3,
+    }
+  );
+});
+
+test('a model is covered only when every request for that model is priced', () => {
+  const priced = pricing.estimateUsageCost('gpt-5.4', { input_tokens: 1_000 }, undefined, tier());
+  const official = pricing.createDefaultPriceProfileV3();
+  official.assumptions.fastLongContext = 'official';
+  const unsupported = pricing.estimateUsageCost(
+    'gpt-5.4',
+    { input_tokens: 272_001 },
+    official,
+    tier('fast')
+  );
+  const coverage = pricing.aggregateCostEstimateCoverage([
+    { modelName: 'gpt-5.4', tokenCount: 1_000, estimate: priced },
+    { modelName: 'gpt-5.4', tokenCount: 272_001, estimate: unsupported },
+  ]);
+  assert.equal(coverage.totalModels, 1);
+  assert.equal(coverage.pricedModels, 0);
+  assert.equal(coverage.pricedModelRatio, 0);
+  assert.equal(coverage.pricedRequests, 1);
+  assert.equal(coverage.unsupportedRequests, 1);
+});
+
+test('local estimate completeness remains false when aggregate totals exceed priced details', () => {
+  const complete = pricing.aggregateCostEstimateCoverage([
+    {
+      modelName: 'gpt-5.4-mini',
+      tokenCount: 1_000_000,
+      estimate: pricing.estimateUsageCost(
+        'gpt-5.4-mini',
+        { input_tokens: 1_000_000 },
+        undefined,
+        tier()
+      ),
+    },
+  ]);
+  const gap = { ...complete, totalTokens: 2_000_000, pricedModels: 0, pricedModelRatio: 0 };
+  assert.equal(pricing.isLocalEstimateComplete(gap), false);
+  assert.equal(pricing.hasPricingAnomaly(gap), true);
+});
+
+test('Fast policy display distinguishes official and custom multipliers from explicit rates', () => {
+  const defaults = pricing.createDefaultPriceProfileV3();
+  assert.deepEqual(
+    pricing.getApiFastPolicyDisplay(pricing.resolvePriceProfile('gpt-5.5', defaults)),
+    { kind: 'official-multiplier', multiplier: 2.5 }
+  );
+  assert.deepEqual(
+    pricing.getApiFastPolicyDisplay(pricing.resolvePriceProfile('gpt-5.6-sol', defaults)),
+    { kind: 'explicit-rates', multiplier: null }
+  );
+
+  const customMultiplier = {
+    ...defaults,
+    overrides: {
+      local: {
+        standard: { short: { input: 2, cachedInput: 0.2, output: 4 } },
+        fast: { multiplier: 3, longSupported: true },
+      },
+    },
+  };
+  assert.deepEqual(
+    pricing.getApiFastPolicyDisplay(pricing.resolvePriceProfile('local', customMultiplier)),
+    { kind: 'custom-multiplier', multiplier: 3 }
+  );
+
+  const explicitRates = {
+    ...defaults,
+    overrides: {
+      local: {
+        standard: { short: { input: 2, cachedInput: 0.2, output: 4 } },
+        fast: {
+          short: { input: 6, cachedInput: 0.4, output: 10 },
+          longSupported: true,
+        },
+      },
+    },
+  };
+  assert.deepEqual(
+    pricing.getApiFastPolicyDisplay(pricing.resolvePriceProfile('local', explicitRates)),
+    { kind: 'explicit-rates', multiplier: null }
+  );
+});
+
+
+test('Astra pricing is exact and keeps other provider verification dates unchanged', () => {
+  const astra = pricing.findCatalogEntry('gpt-6-astra');
+  assert.equal(astra.asOf, '2026-10-03');
+  assert.deepEqual(astra.standard.short, { input: 10, cachedInput: 1, cacheWrite: 12.5, output: 50 });
+  assert.deepEqual(astra.standard.long.rates, { input: 20, cachedInput: 2, cacheWrite: 25, output: 75 });
+  assert.equal(astra.standard.long.thresholdTokens, 272_001);
+  assert.equal(astra.fast.longSupported, true);
+  assert.equal(pricing.findCatalogEntry('gpt-6-astra-preview'), null);
+  assert.equal(pricing.findCatalogEntry('tenant/gpt-6-astra'), null);
+  assert.equal(pricing.findCatalogEntry('gpt-6–astra'), null);
+  assert.equal(pricing.findCatalogEntry('gpt-5.6-sol').asOf, '2026-10-03');
+});
+
+test('Astra long pricing starts above 272K and uses total input including cache', () => {
+  for (const [input, band, rate] of [
+    [271_999, 'short', 10], [272_000, 'short', 10], [272_001, 'long', 20],
+  ]) {
+    const cost = pricing.estimateUsageCost('gpt-6-astra', {
+      input_tokens: input, cache_read_tokens: 200_000, output_tokens: 100,
+    }, undefined, tier());
+    assert.equal(cost.status, 'priced');
+    assert.equal(cost.contextBand, band);
+    assert.equal(cost.rates.input, rate);
+    approx(cost.amount, ((input - 200_000) * rate + 200_000 * cost.rates.cachedInput + 100 * cost.rates.output) / 1_000_000);
+  }
+});
+
+test('Astra Fast applies to every category in both context bands', () => {
+  for (const input of [200_000, 300_000]) {
+    const tokens = {
+      input_tokens: input, cache_read_tokens: 30_000,
+      cache_creation_tokens: 40_000, output_tokens: 100_000,
+    };
+    const standard = pricing.estimateUsageCost('gpt-6-astra', tokens, undefined, tier());
+    const fast = pricing.estimateUsageCost('gpt-6-astra', tokens, undefined, tier('fast'));
+    assert.equal(fast.status, 'priced');
+    approx(fast.amount, standard.amount * 2);
+    for (const category of ['input', 'cachedInput', 'cacheWrite', 'output']) {
+      assert.equal(fast.rates[category], standard.rates[category] * 2);
+    }
+  }
+});
+
+test('Astra preset never replaces explicit user pricing', () => {
+  const profile = pricing.createDefaultPriceProfileV3();
+  profile.overrides['gpt-6-astra'] = {
+    standard: { short: { input: 0, cachedInput: 0, cacheWrite: 0, output: 0 } },
+  };
+  const before = JSON.stringify(profile);
+  const cost = pricing.estimateUsageCost('gpt-6-astra', {
+    input_tokens: 1_000_000, output_tokens: 100_000,
+  }, profile, tier());
+  assert.equal(cost.modelMatch, 'custom');
+  assert.equal(cost.amount, 0);
+  assert.equal(JSON.stringify(profile), before);
+});
+
+test('GPT-6 Sol and Luna preset cards match the official rate card exactly', () => {
+  const sol = pricing.findCatalogEntry('gpt-6-sol');
+  assert.deepEqual(sol.standard.short, { input: 2, cachedInput: 0.2, cacheWrite: 2.5, output: 10 });
+  assert.deepEqual(sol.standard.long.rates, { input: 4, cachedInput: 0.4, cacheWrite: 5, output: 15 });
+  assert.equal(sol.standard.long.thresholdTokens, 272_001);
+  assert.deepEqual(sol.fast.short, { input: sol.standard.short.input * 2, cachedInput: sol.standard.short.cachedInput * 2, cacheWrite: sol.standard.short.cacheWrite * 2, output: sol.standard.short.output * 2 });
+  assert.equal(sol.fast.longSupported, true);
+  const luna = pricing.findCatalogEntry('gpt-6-luna');
+  assert.deepEqual(luna.standard.short, { input: 0.1, cachedInput: 0.01, cacheWrite: 0.125, output: 0.5 });
+  assert.deepEqual(luna.standard.long.rates, { input: 0.2, cachedInput: 0.02, cacheWrite: 0.25, output: 0.75 });
+  assert.equal(luna.standard.long.thresholdTokens, 272_001);
+  assert.deepEqual(luna.fast.short, { input: 0.2, cachedInput: 0.02, cacheWrite: 0.25, output: 1 });
+  assert.equal(luna.fast.longSupported, true);
+});
+
+test('GPT-6 Sol and Luna long pricing starts above 272K and Fast doubles both bands', () => {
+  for (const [model, shortRate, longRate] of [
+    ['gpt-6-sol', 2, 4],
+    ['gpt-6-luna', 0.1, 0.2],
+  ]) {
+    for (const [input, band, rate] of [
+      [271_999, 'short', shortRate], [272_000, 'short', shortRate], [272_001, 'long', longRate],
+    ]) {
+      const cost = pricing.estimateUsageCost(
+        model,
+        { input_tokens: input, output_tokens: 1 },
+        undefined,
+        tier()
+      );
+      assert.equal(cost.status, 'priced');
+      assert.equal(cost.contextBand, band);
+      assert.equal(cost.rates.input, rate);
+    }
+    for (const input of [200_000, 300_000]) {
+      const tokens = { input_tokens: input, output_tokens: 100_000 };
+      const standard = pricing.estimateUsageCost(model, tokens, undefined, tier());
+      const fast = pricing.estimateUsageCost(model, tokens, undefined, tier('fast'));
+      assert.equal(fast.status, 'priced');
+      approx(fast.amount, standard.amount * 2);
+    }
+  }
+});
+
+
+test('GPT-6.1 Sol matches the October Standard and Fast tables without changing GPT-6 Sol', () => {
+  const card = pricing.findCatalogEntry('gpt-6.1-sol');
+  assert.equal(card.asOf, '2026-10-03');
+  assert.deepEqual(card.aliases, []);
+  assert.deepEqual(card.standard.short, { input: 2, cachedInput: 0.1, cacheWrite: 2.5, output: 10 });
+  assert.deepEqual(card.standard.long.rates, { input: 4, cachedInput: 0.2, cacheWrite: 5, output: 15 });
+  assert.equal(card.standard.long.thresholdTokens, 272_001);
+  assert.deepEqual(card.fast, {
+    short: { input: 4, cachedInput: 0.2, cacheWrite: 5, output: 20 },
+    long: { input: 8, cachedInput: 0.4, cacheWrite: 10, output: 30 },
+    longSupported: true,
+  });
+  assert.equal(card.fast.multiplier, undefined);
+  assert.equal(pricing.findCatalogEntry('gpt-6-sol').standard.short.cachedInput, 0.2);
+  assert.equal(pricing.findCatalogEntry('gpt-6.1-sol-preview'), null);
+  assert.equal(pricing.findCatalogEntry('tenant/gpt-6.1-sol'), null);
+  for (const [input, band, rates] of [
+    [272_000, 'short', card.fast.short], [272_001, 'long', card.fast.long],
+  ]) {
+    const estimate = pricing.estimateUsageCost('gpt-6.1-sol', {
+      input_tokens: input, cache_read_tokens: 30_000,
+      cache_creation_tokens: 40_000, output_tokens: 100_000,
+    }, undefined, tier('fast'));
+    assert.equal(estimate.status, 'priced');
+    assert.equal(estimate.contextBand, band);
+    assert.deepEqual(estimate.rates, rates);
+    approx(estimate.amount, ((input - 70_000) * rates.input + 30_000 * rates.cachedInput +
+      40_000 * rates.cacheWrite + 100_000 * rates.output) / 1_000_000);
+  }
+  const custom = pricing.createDefaultPriceProfileV3();
+  custom.overrides['gpt-6.1-sol'] = { standard: { short: { input: 7, cachedInput: 0, output: 3 } } };
+  const before = JSON.stringify(custom);
+  assert.equal(pricing.estimateUsageCost('gpt-6.1-sol', { input_tokens: 100_000 }, custom, tier()).modelMatch, 'custom');
+  assert.equal(JSON.stringify(custom), before);
+});
+
+test('explicit Fast long rates roundtrip and cannot be replaced by a uniform multiplier', () => {
+  const profile = pricing.createDefaultPriceProfileV3();
+  const card = pricing.findCatalogEntry('gpt-6.1-sol');
+  profile.overrides['gpt-6.1-sol'] = {
+    standard: card.standard,
+    fast: {
+      short: { input: 7, cachedInput: 0.03, cacheWrite: 0, output: 13 },
+      long: { input: 11, cachedInput: 0.07, cacheWrite: 17, output: 29 },
+      longSupported: true,
+    },
+  };
+  const imported = pricing.importPriceProfileV3(pricing.serializePriceProfileV3(profile));
+  assert.equal(imported.valid, true);
+  assert.deepEqual(imported.profile.overrides, profile.overrides);
+  for (const [input, band] of [[272_000, 'short'], [272_001, 'long']]) {
+    const estimate = pricing.estimateUsageCost('gpt-6.1-sol', {
+      input_tokens: input, cache_read_tokens: 20_000,
+      cache_creation_tokens: 30_000, output_tokens: 40_000,
+    }, imported.profile, tier('fast'));
+    const rates = profile.overrides['gpt-6.1-sol'].fast[band];
+    assert.deepEqual(estimate.rates, rates);
+    approx(estimate.amount, ((input - 50_000) * rates.input + 20_000 * rates.cachedInput +
+      30_000 * rates.cacheWrite + 40_000 * rates.output) / 1_000_000);
+  }
+  imported.profile.assumptions.gptLongContext = 'shortOnly';
+  const shortOnly = pricing.estimateUsageCost('gpt-6.1-sol', { input_tokens: 300_000 }, imported.profile, tier('fast'));
+  assert.equal(shortOnly.contextBand, 'short');
+  assert.deepEqual(shortOnly.rates, profile.overrides['gpt-6.1-sol'].fast.short);
+  profile.overrides['gpt-6.1-sol'].fast.longSupported = false;
+  profile.assumptions.fastLongContext = 'official';
+  assert.equal(pricing.estimateUsageCost('gpt-6.1-sol', { input_tokens: 300_000 }, profile, tier('fast')).status, 'unsupported');
+  profile.assumptions.fastLongContext = 'allow';
+  assert.deepEqual(pricing.estimateUsageCost('gpt-6.1-sol', { input_tokens: 300_000 }, profile, tier('fast')).rates,
+    profile.overrides['gpt-6.1-sol'].fast.long);
+  delete profile.overrides['gpt-6.1-sol'].fast.long;
+  const legacy = pricing.importPriceProfileV3(pricing.serializePriceProfileV3(profile));
+  assert.equal(legacy.valid, true);
+  assert.deepEqual(pricing.estimateUsageCost('gpt-6.1-sol', { input_tokens: 300_000 }, legacy.profile, tier('fast')).rates,
+    profile.overrides['gpt-6.1-sol'].fast.short);
+});
+
+test('Fast import rejects invalid or ambiguous long cards instead of silently dropping them', () => {
+  const profile = pricing.createDefaultPriceProfileV3();
+  const card = pricing.findCatalogEntry('gpt-6.1-sol');
+  for (const fast of [
+    { ...card.fast, long: { ...card.fast.long, input: -1 } },
+    { ...card.fast, long: null },
+    { ...card.fast, long: { input: 1, cachedInput: 1 } },
+    { multiplier: 2, long: card.fast.long, longSupported: true },
+    { ...card.fast, multiplier: 2 },
+  ]) {
+    profile.overrides.local = { standard: card.standard, fast };
+    assert.equal(pricing.preflightPriceProfileImportV3(profile).valid, false);
+  }
+  profile.overrides.local = { standard: { short: card.standard.short }, fast: card.fast };
+  assert.equal(pricing.preflightPriceProfileImportV3(profile).valid, false);
+});
+
+test('November 2026 catalog additions price the previously unmatched models', () => {
+  const glm = pricing.findCatalogEntry('glm-5.3-flashx');
+  assert.deepEqual(glm.aliases, ['glm-5.3-flashx-legal']);
+  assert.deepEqual(glm.standard.short, { input: 0.37, cachedInput: 0.075, output: 1.25 });
+  assert.equal(glm.standard.long, undefined);
+  assert.equal(glm.fast, undefined);
+  assert.equal(glm.asOf, '2026-11-07');
+  assert.equal(glm.sourceUrl, 'https://docs.z.ai/guides/overview/pricing');
+  const flashx = pricing.estimateUsageCost('glm-5.3-flashx', {
+    input_tokens: 1_000_000, cache_read_tokens: 200_000, output_tokens: 1_000_000,
+  }, undefined, tier());
+  assert.equal(flashx.status, 'priced');
+  assert.equal(flashx.rates.cacheWrite, undefined);
+  approx(flashx.amount, 0.37 * 0.8 + 0.075 * 0.2 + 1.25);
+  assert.equal(pricing.findCatalogEntry('glm-5.3-flashx-legal').canonicalModel, 'glm-5.3-flashx');
+
+  for (const [model, short, long] of [
+    ['gpt-6.1-terra', [1, 0.05, 1.25, 5], [2, 0.1, 2.5, 7.5]],
+    ['gpt-daybreak-blue-latest', [4, 0.4, 5, 20], [8, 0.8, 10, 30]],
+  ]) {
+    for (const [input, band, rates] of [[200_000, 'short', short], [300_000, 'long', long]]) {
+      const estimate = pricing.estimateUsageCost(model, {
+        input_tokens: input, cache_read_tokens: 30_000,
+        cache_creation_tokens: 40_000, output_tokens: 100_000,
+      }, undefined, tier('fast'));
+      assert.equal(estimate.status, 'priced', model);
+      assert.equal(estimate.contextBand, band);
+      assert.deepEqual(estimate.rates, {
+        input: rates[0] * 2, cachedInput: rates[1] * 2,
+        cacheWrite: rates[2] * 2, output: rates[3] * 2,
+      });
+    }
+  }
+  assert.deepEqual(
+    pricing.findCatalogEntry('gpt-daybreak-blue-latest').standard,
+    pricing.findCatalogEntry('gpt-5.6-sol').standard
+  );
+
+  const gemini = pricing.findCatalogEntry('gemini-4-argon');
+  assert.deepEqual(gemini.standard.short, { input: 2, cachedInput: 0.1, output: 10 });
+  assert.equal(gemini.standard.long, undefined);
+  assert.equal(gemini.asOf, '2026-11-07');
+  assert.equal(gemini.sourceUrl, 'https://aistudio.google.com/docs/pricing');
+  const argon = pricing.estimateUsageCost('gemini-4-argon', {
+    input_tokens: 300_000, cache_read_tokens: 50_000, output_tokens: 100_000,
+  }, undefined, tier());
+  assert.equal(argon.contextBand, 'short');
+  approx(argon.amount, 250_000 * 2 / 1_000_000 + 50_000 * 0.1 / 1_000_000 + 100_000 * 10 / 1_000_000);
+
+  const buildFast = pricing.findCatalogEntry('grok-4.7-build-fast');
+  assert.equal(buildFast.canonicalModel, 'grok-4.7-fast');
+  assert.equal(buildFast.modelMatch ?? 'alias', 'alias');
+  const alias = pricing.estimateUsageCost('grok-4.7-build-fast', {
+    input_tokens: 100_000, output_tokens: 50_000,
+  }, undefined, tier());
+  assert.equal(alias.status, 'priced');
+  assert.equal(alias.modelMatch, 'alias');
+  assert.equal(alias.resolvedModel, 'grok-4.7-fast');
+  assert.deepEqual(alias.rates, { input: 4, cachedInput: 1, output: 12 });
+  const longAlias = pricing.estimateUsageCost('grok-4.7-build-fast', {
+    input_tokens: 200_000, output_tokens: 10_000,
+  }, undefined, tier());
+  assert.equal(longAlias.contextBand, 'short');
+  const above = pricing.estimateUsageCost('grok-4.7-build-fast', {
+    input_tokens: 200_001, output_tokens: 10_000,
+  }, undefined, tier());
+  assert.equal(above.contextBand, 'long');
+  assert.deepEqual(above.rates, { input: 6, cachedInput: 1.5, output: 18 });
+});

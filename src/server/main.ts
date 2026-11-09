@@ -7,6 +7,7 @@ import { AppModule } from './app.module';
 import { logger } from '../shared/logging/logger';
 import { AccountLeaseService } from '../modules/proxy-gateway/server/account-lease.service';
 import { ConnectIngressService } from '../modules/proxy-gateway/server/connect-ingress.service';
+import { configureRequestHistory } from '../observability/request-history';
 import { installDashboardHooks } from '../dashboard/request-journal';
 import { installProjectContextHook } from '../modules/proxy-gateway/server/request-project-context';
 import { openCompatibilityListeners, closeCompatibilityListeners } from './compatibility-listeners';
@@ -150,6 +151,7 @@ export async function bootstrapNestServer(config: ProxyConfig): Promise<NestServ
     const admission = releaseAdmission();
     const fastify = app.getHttpAdapter().getInstance() as unknown as FastifyInstance;
     installProjectContextHook(fastify);
+    configureRequestHistory();
     installDashboardHooks(fastify);
     installReleaseHooks(fastify, admission);
     await app.listen(port, host);

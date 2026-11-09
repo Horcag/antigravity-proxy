@@ -320,10 +320,30 @@ administration and `/dashboard`. Set `proxy.compatibility_ports` to `[8045]` for
 existing `/v1/` and `/v1beta/` application APIs on loopback. They retain the same authentication
 and streaming behavior, but reject administration, dashboard, upgrades and CONNECT.
 
-The dashboard uses the separate admin key, held in browser memory until logout/reload.
-It shows account/quota availability, project activity and the latest 500 request outcomes
-from the current service run. It does not store prompts, responses or credentials.
-HTTP and native gRPC failures are counted separately from successful HTTP 200 transport.
+The management console adapts the MIT-licensed CPA Panel LTS frontend, pinned in
+`web/UPSTREAM.json`; the original license is retained and shipped with the built panel.
+It has separate overview, accounts, models, projects, requests, statistics and settings pages.
+The browser signs in with the existing `AG_PROXY_ADMIN_API_KEY`; remembering the session
+uses an HttpOnly, SameSite cookie for up to seven days. The management key is not kept in
+browser storage. Cookie-authenticated mutations require a same-origin CSRF token.
+
+Accounts support Google OAuth (automatic local callback with an explicit manual fallback),
+JSON import, reviewed enable/disable, removal and manual quota refresh. Project keys can
+be created, disabled and rotated without changing existing application addresses. The panel
+edits only supported scheduling, timeout and model-alias settings; arbitrary environment or
+provider-proxy editing is unavailable.
+
+Request metadata is retained locally in `request-history.db` for seven days, capped at
+100,000 requests. Per-account statistics distinguish upstream attempts from final request
+outcomes, including failed attempts before a successful account failover. Prompts, response
+bodies and credentials are never recorded. Token/cache/TTFT fields are unknown when the
+upstream protocol did not provide trustworthy measurements; unknown does not mean zero.
+Old in-memory request history cannot be reconstructed after the upgrade.
+
+`npm ci` installs the pinned frontend dependencies when the `web/` source is present.
+`npm run build` builds both server and the self-contained frontend and copies the HTML and
+license into `dist/dashboard`. Production releases need only the built files; no frontend
+server, external CDN or third-party control plane runs alongside the proxy.
 
 The offline `migration import-easycli --stdin` command accepts a validated version-1 JSON
 payload with `projects`, raw Antigravity `accounts`, and `model_mapping`. Every account

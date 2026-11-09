@@ -1,3 +1,4 @@
+import { observeAccountOutcome } from '../../../observability/request-context';
 const FAILURE_EWMA_ALPHA = 0.2;
 const TTFT_MAX_MS = 30_000;
 const COOLDOWN_MAX_MS = 300_000;
@@ -52,6 +53,7 @@ export class AccountPerformancePolicy {
   }
 
   recordSuccess(accountId: string, effectiveModel: string, ttftMs?: number): void {
+    observeAccountOutcome(accountId, effectiveModel, 'success', ttftMs);
     const now = this.now();
     const key = this.key(accountId, effectiveModel);
     this.prune(now);
@@ -67,6 +69,7 @@ export class AccountPerformancePolicy {
   }
 
   recordFailure(accountId: string, effectiveModel: string): void {
+    observeAccountOutcome(accountId, effectiveModel, 'failure');
     const now = this.now();
     const key = this.key(accountId, effectiveModel);
     this.prune(now);

@@ -1,0 +1,748 @@
+import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { authFilesApi, type AuthFileFieldsPatch } from '@/services/api';
+import type { AuthFileItem, AuthFileModelPolicy } from '@/types';
+import { useNotificationStore } from '@/stores';
+import {
+  applyAuthFileWebsockets,
+  applyAuthFileUsingApi,
+  normalizeProviderKey,
+  parsePriorityValue,
+  readAuthFileWebsockets,
+  readAuthFileUsingApi,
+  supportsAuthFileWebsockets,
+  supportsAuthFileUsingApi,
+} from '@/features/authFiles/constants';
+import {
+  parseCredentialWeightText,
+  readCredentialWeight,
+  validateCredentialWeightText,
+  type CredentialWeightError,
+} from '@/utils/credentialWeight';
+
+type AuthFileHeaders = Record<string, string>;
+type AuthFileHeadersErrorKey =
+  | 'auth_files.headers_invalid_json'
+  | 'auth_files.headers_invalid_object'
+  | 'auth_files.headers_invalid_value';
+type AuthFileContentErrorKey =
+  | 'auth_files.prefix_proxy_invalid_json'
+  | 'auth_files.prefix_proxy_html_challenge';
+type AuthFileWeightErrorKey = 'auth_files.weight_invalid_integer' | 'auth_files.weight_invalid_max';
+type AuthFileEditorErrorKey = AuthFileHeadersErrorKey | AuthFileWeightErrorKey;
+
+export type PrefixProxyEditorField =
+  | 'prefix'
+  | 'proxyUrl'
+  | 'priority'
+  | 'weight'
+  | 'websockets'
+  | 'usingApi'
+  | 'note'
+  | 'headersText'
+  | 'modelPolicyAllowText'
+  | 'modelPolicyAllowEnabled'
+  | 'modelPolicyDenyText'
+  | 'modelPolicyDenyEnabled';
+
+export type PrefixProxyEditorFieldValue = string | boolean;
+
+export type PrefixProxyEditorState = {
+  fileName: string;
+  fileInfoText: string;
+  loading: boolean;
+  saving: boolean;
+  error: string | null;
+  originalText: string;
+  rawText: string;
+  invalidContentPreview: string;
+  json: Record<string, unknown> | null;
+  providerKey: string;
+  prefix: string;
+  proxyUrl: string;
+  priority: string;
+  weight: string;
+  weightError: string | null;
+  websockets: boolean;
+  websocketsTouched: boolean;
+  usingApi: boolean;
+  usingApiTouched: boolean;
+  note: string;
+  noteTouched: boolean;
+  headersText: string;
+  headersTouched: boolean;
+  headersError: string | null;
+  modelPolicyAllowText: string;
+  modelPolicyAllowEnabled: boolean;
+  modelPolicyDenyText: string;
+  modelPolicyDenyEnabled: boolean;
+  modelPolicyTouched: boolean;
+};
+
+export type UseAuthFilesPrefixProxyEditorOptions = {
+  disableControls: boolean;
+  loadFiles: () => Promise<void>;
+  onFileMutated?: (name: string) => void;
+};
+
+export type UseAuthFilesPrefixProxyEditorResult = {
+  prefixProxyEditor: PrefixProxyEditorState | null;
+  prefixProxyUpdatedText: string;
+  prefixProxyDirty: boolean;
+  openPrefixProxyEditor: (file: AuthFileItem) => Promise<void>;
+  closePrefixProxyEditor: () => void;
+  handlePrefixProxyChange: (
+    field: PrefixProxyEditorField,
+    value: PrefixProxyEditorFieldValue
+  ) => void;
+  handlePrefixProxySave: () => Promise<void>;
+};
+
+const isRecordObject = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+
+const validateHeadersValue = (value: unknown): AuthFileHeadersErrorKey | null => {
+  if (!isRecordObject(value)) {
+    return 'auth_files.headers_invalid_object';
+  }
+  return Object.values(value).every((item) => typeof item === 'string')
+    ? null
+    : 'auth_files.headers_invalid_value';
+};
+
+const parseHeadersText = (
+  text: string
+): { value: AuthFileHeaders | null; errorKey: AuthFileHeadersErrorKey | null } => {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return { value: null, errorKey: null };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    return { value: null, errorKey: 'auth_files.headers_invalid_json' };
+  }
+
+  const errorKey = validateHeadersValue(parsed);
+  if (errorKey) {
+    return { value: null, errorKey };
+  }
+
+  return { value: parsed as AuthFileHeaders, errorKey: null };
+};
+
+const credentialWeightErrorKey = (error: CredentialWeightError): AuthFileWeightErrorKey =>
+  error === 'max' ? 'auth_files.weight_invalid_max' : 'auth_files.weight_invalid_integer';
+
+const normalizeTextField = (value: unknown): string =>
+  typeof value === 'string' ? value.trim() : '';
+
+const INVALID_CONTENT_PREVIEW_LIMIT = 1000;
+
+const buildInvalidContentPreview = (text: string): string => {
+  const trimmed = text.trim();
+  if (!trimmed) return '';
+  if (trimmed.length <= INVALID_CONTENT_PREVIEW_LIMIT) return trimmed;
+  return `${trimmed.slice(0, INVALID_CONTENT_PREVIEW_LIMIT)}\n...`;
+};
+
+const buildInvalidAuthFileContentState = (
+  text: string,
+  resolveError: (key: AuthFileContentErrorKey) => string
+): Pick<
+  PrefixProxyEditorState,
+  'loading' | 'error' | 'rawText' | 'originalText' | 'invalidContentPreview'
+> => ({
+  loading: false,
+  error: resolveError(getAuthFileContentErrorKey(text)),
+  rawText: text,
+  originalText: text,
+  invalidContentPreview: buildInvalidContentPreview(text),
+});
+
+const getAuthFileContentErrorKey = (text: string): AuthFileContentErrorKey => {
+  const head = text.trimStart().slice(0, 4096).toLowerCase();
+  const looksLikeHtml =
+    head.startsWith('<!doctype html') ||
+    head.startsWith('<html') ||
+    head.includes('<head') ||
+    head.includes('<body');
+  const looksLikeChallenge =
+    head.includes('cf_chl') ||
+    head.includes('__cf_chl_tk') ||
+    head.includes('challenge-platform') ||
+    head.includes('cloudflare');
+
+  return looksLikeHtml || looksLikeChallenge
+    ? 'auth_files.prefix_proxy_html_challenge'
+    : 'auth_files.prefix_proxy_invalid_json';
+};
+
+const hasKeys = (value: Record<string, unknown> | AuthFileFieldsPatch | null): boolean =>
+  Boolean(value && Object.keys(value).length > 0);
+
+// 账号 model_policy 读取：保持 Core 契约 {allowlist:{enabled,models},denylist:{...}}
+const parsePolicyModelsText = (text: string): string[] => {
+  const seen = new Set<string>();
+  const models: string[] = [];
+  text
+    .split(/[\n,]+/)
+    .map((entry) => entry.trim().toLowerCase())
+    .forEach((entry) => {
+      if (!entry || seen.has(entry)) return;
+      seen.add(entry);
+      models.push(entry);
+    });
+  return models;
+};
+
+const readModelPolicyList = (value: unknown): { enabled: boolean; models: string[] } | null => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const list = value as Record<string, unknown>;
+  if (list.enabled !== undefined && typeof list.enabled !== 'boolean') return null;
+  const models = Array.isArray(list.models)
+    ? list.models.map((item) => String(item ?? '').trim()).filter(Boolean)
+    : [];
+  return { enabled: list.enabled === true, models };
+};
+
+const buildModelPolicyPatch = (
+  editor: PrefixProxyEditorState
+): AuthFileModelPolicy | null | undefined => {
+  if (!editor.modelPolicyTouched) return undefined;
+  const original = editor.json ? editor.json.model_policy : undefined;
+  const originalPolicy =
+    original && typeof original === 'object' && !Array.isArray(original)
+      ? (original as Record<string, unknown>)
+      : null;
+  const originalAllow = readModelPolicyList(originalPolicy?.allowlist);
+  const originalDeny = readModelPolicyList(originalPolicy?.denylist);
+
+  const allowModels = parsePolicyModelsText(editor.modelPolicyAllowText);
+  const denyModels = parsePolicyModelsText(editor.modelPolicyDenyText);
+  const allowChanged =
+    editor.modelPolicyAllowEnabled !== (originalAllow?.enabled ?? false) ||
+    allowModels.join('\n') !== (originalAllow?.models ?? []).join('\n');
+  const denyChanged =
+    editor.modelPolicyDenyEnabled !== (originalDeny?.enabled ?? false) ||
+    denyModels.join('\n') !== (originalDeny?.models ?? []).join('\n');
+  if (!allowChanged && !denyChanged) return undefined;
+
+  const hasAny =
+    editor.modelPolicyAllowEnabled ||
+    allowModels.length > 0 ||
+    editor.modelPolicyDenyEnabled ||
+    denyModels.length > 0;
+  if (!hasAny) return null;
+
+  const next: AuthFileModelPolicy = {};
+  if (editor.modelPolicyAllowEnabled || allowModels.length > 0) {
+    next.allowlist = { enabled: editor.modelPolicyAllowEnabled, models: allowModels };
+  }
+  if (editor.modelPolicyDenyEnabled || denyModels.length > 0) {
+    next.denylist = { enabled: editor.modelPolicyDenyEnabled, models: denyModels };
+  }
+  return next;
+};
+
+const normalizeHeaders = (value: unknown): AuthFileHeaders => {
+  if (!isRecordObject(value)) return {};
+
+  return Object.entries(value).reduce<AuthFileHeaders>((result, [key, rawValue]) => {
+    if (typeof rawValue !== 'string') return result;
+    const name = key.trim();
+    const headerValue = rawValue.trim();
+    if (!name || !headerValue) return result;
+    result[name] = headerValue;
+    return result;
+  }, {});
+};
+
+const buildHeadersPatch = (
+  originalHeaders: AuthFileHeaders,
+  nextHeaders: AuthFileHeaders
+): AuthFileHeaders | undefined => {
+  const patch: AuthFileHeaders = {};
+  const nextNames = new Set(Object.keys(nextHeaders));
+
+  Object.entries(nextHeaders).forEach(([name, value]) => {
+    if (originalHeaders[name] !== value) {
+      patch[name] = value;
+    }
+  });
+
+  Object.keys(originalHeaders).forEach((name) => {
+    if (!nextNames.has(name)) {
+      patch[name] = '';
+    }
+  });
+
+  return Object.keys(patch).length > 0 ? patch : undefined;
+};
+
+const applyHeadersPatch = (
+  value: Record<string, unknown>,
+  headersPatch: AuthFileHeaders | undefined
+) => {
+  if (!headersPatch) return;
+
+  const nextHeaders = normalizeHeaders(value.headers);
+  Object.entries(headersPatch).forEach(([name, rawValue]) => {
+    const headerName = name.trim();
+    if (!headerName) return;
+    const headerValue = rawValue.trim();
+    if (!headerValue) {
+      delete nextHeaders[headerName];
+      return;
+    }
+    nextHeaders[headerName] = headerValue;
+  });
+
+  if (Object.keys(nextHeaders).length > 0) {
+    value.headers = nextHeaders;
+  } else {
+    delete value.headers;
+  }
+};
+
+export const buildAuthFileFieldsPatch = (
+  editor: PrefixProxyEditorState,
+  resolveError: (key: AuthFileEditorErrorKey) => string
+): AuthFileFieldsPatch => {
+  const original = editor.json ?? {};
+  const patch: AuthFileFieldsPatch = {};
+
+  const originalPrefix = normalizeTextField(original.prefix);
+  const nextPrefix = editor.prefix.trim();
+  if (nextPrefix !== originalPrefix) {
+    patch.prefix = nextPrefix;
+  }
+
+  const originalProxyURL = normalizeTextField(original.proxy_url);
+  const nextProxyURL = editor.proxyUrl.trim();
+  if (nextProxyURL !== originalProxyURL) {
+    patch.proxy_url = nextProxyURL;
+  }
+
+  const originalPriority = parsePriorityValue(original.priority);
+  const priorityText = editor.priority.trim();
+  const nextPriority = parsePriorityValue(priorityText);
+  if (!priorityText) {
+    if (originalPriority !== undefined && originalPriority !== 0) {
+      patch.priority = 0;
+    }
+  } else if (nextPriority !== undefined) {
+    if (nextPriority === 0) {
+      if (originalPriority !== undefined && originalPriority !== 0) {
+        patch.priority = 0;
+      }
+    } else if (nextPriority !== originalPriority) {
+      patch.priority = nextPriority;
+    }
+  }
+
+  const weightError = validateCredentialWeightText(editor.weight);
+  if (weightError) {
+    throw new Error(resolveError(credentialWeightErrorKey(weightError)));
+  }
+  const originalWeight = readCredentialWeight(original.weight);
+  const nextWeight = parseCredentialWeightText(editor.weight);
+  if (nextWeight === undefined) {
+    if (originalWeight !== undefined) patch.weight = null;
+  } else if (nextWeight !== originalWeight) {
+    patch.weight = nextWeight;
+  }
+
+  if (editor.noteTouched) {
+    const originalNote = normalizeTextField(original.note);
+    const nextNote = editor.note.trim();
+    if (nextNote !== originalNote) {
+      patch.note = nextNote;
+    }
+  }
+
+  if (supportsAuthFileWebsockets(editor.providerKey) && editor.websocketsTouched) {
+    const originalWebsockets = readAuthFileWebsockets(original);
+    const nextWebsockets = Boolean(editor.websockets);
+    if (nextWebsockets !== originalWebsockets) {
+      patch.websockets = nextWebsockets;
+    }
+  }
+
+  if (supportsAuthFileUsingApi(editor.providerKey) && editor.usingApiTouched) {
+    const originalUsingApi = readAuthFileUsingApi(original);
+    const nextUsingApi = Boolean(editor.usingApi);
+    if (nextUsingApi !== originalUsingApi) {
+      patch.using_api = nextUsingApi;
+    }
+  }
+
+  if (editor.headersTouched) {
+    const { value: parsedHeaders, errorKey } = parseHeadersText(editor.headersText);
+    if (errorKey) {
+      throw new Error(resolveError(errorKey));
+    }
+    const headersPatch = buildHeadersPatch(
+      normalizeHeaders(original.headers),
+      normalizeHeaders(parsedHeaders ?? {})
+    );
+    if (headersPatch) {
+      patch.headers = headersPatch;
+    }
+  }
+
+  const modelPolicyPatch = buildModelPolicyPatch(editor);
+  if (modelPolicyPatch !== undefined) {
+    patch.model_policy = modelPolicyPatch;
+  }
+
+  return patch;
+};
+
+const buildPrefixProxyUpdatedText = (
+  editor: PrefixProxyEditorState | null,
+  resolveError: (key: AuthFileEditorErrorKey) => string
+): string => {
+  if (!editor?.json) return editor?.rawText ?? '';
+  const patch = buildAuthFileFieldsPatch(editor, resolveError);
+  let next: Record<string, unknown> = { ...editor.json };
+  if (patch.prefix !== undefined) {
+    if (patch.prefix) {
+      next.prefix = patch.prefix;
+    } else {
+      delete next.prefix;
+    }
+  }
+  if (patch.proxy_url !== undefined) {
+    if (patch.proxy_url) {
+      next.proxy_url = patch.proxy_url;
+    } else {
+      delete next.proxy_url;
+    }
+  }
+
+  if (patch.priority !== undefined) {
+    if (patch.priority === 0) {
+      delete next.priority;
+    } else {
+      next.priority = patch.priority;
+    }
+  }
+
+  if (patch.weight !== undefined) {
+    if (patch.weight === null) {
+      delete next.weight;
+    } else {
+      next.weight = patch.weight;
+    }
+  }
+
+  if (patch.note !== undefined) {
+    if (patch.note) {
+      next.note = patch.note;
+    } else if ('note' in next) {
+      delete next.note;
+    }
+  }
+
+  applyHeadersPatch(next, patch.headers);
+
+  if (patch.websockets !== undefined) {
+    next = applyAuthFileWebsockets(next, patch.websockets);
+  }
+
+  if (patch.using_api !== undefined) {
+    next = applyAuthFileUsingApi(next, patch.using_api);
+  }
+
+  if (patch.model_policy !== undefined) {
+    if (patch.model_policy === null) {
+      delete next.model_policy;
+    } else {
+      const policy: Record<string, unknown> = {};
+      if (patch.model_policy.allowlist) {
+        policy.allowlist = patch.model_policy.allowlist;
+      }
+      if (patch.model_policy.denylist) {
+        policy.denylist = patch.model_policy.denylist;
+      }
+      next.model_policy = policy;
+    }
+  }
+
+  return JSON.stringify(next);
+};
+
+export function useAuthFilesPrefixProxyEditor(
+  options: UseAuthFilesPrefixProxyEditorOptions
+): UseAuthFilesPrefixProxyEditorResult {
+  const { disableControls, loadFiles, onFileMutated } = options;
+  const { t } = useTranslation();
+  const showNotification = useNotificationStore((state) => state.showNotification);
+
+  const [prefixProxyEditor, setPrefixProxyEditor] = useState<PrefixProxyEditorState | null>(null);
+
+  const hasBlockingValidationError = Boolean(
+    (prefixProxyEditor?.headersTouched && prefixProxyEditor.headersError) ||
+    prefixProxyEditor?.weightError
+  );
+  const prefixProxyUpdatedText =
+    prefixProxyEditor && !hasBlockingValidationError
+      ? buildPrefixProxyUpdatedText(prefixProxyEditor, (key) => t(key))
+      : '';
+
+  const prefixProxyPatch =
+    prefixProxyEditor?.json && !hasBlockingValidationError
+      ? buildAuthFileFieldsPatch(prefixProxyEditor, (key) => t(key))
+      : null;
+
+  const prefixProxyDirty = hasKeys(prefixProxyPatch);
+
+  const closePrefixProxyEditor = () => {
+    setPrefixProxyEditor(null);
+  };
+
+  const openPrefixProxyEditor = async (file: AuthFileItem) => {
+    const name = file.name;
+    const fileProviderKey = normalizeProviderKey(String(file.type ?? file.provider ?? ''));
+
+    if (disableControls) return;
+    if (prefixProxyEditor?.fileName === name) {
+      setPrefixProxyEditor(null);
+      return;
+    }
+
+    setPrefixProxyEditor({
+      fileName: name,
+      fileInfoText: JSON.stringify(file, null, 2),
+      loading: true,
+      saving: false,
+      error: null,
+      originalText: '',
+      rawText: '',
+      invalidContentPreview: '',
+      json: null,
+      providerKey: fileProviderKey,
+      prefix: '',
+      proxyUrl: '',
+      priority: '',
+      weight: '',
+      weightError: null,
+      websockets: false,
+      websocketsTouched: false,
+      usingApi: false,
+      usingApiTouched: false,
+      note: '',
+      noteTouched: false,
+      headersText: '',
+      headersTouched: false,
+      headersError: null,
+      modelPolicyAllowText: '',
+      modelPolicyAllowEnabled: false,
+      modelPolicyDenyText: '',
+      modelPolicyDenyEnabled: false,
+      modelPolicyTouched: false,
+    });
+
+    try {
+      const rawText = await authFilesApi.downloadText(name);
+      const trimmed = rawText.trim();
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(trimmed) as unknown;
+      } catch {
+        setPrefixProxyEditor((prev) => {
+          if (!prev || prev.fileName !== name) return prev;
+          return {
+            ...prev,
+            ...buildInvalidAuthFileContentState(rawText, (key) => t(key)),
+          };
+        });
+        return;
+      }
+
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        setPrefixProxyEditor((prev) => {
+          if (!prev || prev.fileName !== name) return prev;
+          return {
+            ...prev,
+            ...buildInvalidAuthFileContentState(rawText, (key) => t(key)),
+          };
+        });
+        return;
+      }
+
+      const json = { ...(parsed as Record<string, unknown>) };
+      const originalText = JSON.stringify(json);
+      const providerKey = normalizeProviderKey(
+        String(json.type ?? json.provider ?? file.type ?? file.provider ?? '')
+      );
+      const prefix = typeof json.prefix === 'string' ? json.prefix : '';
+      const proxyUrl = typeof json.proxy_url === 'string' ? json.proxy_url : '';
+      const priority = parsePriorityValue(json.priority);
+      const weight = readCredentialWeight(json.weight);
+      const websockets = supportsAuthFileWebsockets(providerKey)
+        ? readAuthFileWebsockets(json)
+        : false;
+      const usingApi = supportsAuthFileUsingApi(providerKey) ? readAuthFileUsingApi(json) : false;
+      const note = typeof json.note === 'string' ? json.note : '';
+      const headers = json.headers;
+      let headersText = '';
+      let headersError: string | null = null;
+      if (headers !== undefined) {
+        headersText = JSON.stringify(headers, null, 2);
+        const { errorKey } = parseHeadersText(headersText);
+        headersError = errorKey ? t(errorKey) : null;
+      }
+
+      const rawPolicy =
+        json.model_policy &&
+        typeof json.model_policy === 'object' &&
+        !Array.isArray(json.model_policy)
+          ? (json.model_policy as Record<string, unknown>)
+          : null;
+      const policyAllow = readModelPolicyList(rawPolicy?.allowlist);
+      const policyDeny = readModelPolicyList(rawPolicy?.denylist);
+
+      setPrefixProxyEditor((prev) => {
+        if (!prev || prev.fileName !== name) return prev;
+        return {
+          ...prev,
+          loading: false,
+          originalText,
+          rawText: originalText,
+          invalidContentPreview: '',
+          json,
+          providerKey,
+          prefix,
+          proxyUrl,
+          priority: priority !== undefined ? String(priority) : '',
+          weight: weight !== undefined ? String(weight) : '',
+          weightError: null,
+          websockets,
+          websocketsTouched: false,
+          usingApi,
+          usingApiTouched: false,
+          note,
+          noteTouched: false,
+          headersText,
+          headersTouched: false,
+          headersError,
+          modelPolicyAllowText: policyAllow?.models.join('\n') ?? '',
+          modelPolicyAllowEnabled: policyAllow?.enabled ?? false,
+          modelPolicyDenyText: policyDeny?.models.join('\n') ?? '',
+          modelPolicyDenyEnabled: policyDeny?.enabled ?? false,
+          modelPolicyTouched: false,
+          error: null,
+        };
+      });
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : t('notification.download_failed');
+      setPrefixProxyEditor((prev) => {
+        if (!prev || prev.fileName !== name) return prev;
+        return { ...prev, loading: false, error: errorMessage, rawText: '' };
+      });
+      showNotification(`${t('notification.download_failed')}: ${errorMessage}`, 'error');
+    }
+  };
+
+  const handlePrefixProxyChange = (
+    field: PrefixProxyEditorField,
+    value: PrefixProxyEditorFieldValue
+  ) => {
+    setPrefixProxyEditor((prev) => {
+      if (!prev) return prev;
+      if (field === 'prefix') return { ...prev, prefix: String(value) };
+      if (field === 'proxyUrl') return { ...prev, proxyUrl: String(value) };
+      if (field === 'priority') return { ...prev, priority: String(value) };
+      if (field === 'weight') {
+        const weight = String(value);
+        const error = validateCredentialWeightText(weight);
+        return {
+          ...prev,
+          weight,
+          weightError: error ? t(credentialWeightErrorKey(error)) : null,
+        };
+      }
+      if (field === 'websockets') {
+        return { ...prev, websockets: Boolean(value), websocketsTouched: true };
+      }
+      if (field === 'usingApi') {
+        return { ...prev, usingApi: Boolean(value), usingApiTouched: true };
+      }
+      if (field === 'note') return { ...prev, note: String(value), noteTouched: true };
+      if (field === 'headersText') {
+        const headersText = String(value);
+        const { errorKey } = parseHeadersText(headersText);
+        return {
+          ...prev,
+          headersText,
+          headersTouched: true,
+          headersError: errorKey ? t(errorKey) : null,
+        };
+      }
+      if (field === 'modelPolicyAllowText') {
+        return { ...prev, modelPolicyAllowText: String(value), modelPolicyTouched: true };
+      }
+      if (field === 'modelPolicyAllowEnabled') {
+        return { ...prev, modelPolicyAllowEnabled: Boolean(value), modelPolicyTouched: true };
+      }
+      if (field === 'modelPolicyDenyText') {
+        return { ...prev, modelPolicyDenyText: String(value), modelPolicyTouched: true };
+      }
+      if (field === 'modelPolicyDenyEnabled') {
+        return { ...prev, modelPolicyDenyEnabled: Boolean(value), modelPolicyTouched: true };
+      }
+      return prev;
+    });
+  };
+
+  const handlePrefixProxySave = async () => {
+    if (!prefixProxyEditor?.json) return;
+    if (!prefixProxyDirty) return;
+
+    const name = prefixProxyEditor.fileName;
+    let payload: AuthFileFieldsPatch;
+    try {
+      payload = buildAuthFileFieldsPatch(prefixProxyEditor, (key) => t(key));
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : 'Invalid format';
+      showNotification(errorMessage, 'error');
+      return;
+    }
+    if (!hasKeys(payload)) return;
+
+    setPrefixProxyEditor((prev) => {
+      if (!prev || prev.fileName !== name) return prev;
+      return { ...prev, saving: true };
+    });
+
+    try {
+      await authFilesApi.patchFields(name, payload);
+      onFileMutated?.(name);
+      showNotification(t('auth_files.prefix_proxy_saved_success', { name }), 'success');
+      await loadFiles();
+      setPrefixProxyEditor(null);
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : '';
+      showNotification(`${t('notification.update_failed')}: ${errorMessage}`, 'error');
+      setPrefixProxyEditor((prev) => {
+        if (!prev || prev.fileName !== name) return prev;
+        return { ...prev, saving: false };
+      });
+    }
+  };
+
+  return {
+    prefixProxyEditor,
+    prefixProxyUpdatedText,
+    prefixProxyDirty,
+    openPrefixProxyEditor,
+    closePrefixProxyEditor,
+    handlePrefixProxyChange,
+    handlePrefixProxySave,
+  };
+}

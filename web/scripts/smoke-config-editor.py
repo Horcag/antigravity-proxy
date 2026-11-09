@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+"""Configuration editor browser regression, using only the local mock Core."""
+from __future__ import annotations
+from panel_browser import PanelBrowser, launch_chromium
+
+import importlib.util
+import json
+import re
+import threading
+import time
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location("panel_smoke", ROOT / "scripts/smoke-lts-panel.py")
+base = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(base)
+OUTPUT = ROOT / "local/config-editor-redesign"
+STOP = threading.Event()
+
+
+class ConfigSurface:
+    """Keep browser operations on the page and editor operations in the active workspace."""
+
+    def __init__(self, page):
+        # Resolve the active frame once; nested PanelBrowser scoping cannot see
+        # the outer iframe when the source editor has no visual search input.
+        self.page = page.raw if isinstance(page, PanelBrowser) else page
+
+    def __getattr__(self, name):
+        if name in {'goto', 'reload', 'screenshot', 'set_viewport_size'}:
+            return getattr(self.page, name)
+        self.page.wait_for_function('''() =>
+          document.querySelector('iframe[data-connection-frame][data-active="true"]') ||
+          document.querySelector('input[type="search"]')
+        ''')
+        frame = self.page.locator('iframe[data-connection-frame][data-active="true"]')
+        if frame.count():
+            return getattr(frame.element_handle().content_frame(), name)
+        return getattr(self.page, name)
+
+
+def flow_payload():
+    state = {"enabled": False, "active-requests": 0, "active-attempts": 0,
+             "waiting": 0, "queued-bytes": 0, "buckets": [], "admitted": 0,
+             "rejected": 0, "timed-out": 0, "canceled": 0, "waited": 0,
+             "sampled-at": "2026-09-11T00:00:00Z", "process-id": "config-smoke",
+             "policy-revision": 1, "policy": {"version": 3, "enabled": False, "rules": []}}
+    return {"schema-version": 3, "supported": True, "state": state,
+            "keys": [], "accounts": [], "models": [], "model-options": [],
+            "events-supported": True, "events-enabled": True, "events-interval-ms": 500}
+
+
+class ConfigCore(base.MockCoreHandler):
+    def do_GET(self):
+        if self.path == "/v0/management/flow-control":
+            self.state.record("GET", self.path)
+            self._send_json(flow_payload())
+        elif self.path == "/v0/management/flow-control/events":
+            self.state.record("GET", self.path)
+            self.send_response(200)
+            self._send_cors_headers()
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            try:
+                while not STOP.is_set():
+                    # Match the real Core stream: snapshot frames carry an explicit
+                    # event line; bare data frames are dropped by the SSE decoder.
+                    self.wfile.write(("event: snapshot\ndata: " + json.dumps(flow_payload()) + "\n\n").encode())
+                    self.wfile.flush()
+                    STOP.wait(0.25)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        else:
+            super().do_GET()
+
+
+def locate(page, field, key):
+    base.locate_config_field(page, field, key)
+    assert page.get_by_role("dialog").count() == 0, "Internal navigation must not open a leave dialog"
+
+
+def check_layout(page):
+    page.evaluate("""async () => {
+      await Promise.all(document.getAnimations().filter(a => a.effect?.getComputedTiming().iterations !== Infinity).map(a => a.finished.catch(() => {})));
+    }""")
+    result = page.locator('[data-config-page]:visible').evaluate("""node => {
+      const root = node.closest('[class*="editorContent"]');
+      return { width: root.clientWidth, scroll: root.scrollWidth };
+    }""")
+    assert result["scroll"] <= result["width"] + 1, result
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")
+    if page.locator('[data-config-field]:visible input').count():
+        field = page.locator('[data-config-field]:visible input').last
+        field.focus()
+        field.evaluate("node => node.scrollIntoView({block:'center'})")
+        rect = field.bounding_box()
+        footer = page.locator('[class*="actionBar_"]').first.bounding_box()
+        assert rect and footer and rect['y'] + rect['height'] <= footer['y'] + 1, (rect, footer)
+
+
+def check_contrast(page):
+    failures = page.evaluate("""() => {
+      const canvas=document.createElement('canvas');canvas.width=canvas.height=1;
+      const ctx=canvas.getContext('2d',{willReadFrequently:true});
+      const rgba=color=>{ctx.clearRect(0,0,1,1);ctx.fillStyle=color;ctx.fillRect(0,0,1,1);const p=[...ctx.getImageData(0,0,1,1).data];return [p[0],p[1],p[2],p[3]/255];};
+      const blend=(a,b)=>a.slice(0,3).map((v,i)=>v*a[3]+b[i]*(1-a[3]));
+      const background=node=>{const parents=[];for(let n=node;n;n=n.parentElement)parents.unshift(n);let bg=[255,255,255];for(const n of parents)bg=blend(rgba(getComputedStyle(n).backgroundColor),bg);return bg;};
+      const lum=c=>c.map(v=>v/255).map(v=>v<=0.04045?v/12.92:((v+0.055)/1.055)**2.4).reduce((s,v,i)=>s+v*[0.2126,0.7152,0.0722][i],0);
+      const contrast=(a,b)=>{const x=lum(a),y=lum(b);return (Math.max(x,y)+0.05)/(Math.min(x,y)+0.05);};
+      const failures=[];
+      for(const n of document.querySelectorAll('[data-config-page] label,[data-config-page] legend,[class*="choiceDescription"],[data-config-page] input:not([type=checkbox]):not([type=radio]),[data-config-page] button[aria-haspopup=listbox],[class*="directoryPages"] button[aria-current=page],[data-testid="config-page-introduction"],[class*="configHelp"] summary,[class*="configHelp"] p,[data-testid="config-buffer-warning"],[data-testid="config-hedging-condition"],[data-config-default-reference]')) {
+        if(!n.getClientRects().length || n.disabled)continue;
+        const s=getComputedStyle(n),bg=background(n),ratio=contrast(blend(rgba(s.color),bg),bg);
+        if(ratio<4.5)failures.push({kind:'text',tag:n.tagName,ratio,color:s.color});
+        if(n.matches('input:not([type=checkbox]),button[aria-haspopup=listbox]')){
+          const border=contrast(blend(rgba(s.borderTopColor),bg),bg);
+          if(border<3)failures.push({kind:'control border',tag:n.tagName,ratio:border,color:s.borderTopColor});
+        }
+      }
+      return failures;
+    }""")
+    assert not failures, failures
+
+
+def run_payload_integrity_smoke(page, state):
+    original = state.config_yaml
+    # Canonical v8 location: requests.payload (the visual editor projects it as `payload`).
+    a = '      - models: [{name: model-a}]\n        params: {temperature: 1}\n        extension: belongs-to-a\n'
+    b = '      - models: [{name: model-b}]\n        params: {temperature: 3}\n        extension: belongs-to-b\n'
+    head = 'requests:\n  payload:\n    default:\n'
+    source = head + a + b
+    conflict_text = 'The payload section you edited has also changed on the server.'
+    # Since 796121e6 the whole-config list guard can report the same concurrent list
+    # change first; either message is a refused save that keeps the draft.
+    list_conflict_text = 'Configuration list changed concurrently'
+
+    def wait_for_conflict():
+        page.get_by_text(conflict_text, exact=False).or_(
+            page.get_by_text(list_conflict_text, exact=False)
+        ).first.wait_for()
+    failure_text = 'Unable to convert the visual draft to YAML.'
+
+    def load(yaml):
+        state.config_yaml = original + '\n' + yaml
+        page.reload()
+        page.get_by_role('button', name='Visual Editor', exact=True).click()
+        locate(page, 'payloadDefaultRules', 'payload.default')
+        return page.locator('[data-config-field="payloadDefaultRules"]')
+
+    def writes():
+        return len(state.config_yaml_puts)
+
+    def assert_draft(field, value):
+        assert field.get_by_label('Parameter Value', exact=True).first.input_value() == value
+        assert page.locator('button[aria-label="Save"]').is_enabled()
+
+    try:
+        # Saving before preview: remote reorder and insertion must not reach PUT.
+        for target in [head + b + a, source + a.replace('model-a', 'new-server-rule')]:
+            field = load(source)
+            field.get_by_label('Parameter Value', exact=True).first.fill('2')
+            state.config_yaml = original + '\n' + target
+            before = writes()
+            page.locator('button[aria-label="Save"]').click()
+            wait_for_conflict()
+            assert writes() == before
+            assert page.get_by_role('dialog').count() == 0
+            assert_draft(field, '2')
+            assert state.config_yaml == original + '\n' + target
+
+        # A conflict arriving after preview also blocks confirm and retains the draft.
+        field = load(source)
+        field.get_by_label('Parameter Value', exact=True).first.fill('2')
+        page.locator('button[aria-label="Save"]').click()
+        confirm = page.get_by_role('button', name='Confirm Save', exact=True)
+        confirm.wait_for()
+        state.config_yaml = original + '\n' + head + b + a
+        before = writes()
+        confirm.click()
+        wait_for_conflict()
+        assert writes() == before
+        assert confirm.is_visible()
+        page.get_by_role('dialog').get_by_role('button', name='Cancel', exact=True).click()
+        assert_draft(field, '2')
+
+        anchored = '''requests:
+  payload:
+    default:
+      - models: [{name: model-a}]
+        params:
+          temperature: 1
+          options: &options {limit: 1}
+    override:
+      - models: [{name: model-b}]
+        params:
+          options: *options
+'''
+        field = load(anchored)
+        field.get_by_label('Parameter Value', exact=True).first.fill('2')
+        # Both source materialization and save must preserve cross-rule aliases.
+        for _ in range(2):
+            page.get_by_role('button', name='Source File Editor', exact=True).click()
+            # CodeMirror only renders visible lines; inspect the complete editor document.
+            assert page.locator('.cm-content').evaluate('''node => {
+              const text = node.cmView.rootView.view.state.doc.toString();
+              return text.includes('&options') && text.includes('*options');
+            }''')
+            page.get_by_role('button', name='Visual Editor', exact=True).click()
+            locate(page, 'payloadDefaultRules', 'payload.default')
+        page.locator('button[aria-label="Save"]').click()
+        page.get_by_role('button', name='Confirm Save', exact=True).click()
+        page.get_by_text('Configuration saved successfully', exact=False).first.wait_for()
+        assert 'temperature: 2' in state.config_yaml
+        assert '&options' in state.config_yaml and '*options' in state.config_yaml
+
+        # Removing a referenced anchor is an actual serialization error.
+        field = load(anchored)
+        field.locator('[class*="payloadRuleParamRow"]').nth(1).get_by_role('button', name='Delete', exact=True).click()
+        before = writes()
+        page.get_by_role('button', name='Source File Editor', exact=True).click()
+        page.get_by_text(failure_text, exact=False).wait_for()
+        assert field.is_visible(), 'Failed source conversion must stay in the visual editor'
+        assert field.get_by_label('Parameter Value', exact=True).count() == 1
+        assert page.locator('button[aria-label="Save"]').is_enabled()
+        with page.page.expect_response(lambda response: response.request.method == 'GET' and response.url.endswith('/v8/management/config.yaml')):
+            page.locator('button[aria-label="Save"]').click()
+        page.wait_for_function('!document.querySelector(\'button[aria-label="Save"]\').disabled')
+        assert page.get_by_role('dialog').count() == 0
+        assert writes() == before
+        assert field.get_by_label('Parameter Value', exact=True).count() == 1
+        assert state.config_yaml == original + '\n' + anchored
+    finally:
+        state.config_yaml = original
+        page.reload()
+        page.get_by_role('button', name='Visual Editor', exact=True).click()
+
+
+def run_cache_affinity_smoke(page, state):
+    original = state.config_yaml
+
+    def load(source):
+        state.config_yaml = source
+        page.reload()
+        page.get_by_role('button', name='Visual Editor', exact=True).click()
+        locate(page, 'codexCacheAffinityStrategy', 'codex.cache-affinity.strategy')
+        return page.get_by_test_id('codex-cache-affinity-control')
+
+    def save():
+        before = len(state.config_yaml_puts)
+        page.locator('button[aria-label="Save"]').click()
+        page.get_by_role('button', name='Confirm Save', exact=True).click()
+        deadline = time.monotonic() + 15
+        while len(state.config_yaml_puts) == before and time.monotonic() < deadline:
+            page.wait_for_timeout(50)
+        assert len(state.config_yaml_puts) == before + 1
+        page.wait_for_function("!document.querySelector('button[aria-label=\"Save\"]:not([disabled])')")
+
+    try:
+        field = load(original)
+        assert 'cache-affinity:' not in original
+        assert field.get_by_role('radio').count() == 3
+        assert field.get_by_role('radio', name='Automatic optimization (recommended)', exact=True).is_checked()
+        assert 'Using the default' in field.inner_text()
+        assert 'ChatGPT' in page.get_by_test_id('config-page-introduction').inner_text()
+        assert page.locator('[data-config-page]:visible [data-testid="codex-draft-summary"]').count() == 0
+        assert page.locator('button[aria-label="Save"]').is_disabled()
+        page.set_viewport_size({'width': 1440, 'height': 900})
+        page.screenshot(path=str(OUTPUT / 'cache-affinity-default.png'))
+
+        # Existing unknown siblings and comments survive all three choices.
+        # Canonical v8 location: upstream.codex.cache-affinity.
+        source = original.replace('  codex:\n', '  codex:\n    cache-affinity:\n      strategy: legacy # cache-policy\n      future-field: preserve\n', 1)
+        assert source != original
+        field = load(source)
+        for label, value in [('Session compatibility only', 'stable-id'),
+                             ('Automatic optimization (recommended)', 'client-aware'),
+                             ('Disable enhanced optimization', 'legacy')]:
+            field.get_by_role('radio', name=label, exact=True).check()
+            save()
+            assert re.search(r'strategy: '+value+r'\b', state.config_yaml)
+            assert 'future-field: preserve' in state.config_yaml
+            assert '# cache-policy' in state.config_yaml
+            field = load(state.config_yaml)
+            assert field.get_by_role('radio', name=label, exact=True).is_checked()
+        assert 'upstream service may still use its own cache' in field.inner_text()
+        assert 'compare behavior' in field.inner_text()
+
+        field = load(source.replace('strategy: legacy', 'strategy: future-mode'))
+        assert field.get_by_role('alert').is_visible()
+        assert field.locator('input:checked').count() == 0
+    finally:
+        load(original)
+
+
+def run_codex_outbound_smoke(page, state):
+    original = state.config_yaml
+
+    def load(source):
+        state.config_yaml = source
+        page.reload()
+        page.get_by_role('button', name='Visual Editor', exact=True).click()
+        locate(page, 'codexOutboundTransport', 'codex.outbound.transport')
+        return page.get_by_test_id('codex-outbound-transport-control')
+
+    try:
+        field = load(original)
+        assert 'outbound:' not in original
+        assert field.get_by_role('radio').count() == 3
+        assert field.get_by_role('radio', name='Follow the client', exact=True).is_checked()
+        assert 'Using the default' in field.inner_text()
+        assert page.get_by_test_id('codex-outbound-request-compression-control').get_by_role('radio').count() == 2
+        assert page.get_by_test_id('codex-outbound-accept-encoding-control').get_by_role('radio').count() == 2
+        assert page.locator('button[aria-label="Save"]').is_disabled()
+        check_layout(page)
+        page.screenshot(path=str(OUTPUT / 'codex-outbound-default.png'))
+
+        source = original.replace('codex:\n', 'codex:\n  outbound:\n    future-knob: preserve # outbound-policy\n', 1)
+        field = load(source)
+        field.get_by_role('radio', name='WebSocket for large requests', exact=True).check()
+        before = len(state.config_yaml_puts)
+        page.locator('button[aria-label="Save"]').click()
+        page.get_by_role('button', name='Confirm Save', exact=True).click()
+        deadline = time.monotonic() + 15
+        while len(state.config_yaml_puts) == before and time.monotonic() < deadline:
+            page.wait_for_timeout(50)
+        assert len(state.config_yaml_puts) == before + 1
+        assert re.search(r'transport: auto\b', state.config_yaml)
+        assert 'future-knob: preserve' in state.config_yaml and '# outbound-policy' in state.config_yaml
+        field = load(state.config_yaml)
+        assert field.get_by_role('radio', name='WebSocket for large requests', exact=True).is_checked()
+    finally:
+        load(original)
+
+
+def run_zcode_context_usage_smoke(page, state):
+    original = state.config_yaml
+
+    def load(source):
+        state.config_yaml = source
+        page.reload()
+        page.get_by_role('button', name='Visual Editor', exact=True).click()
+        locate(page, 'codexZcodeContextUsage', 'codex.zcode-context-usage')
+        return page.get_by_test_id('codex-zcode-context-usage-control')
+
+    try:
+        field = load(original)
+        assert field.get_by_role('radio', name='Disabled (default)', exact=True).is_checked()
+        assert page.locator('button[aria-label="Save"]').is_disabled()
+        assert 'extra native token count' in field.inner_text()
+        source, inserted = re.subn(
+            r'(?m)^([ \t]*)codex:[ \t]*$',
+            lambda match: (
+                f'{match.group(0)}\n'
+                f'{match.group(1)}  zcode-context-usage: disabled # context-policy\n'
+                f'{match.group(1)}  future-context: preserve'
+            ),
+            original,
+            count=1,
+        )
+        assert inserted == 1, 'Context policy fixture requires a Codex config mapping'
+        field = load(source)
+        for label, mode in [('Observe', 'observe'), ('Correct', 'correct'), ('Disabled (default)', 'disabled')]:
+            field.get_by_role('radio', name=label, exact=True).check()
+            before = len(state.config_yaml_puts)
+            page.locator('button[aria-label="Save"]').click()
+            page.get_by_role('button', name='Confirm Save', exact=True).click()
+            deadline = time.monotonic() + 15
+            while len(state.config_yaml_puts) == before and time.monotonic() < deadline:
+                page.wait_for_timeout(50)
+            assert len(state.config_yaml_puts) == before + 1
+            assert re.search(r'zcode-context-usage: ' + mode + r'\b', state.config_yaml)
+            assert '# context-policy' in state.config_yaml and 'future-context: preserve' in state.config_yaml
+            field = load(state.config_yaml)
+            assert field.get_by_role('radio', name=label, exact=True).is_checked()
+        for width in [1440, 320]:
+            page.set_viewport_size({'width': width, 'height': 900})
+            check_layout(page)
+            page.screenshot(path=str(OUTPUT / f'zcode-context-{width}.png'))
+        page.set_viewport_size({'width': 1440, 'height': 900})
+        field = load(source.replace('zcode-context-usage: disabled', 'zcode-context-usage: future'))
+        assert field.get_by_role('alert').is_visible()
+        assert field.locator('input:checked').count() == 0
+    finally:
+        load(original)
+
+
+def run():
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    app_port, api_port = base.find_free_port(), base.find_free_port()
+    state = base.MockCoreState()
+    state.config_yaml += '\nflow-control:\n  version: 3\n  enabled: false\n  rules: []\n'
+    errors = []
+    with base.run_server(base.StaticPanelHandler, app_port), base.run_server(ConfigCore, api_port, state), sync_playwright() as pw:
+        browser = launch_chromium(pw)
+        context = browser.new_context(viewport={"width": 1440, "height": 900})
+        context.add_init_script("""
+          if (!localStorage.getItem('cli-proxy-language')) localStorage.setItem('cli-proxy-language', JSON.stringify({state:{language:'en'},version:0}));
+          window.configSSE={started:0,aborted:0};
+          const fetchOriginal=window.fetch;
+          window.fetch=(url,options)=>{
+            if(String(url).includes('/flow-control/events')) {
+              window.configSSE.started++;
+              options.signal.addEventListener('abort',()=>window.configSSE.aborted++,{once:true});
+            }
+            return fetchOriginal(url,options);
+          };
+        """)
+        page = PanelBrowser(context.new_page())
+        page.set_default_timeout(15000)
+        page.on('pageerror', lambda error: errors.append(str(error)))
+        app_url = f"http://127.0.0.1:{app_port}/management.html"
+        page.goto(app_url + '#/login')
+        page.locator('input[type="checkbox"]').first.check(force=True)
+        page.locator('input.input').first.fill(f'http://127.0.0.1:{api_port}')
+        page.locator('input[name="cpa-management-key"]').fill('smoke-management-key')
+        page.get_by_label('Remember password').check(force=True)
+        page.get_by_role('button', name=re.compile(r'^(Login|Connect)$', re.I)).click()
+        page.wait_for_url(re.compile(r'#/$'))
+        page.goto(app_url + '#/config')
+        page = ConfigSurface(page)
+        page.get_by_role('searchbox').wait_for()
+
+        def flow_status_reads():
+            return sum(1 for request in state.requests if request == 'GET /v0/management/flow-control')
+
+        def config_puts():
+            return len(state.config_yaml_puts)
+
+        def wait_for_config_puts(expected: int) -> None:
+            # A success toast stays on screen for seconds, so matching its text can
+            # return before the write lands; the recorded PUT is the real signal.
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and config_puts() < expected:
+                page.wait_for_timeout(50)
+            assert config_puts() >= expected, 'Config save did not reach the mock Core'
+
+        # The host login and the resident connection frame each run one capability
+        # probe; the config editor itself must not mount or fetch the flow module.
+        probe_reads = flow_status_reads()
+        assert probe_reads >= 1, 'Login capability probe did not read flow status'
+        assert not any(
+            '/flow-control' in request and request != 'GET /v0/management/flow-control'
+            for request in state.requests
+        )
+        page.wait_for_timeout(700)
+        assert flow_status_reads() == probe_reads, 'Config editor must not mount the flow module'
+        assert page.locator('[data-config-domain="flow-control"]').count() == 0
+
+        locate(page, 'codexAbnormalReasoningRetryAction', 'abnormal-reasoning-retry.action')
+        modes = page.get_by_role('group', name='Retry action', exact=True)
+        assert modes.get_by_role('radio').count() == 3
+        modes.get_by_role('radio', name='Disabled', exact=True).check()
+        modes.get_by_role('radio', name='Disabled', exact=True).press('ArrowDown')
+        assert modes.get_by_role('radio', name='Observe only', exact=True).is_checked()
+        modes.get_by_role('radio', name='Observe only', exact=True).press('ArrowDown')
+        assert modes.get_by_role('radio', name='Retry', exact=True).is_checked()
+        page.get_by_test_id('config-editor-help').locator('summary').click()
+        locate(page, 'codexAbnormalReasoningRetryHedgeDelayMs', '对冲延迟')
+        assert page.get_by_test_id('config-editor-help').get_attribute('open') is not None
+        page.get_by_test_id('config-editor-help').locator('summary').click()
+        assert page.get_by_test_id('config-page-introduction').inner_text()
+        assert 'Hedging is off' in page.get_by_test_id('config-hedging-condition').inner_text()
+        hedging_modes = page.get_by_role('group', name='Hedged retry mode', exact=True)
+        assert hedging_modes.get_by_role('radio').count() == 2
+        assert page.locator('[data-config-page]:visible [data-testid="codex-draft-summary"]').count() == 0
+        hedging_modes.get_by_role('radio', name='Speed', exact=True).check()
+        hedging_modes.get_by_role('radio', name='Quality (default)', exact=True).check()
+        assert '1000 ms' in page.locator('[data-config-default-reference="codexAbnormalReasoningRetryHedgeDelayMs"]').inner_text()
+        page.get_by_label('Hedge delay (ms)').fill('250')
+        locate(page, 'codexAbnormalReasoningRetryAction', 'abnormal-reasoning-retry.action')
+        modes.get_by_role('radio', name='Observe only', exact=True).check()
+        locate(page, 'codexAbnormalReasoningRetryHedgeDelayMs', 'hedge-delay-ms')
+        page.get_by_role('button', name='Go to mode and scope', exact=True).click()
+        assert modes.is_visible()
+        assert page.get_by_role('dialog').count() == 0
+        modes.get_by_role('radio', name='Retry', exact=True).check()
+        locate(page, 'codexAbnormalReasoningRetryHedgeDelayMs', 'hedge-delay-ms')
+        assert page.get_by_label('Hedge delay (ms)').input_value() == '250'
+        locate(page, 'codexAbnormalReasoningRetryStreamBuffer', 'abnormal-reasoning-retry.stream-buffer')
+        buffer_switch = page.locator('[data-config-field="codexAbnormalReasoningRetryStreamBuffer"] input[type="checkbox"]')
+        was_buffered = buffer_switch.is_checked()
+        if was_buffered:
+            buffer_switch.press('Space')
+        assert page.get_by_test_id('config-buffer-warning').is_visible()
+        for theme in ['white', 'aurora-dawn', 'aurora-nebula']:
+            page.evaluate('(theme)=>document.documentElement.setAttribute("data-theme",theme)', theme)
+            check_contrast(page)
+        if buffer_switch.is_checked() != was_buffered:
+            buffer_switch.press('Space')
+        locate(page, 'redisUsageQueueRetentionSeconds', 'Redis 保留时间')
+        page.get_by_label('Redis Usage Queue Retention (seconds)').fill('0')
+        locate(page, 'disableImageGeneration', '图像生成')
+        assert page.locator('[class*="errorSummary"] button').count() == 1
+        page.locator('[class*="errorSummary"] button').click()
+        page.get_by_label('Redis Usage Queue Retention (seconds)').fill('60')
+        locate(page, 'codexAbnormalReasoningRetryHedgeDelayMs', 'hedge-delay-ms')
+        assert page.get_by_label('Hedge delay (ms)').input_value() == '250'
+        assert page.locator('[data-config-domain="codex-policy"]').get_attribute('aria-label').endswith('Unsaved changes')
+
+        # Inspecting generated source must not turn field edits into a whole-document overwrite.
+        page.get_by_role('button', name='Source File Editor', exact=True).click()
+        page.get_by_role('button', name='Visual Editor', exact=True).click()
+        locate(page, 'codexAbnormalReasoningRetryHedgeDelayMs', 'hedge-delay-ms')
+        assert page.get_by_label('Hedge delay (ms)').input_value() == '250'
+        assert page.locator('[data-config-domain="codex-policy"]').get_attribute('aria-label').endswith('Unsaved changes')
+        page.get_by_role('button', name='Source File Editor', exact=True).click()
+        state.config_yaml += '\nconcurrent-editor-marker: preserve-me\n'
+        puts_before_source_save = config_puts()
+        page.locator('button[aria-label="Save"]').click()
+        assert page.get_by_test_id('config-diff-target').inner_text() == page.get_by_test_id('config-save-target').inner_text()
+        state.config_yaml += '\nconcurrent-after-preview: preserve-too\n'
+        page.get_by_role('button', name='Confirm Save').click()
+        page.get_by_role('button', name='Confirm Save').wait_for(state='visible')
+        page.get_by_role('button', name='Confirm Save').click()
+        wait_for_config_puts(puts_before_source_save + 1)
+        page.get_by_text('Configuration saved successfully', exact=False).first.wait_for()
+        assert 'hedge-delay-ms: 250' in state.config_yaml
+        assert 'unmanaged-lts-smoke: keep-me' in state.config_yaml
+        assert 'concurrent-editor-marker: preserve-me' in state.config_yaml
+        assert 'concurrent-after-preview: preserve-too' in state.config_yaml
+        assert 'action: retry' in state.config_yaml
+        page.get_by_role('button', name='Visual Editor', exact=True).click()
+        assert not page.locator('[data-config-domain="codex-policy"]').get_attribute('aria-label').endswith('Unsaved changes')
+
+        # Flow control is a first-class page with its own config draft.
+        page.goto(app_url + '#/flow-control')
+        page.get_by_test_id('flow-control-settings').wait_for()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and flow_status_reads() <= probe_reads:
+            page.wait_for_timeout(100)
+        assert flow_status_reads() > probe_reads, 'Flow page did not read its own status'
+        assert not any('/flow-control/events' in request for request in state.requests)
+        flow_rules = page.locator('[data-config-field="flowControlRulesText"]')
+        flow_rules.get_by_role('button', name='Add rule', exact=True).click()
+        flow_rules.get_by_role('button', name='Add rule', exact=True).click()
+        disclosures = flow_rules.locator('details[class*="ruleDisclosure"]')
+        assert disclosures.count() == 2
+        second_id = disclosures.nth(1).get_by_label('Rule ID (stable IDs preserve rate history)', exact=True)
+        second_id.fill('renamed')
+        second_id.press('End')
+        second_id.press_sequentially('-rule')
+        assert second_id.input_value() == 'renamed-rule'
+        assert second_id.evaluate('node => node === document.activeElement')
+        disclosures.nth(1).locator(':scope > summary').click()
+        disclosures.first.get_by_role('button', name='Remove rule', exact=True).click()
+        assert disclosures.count() == 1
+        assert disclosures.first.get_attribute('open') is None, 'Remaining rule inherited removed rule expansion'
+        disclosures.first.locator(':scope > summary').click()
+        assert disclosures.first.get_by_label('Rule ID (stable IDs preserve rate history)', exact=True).input_value() == 'renamed-rule'
+        # The flow page saves only flow-control keys through its own diff flow.
+        # Clear the previous success toast first so the text match below proves this
+        # save, then wait for the PUT itself before asserting on the written YAML.
+        success_toast = page.get_by_text('Configuration saved successfully', exact=False)
+        if success_toast.count():
+            success_toast.first.wait_for(state='detached')
+        puts_before_flow_save = config_puts()
+        page.locator('button[aria-label="Save"]').click()
+        page.get_by_role('button', name='Confirm Save', exact=True).click()
+        wait_for_config_puts(puts_before_flow_save + 1)
+        success_toast.first.wait_for()
+        assert 'renamed-rule' in state.config_yaml
+        assert 'unmanaged-lts-smoke: keep-me' in state.config_yaml
+        assert 'hedge-delay-ms: 250' in state.config_yaml, 'Flow save must not clobber other config edits'
+        # Bookmarked editor deep links redirect to the dedicated page.
+        page.goto(app_url + '#/config?section=flow-control&subsection=monitoring')
+        page.wait_for_function("location.hash === '#/analytics/flow/config'")
+        page.get_by_test_id('flow-control-settings').wait_for()
+        page.goto(app_url + '#/analytics/flow')
+        # Observation connects only while the dashboard is mounted; leaving the
+        # route unmounts the sidecar and drops the live subscription with it.
+        page.get_by_role('button', name='Observe live', exact=True).click()
+        page.wait_for_function('window.configSSE.started === 1')
+        page.goto(app_url + '#/config')
+        locate(page, 'codexAbnormalReasoningRetryHedgeDelayMs', 'hedge-delay-ms')
+        page.wait_for_function('window.configSSE.aborted === 1')
+        page.goto(app_url + '#/analytics/flow')
+        page.get_by_role('button', name='Observe live', exact=True).click()
+        page.wait_for_function('window.configSSE.started === 2')
+        page.goto(app_url + '#/config')
+        locate(page, 'codexAbnormalReasoningRetryHedgeDelayMs', 'hedge-delay-ms')
+        page.wait_for_function('window.configSSE.aborted === 2')
+
+        # A hidden Raw rule error remains reachable without discarding another page's draft.
+        locate(page, 'payloadDefaultRawRules', 'payload.default-raw')
+        raw = page.locator('[data-config-field="payloadDefaultRawRules"]')
+        raw.get_by_role('button', name='Add Rule', exact=True).click()
+        raw.get_by_role('button', name='Add Parameter', exact=True).click()
+        raw.locator('textarea').fill('{')
+        locate(page, 'codexAbnormalReasoningRetryHedgeDelayMs', 'hedge-delay-ms')
+        page.locator('[class*="errorSummary"] button').click()
+        assert raw.locator('textarea').is_visible()
+        raw.locator('textarea').fill('1')
+        assert page.locator('[class*="errorSummary"]').count() == 0
+        # Search must scroll the focused control, not the centre of a tall rule group.
+        for _ in range(3):
+            raw.get_by_role('button', name='Add Rule', exact=True).click()
+        locate(page, 'codexAbnormalReasoningRetryHedgeDelayMs', 'hedge-delay-ms')
+        locate(page, 'payloadDefaultRawRules', 'payload.default-raw')
+        page.wait_for_function("document.activeElement?.closest('[data-config-field]')?.dataset.configField === 'payloadDefaultRawRules'")
+        focus = page.evaluate("""() => {
+          const r=document.activeElement.getBoundingClientRect();
+          const footer=document.querySelector('[class*="actionBar_"]').getBoundingClientRect();
+          return {top:r.top,bottom:r.bottom,footer:footer.top,header:document.querySelector('.main-header').getBoundingClientRect().bottom};
+        }""")
+        assert focus['top'] >= focus['header'] and focus['bottom'] <= focus['footer'], focus
+        page.locator('button[aria-label="Reload"]').click()
+        page.get_by_role('dialog').get_by_role('button', name='Reload', exact=True).click()
+        page.wait_for_function("!document.querySelector('button[aria-label=\"Save\"]:not([disabled])')")
+
+        run_payload_integrity_smoke(page, state)
+        run_cache_affinity_smoke(page, state)
+        run_codex_outbound_smoke(page, state)
+        run_zcode_context_usage_smoke(page, state)
+
+        for width, height in [(1440,900),(1280,800),(1024,768),(768,1024),(390,844),(320,844)]:
+            page.set_viewport_size({'width':width,'height':height})
+            locate(page, 'codexAbnormalReasoningRetryHedgeDelayMs', 'hedge-delay-ms')
+            check_layout(page)
+            page.screenshot(path=str(OUTPUT / f'codex-{width}.png'))
+
+        page.set_viewport_size({'width':1440,'height':900})
+        for theme in ['white','aurora-dawn','aurora-nebula']:
+            page.evaluate('(theme)=>document.documentElement.setAttribute("data-theme",theme)',theme)
+            check_layout(page)
+            check_contrast(page)
+            page.screenshot(path=str(OUTPUT / f'codex-{theme}.png'))
+        for language in ['zh-CN','en','zh-TW','ru']:
+            page.evaluate("language => localStorage.setItem('cli-proxy-language',JSON.stringify({state:{language},version:0}))",language)
+            page.reload()
+            page.get_by_role('searchbox').wait_for()
+            locate(page, 'codexAbnormalReasoningRetryHedgeDelayMs', 'hedge-delay-ms')
+            check_layout(page)
+            check_contrast(page)
+            page.screenshot(path=str(OUTPUT / f'codex-{language}.png'))
+            page.set_viewport_size({'width':320,'height':844})
+            check_layout(page)
+            page.screenshot(path=str(OUTPUT / f'codex-help-{language}-320.png'))
+            locate(page, 'codexAbnormalReasoningRetryAction', 'abnormal-reasoning-retry.action')
+            check_layout(page)
+            check_contrast(page)
+            page.locator('#config-page-heading').evaluate("node => node.scrollIntoView({block:'start'})")
+            page.screenshot(path=str(OUTPUT / f'codex-scope-{language}-320.png'))
+            page.set_viewport_size({'width':1440,'height':900})
+            check_layout(page)
+            check_contrast(page)
+            page.locator('#config-page-heading').evaluate("node => node.scrollIntoView({block:'start'})")
+            page.screenshot(path=str(OUTPUT / f'codex-scope-{language}.png'))
+        for language in ['zh-CN','en','zh-TW','ru']:
+            page.evaluate("language => localStorage.setItem('cli-proxy-language',JSON.stringify({state:{language},version:0}))", language)
+            page.reload()
+            page.get_by_role('searchbox').wait_for()
+            locate(page, 'codexCacheAffinityStrategy', 'codex.cache-affinity.strategy')
+            assert page.get_by_test_id('codex-cache-affinity-control').get_by_role('radio').count() == 3
+            for width in [1440, 320]:
+                page.set_viewport_size({'width':width,'height':900})
+                check_layout(page)
+                check_contrast(page)
+                page.locator('#config-page-heading').evaluate("node => node.scrollIntoView({block:'start'})")
+                page.screenshot(path=str(OUTPUT / f'cache-affinity-{language}-{width}.png'))
+        page.set_viewport_size({'width':1440,'height':900})
+        # Check every second-level page, not only the Codex examples (last language is Russian).
+        visited_pages = []
+        # evaluate_all does not wait: after the 320px pass the domain navigation re-renders, so wait for it.
+        page.locator('[data-config-domain]').first.wait_for()
+        domains = page.locator('[data-config-domain]').evaluate_all("nodes => nodes.map(n => n.dataset.configDomain)")
+        for domain in domains:
+            page.locator(f'[data-config-domain="{domain}"]').click()
+            paths = page.locator(f'[data-config-nav^="{domain}/"]').evaluate_all("nodes => nodes.map(n => n.dataset.configNav)")
+            for path in paths:
+                page.locator(f'[data-config-nav="{path}"]').click()
+                page.locator(f'[data-config-page="{path}"]:visible').wait_for()
+                assert page.get_by_test_id('config-page-introduction').inner_text().strip()
+                check_layout(page)
+                visited_pages.append(path)
+        # configNavigation.test.mjs 验证合并后的说明注册表与 CONFIG_DOMAINS 一致。
+        expected_pages = set()
+        for catalog in [ROOT / 'src/i18n/locales/en.json', ROOT / 'src/lts/i18n/en.lts.json']:
+            guidance = json.loads(catalog.read_text())['config_management']['editor']['guidance']['pages']
+            expected_pages.update(f'{domain}/{page}' for domain, pages in guidance.items() for page in pages)
+        assert len(visited_pages) == len(set(visited_pages)), f'Duplicate page visits: {visited_pages}'
+        assert set(visited_pages) == expected_pages, {
+            'missing': sorted(expected_pages - set(visited_pages)),
+            'unexpected': sorted(set(visited_pages) - expected_pages),
+        }
+        assert not errors, errors
+        context.close()
+        browser.close()
+    STOP.set()
+    print(f'Visited {len(visited_pages)} configuration pages exactly once.')
+    print('Configuration editor browser regression passed: native mode choices, keyboard navigation, inline prerequisites, rule identity on rename/delete, shared drafts, hidden Raw errors, YAML roundtrip, SSE visibility, 6 viewports, 3 themes, 4 languages and rendered contrast.')
+    print(f'Screenshots: {OUTPUT}')
+
+
+if __name__ == '__main__':
+    try:
+        run()
+    finally:
+        STOP.set()

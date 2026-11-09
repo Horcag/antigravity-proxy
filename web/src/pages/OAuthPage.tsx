@@ -1,0 +1,857 @@
+import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Card } from '@/components/ui/Card';
+import { Button } from '@/components/ui/Button';
+import { Input } from '@/components/ui/Input';
+import { useAuthStore, useNotificationStore } from '@/stores';
+import { apiClient } from '@/services/api/client';
+import { validateDevinCallback } from './devinOAuth';
+import iconDevin from '@/assets/icons/devin.svg';
+import iconMeta from '@/assets/icons/meta.svg';
+import { oauthApi, type OAuthProvider } from '@/services/api/oauth';
+import { vertexApi, type VertexImportResponse } from '@/services/api/vertex';
+import { copyToClipboard } from '@/utils/clipboard';
+import { getErrorMessage, isRecord } from '@/utils/helpers';
+import { createOAuthAttempts, type OAuthAttempt } from './oauthAttempts';
+import styles from './OAuthPage.module.scss';
+import { registerSessionBusyCheck, registerSessionLeaveCheck } from '@/services/connectionSession';
+import iconCodex from '@/assets/icons/codex.svg';
+import iconClaude from '@/assets/icons/claude.svg';
+import iconAntigravity from '@/assets/icons/antigravity.svg';
+import iconGemini from '@/assets/icons/gemini.svg';
+import iconKimiLight from '@/assets/icons/kimi-light.svg';
+import iconVertex from '@/assets/icons/vertex.svg';
+import iconGrok from '@/assets/icons/grok.svg';
+import iconCopilot from '@/assets/icons/copilot.svg';
+
+interface ProviderState {
+  url?: string;
+  state?: string;
+  status?: 'idle' | 'waiting' | 'success' | 'error';
+  error?: string;
+  polling?: boolean;
+  projectId?: string;
+  projectIdError?: string;
+  callbackUrl?: string;
+  callbackSubmitting?: boolean;
+  callbackStatus?: 'success' | 'error';
+  callbackError?: string;
+  userCode?: string;
+}
+
+interface VertexImportResult {
+  projectId?: string;
+  email?: string;
+  location?: string;
+  authFile?: string;
+}
+
+interface VertexImportState {
+  file?: File;
+  fileName: string;
+  location: string;
+  loading: boolean;
+  error?: string;
+  result?: VertexImportResult;
+}
+
+function getErrorStatus(error: unknown): number | undefined {
+  if (!isRecord(error)) return undefined;
+  return typeof error.status === 'number' ? error.status : undefined;
+}
+
+const PROVIDERS: {
+  id: OAuthProvider;
+  titleKey: string;
+  hintKey: string;
+  urlLabelKey: string;
+  icon: string;
+}[] = [
+  { id: 'devin', titleKey: 'auth_login.devin_oauth_title', hintKey: 'auth_login.devin_oauth_hint', urlLabelKey: 'auth_login.devin_oauth_url_label', icon: iconDevin },
+  { id: 'meta', titleKey: 'auth_login.meta_oauth_title', hintKey: 'auth_login.meta_oauth_hint', urlLabelKey: 'auth_login.meta_oauth_url_label', icon: iconMeta },
+  {
+    id: 'codex',
+    titleKey: 'auth_login.codex_oauth_title',
+    hintKey: 'auth_login.codex_oauth_hint',
+    urlLabelKey: 'auth_login.codex_oauth_url_label',
+    icon: iconCodex,
+  },
+  {
+    id: 'anthropic',
+    titleKey: 'auth_login.anthropic_oauth_title',
+    hintKey: 'auth_login.anthropic_oauth_hint',
+    urlLabelKey: 'auth_login.anthropic_oauth_url_label',
+    icon: iconClaude,
+  },
+  {
+    id: 'antigravity',
+    titleKey: 'auth_login.antigravity_oauth_title',
+    hintKey: 'auth_login.antigravity_oauth_hint',
+    urlLabelKey: 'auth_login.antigravity_oauth_url_label',
+    icon: iconAntigravity,
+  },
+  {
+    id: 'gemini-cli',
+    titleKey: 'auth_login.gemini_cli_oauth_title',
+    hintKey: 'auth_login.gemini_cli_oauth_hint',
+    urlLabelKey: 'auth_login.gemini_cli_oauth_url_label',
+    icon: iconGemini,
+  },
+  {
+    id: 'kimi',
+    titleKey: 'auth_login.kimi_oauth_title',
+    hintKey: 'auth_login.kimi_oauth_hint',
+    urlLabelKey: 'auth_login.kimi_oauth_url_label',
+    icon: iconKimiLight,
+  },
+  {
+    id: 'kimi-ai',
+    titleKey: 'auth_login.kimi_ai_oauth_title',
+    hintKey: 'auth_login.kimi_ai_oauth_hint',
+    urlLabelKey: 'auth_login.kimi_oauth_url_label',
+    icon: iconKimiLight,
+  },
+  {
+    id: 'xai',
+    titleKey: 'auth_login.xai_oauth_title',
+    hintKey: 'auth_login.xai_oauth_hint',
+    urlLabelKey: 'auth_login.xai_oauth_url_label',
+    icon: iconGrok,
+  },
+  {
+    id: 'copilot',
+    titleKey: 'auth_login.copilot_oauth_title',
+    hintKey: 'auth_login.copilot_oauth_hint',
+    urlLabelKey: 'auth_login.copilot_oauth_url_label',
+    icon: iconCopilot,
+  },
+];
+
+const CALLBACK_SUPPORTED: OAuthProvider[] = [
+  'devin',
+  'codex',
+  'anthropic',
+  'antigravity',
+  'gemini-cli',
+  'xai',
+];
+const XAI_CALLBACK_URL = 'http://127.0.0.1:56121/callback';
+const SUCCESS_RESET_DELAY_MS = 5000;
+const getProviderI18nPrefix = (provider: OAuthProvider) =>
+  (provider === 'kimi-ai' ? 'kimi' : provider).replace('-', '_');
+const getAuthKey = (provider: OAuthProvider, suffix: string) =>
+  `auth_login.${getProviderI18nPrefix(provider)}_${suffix}`;
+
+const isAbsoluteUrl = (value: string): boolean => {
+  try {
+    new URL(value);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const readQueryLikeCallbackInput = (value: string) => {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const queryStart = trimmed.indexOf('?');
+  const hashStart = trimmed.indexOf('#');
+  const rawParams =
+    queryStart >= 0
+      ? trimmed.slice(queryStart + 1)
+      : hashStart >= 0
+        ? trimmed.slice(hashStart + 1)
+        : trimmed;
+
+  if (!/(^|[&#?])(code|state|error)=/i.test(rawParams)) return null;
+  return new URLSearchParams(rawParams.replace(/^[?#]/, ''));
+};
+
+const extractDisplayedXaiCode = (value: string): string => {
+  const trimmed = value.trim();
+  const codeMatch = trimmed.match(/\bcode\s*[:=]\s*([^\s&]+)/i);
+  return (codeMatch?.[1] ?? trimmed).trim();
+};
+
+const buildXaiCallbackUrl = (input: string, state?: string): string | null => {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+  if (isAbsoluteUrl(trimmed)) return trimmed;
+
+  const params = readQueryLikeCallbackInput(trimmed);
+  if (params) {
+    const code = params.get('code')?.trim();
+    const error = params.get('error')?.trim();
+    const errorDescription = params.get('error_description')?.trim();
+    const callbackState = params.get('state')?.trim() || state?.trim();
+    if (!callbackState) return null;
+
+    const callbackUrl = new URL(XAI_CALLBACK_URL);
+    callbackUrl.searchParams.set('state', callbackState);
+    if (code) callbackUrl.searchParams.set('code', code);
+    if (error) callbackUrl.searchParams.set('error', error);
+    if (errorDescription) callbackUrl.searchParams.set('error_description', errorDescription);
+    return callbackUrl.toString();
+  }
+
+  const code = extractDisplayedXaiCode(trimmed);
+  const callbackState = state?.trim();
+  if (!code || !callbackState) return null;
+
+  const callbackUrl = new URL(XAI_CALLBACK_URL);
+  callbackUrl.searchParams.set('code', code);
+  callbackUrl.searchParams.set('state', callbackState);
+  return callbackUrl.toString();
+};
+
+const resolveCallbackUrl = (
+  provider: OAuthProvider,
+  input: string,
+  state?: string
+): string | null => {
+  if (provider === 'devin' && validateDevinCallback(input, state)) return null;
+  if (provider !== 'xai') return input.trim();
+  return buildXaiCallbackUrl(input, state);
+};
+
+export function OAuthPage() {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const { showNotification } = useNotificationStore();
+  const [states, setStates] = useState<Record<OAuthProvider, ProviderState>>(
+    {} as Record<OAuthProvider, ProviderState>
+  );
+  useEffect(
+    () =>
+      registerSessionLeaveCheck(() =>
+        Object.values(states).some((state) => state.polling || state.callbackSubmitting)
+      ),
+    [states]
+  );
+  const [vertexState, setVertexState] = useState<VertexImportState>({
+    fileName: '',
+    location: '',
+    loading: false,
+  });
+  const sessionCleanup = useRef(new Map<OAuthProvider, () => Promise<unknown>>());
+  const attempts = useRef(
+    createOAuthAttempts({
+      setTimeout: (callback, delay) => window.setTimeout(callback, delay),
+      clearTimeout: (timer) => window.clearTimeout(timer),
+    })
+  );
+  useEffect(
+    () =>
+      registerSessionBusyCheck(
+        () => vertexState.loading || Object.values(states).some((state) => state.callbackSubmitting)
+      ),
+    [states, vertexState.loading]
+  );
+  const vertexFileInputRef = useRef<HTMLInputElement | null>(null);
+  const providerCardRefs = useRef<Partial<Record<OAuthProvider, HTMLDivElement | null>>>({});
+  const providerQuery = searchParams.get('provider')?.trim().toLowerCase() || '';
+  const focusedProvider = (
+    providerQuery === 'claude'
+      ? 'anthropic'
+      : providerQuery === 'gemini'
+        ? 'gemini-cli'
+        : providerQuery
+  ) as OAuthProvider;
+  const hasFocusedProvider = PROVIDERS.some((provider) => provider.id === focusedProvider);
+
+  const clearTimers = useCallback(() => {
+    attempts.current.invalidateAll();
+    for (const cancel of sessionCleanup.current.values()) void cancel().catch(() => {});
+    sessionCleanup.current.clear();
+  }, []);
+
+  useEffect(() => {
+    const unsubscribe = useAuthStore.subscribe((next, previous) => {
+      if (
+        next.apiBase !== previous.apiBase ||
+        next.managementKey !== previous.managementKey ||
+        next.connectionStatus !== previous.connectionStatus
+      ) {
+        clearTimers();
+        setStates({} as Record<OAuthProvider, ProviderState>);
+      }
+    });
+    return () => {
+      unsubscribe();
+      clearTimers();
+    };
+  }, [clearTimers]);
+
+  useEffect(() => {
+    if (!hasFocusedProvider) return;
+    const frame = window.requestAnimationFrame(() => {
+      providerCardRefs.current[focusedProvider]?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center',
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [focusedProvider, hasFocusedProvider]);
+
+  const updateProviderState = (provider: OAuthProvider, next: Partial<ProviderState>) => {
+    setStates((prev) => ({
+      ...prev,
+      [provider]: { ...(prev[provider] ?? {}), ...next },
+    }));
+  };
+
+  const resetProviderAttempt = (provider: OAuthProvider) => {
+    const cancel = sessionCleanup.current.get(provider);
+    sessionCleanup.current.delete(provider);
+    if (cancel) void cancel().catch(() => showNotification(t('alignment_quota.cancel_failed'), 'error'));
+    attempts.current.get(provider)?.invalidate();
+    setStates((prev) => {
+      const current = prev[provider] ?? {};
+      const next: ProviderState = {};
+      if (provider === 'gemini-cli' && current.projectId !== undefined) {
+        next.projectId = current.projectId;
+      }
+      return {
+        ...prev,
+        [provider]: next,
+      };
+    });
+  };
+
+  const completeProviderAuth = (provider: OAuthProvider) => {
+    sessionCleanup.current.delete(provider);
+    const resetAttempt = attempts.current.begin(provider);
+    updateProviderState(provider, {
+      url: undefined,
+      state: undefined,
+      status: 'success',
+      error: undefined,
+      polling: false,
+      callbackUrl: '',
+      callbackSubmitting: false,
+      callbackStatus: undefined,
+      callbackError: undefined,
+    });
+    resetAttempt.schedule(() => {
+      resetProviderAttempt(provider);
+    }, SUCCESS_RESET_DELAY_MS);
+  };
+
+  const startPolling = (provider: OAuthProvider, state: string, attempt: OAuthAttempt) => {
+    attempt.poll(
+      () => oauthApi.getAuthStatus(state, attempt.signal),
+      (res) => {
+        if (res.status === 'ok') {
+          completeProviderAuth(provider);
+          showNotification(t(getAuthKey(provider, 'oauth_status_success')), 'success');
+        } else if (res.status === 'error') {
+          updateProviderState(provider, { status: 'error', error: res.error, polling: false });
+          showNotification(
+            `${t(getAuthKey(provider, 'oauth_status_error'))} ${res.error || ''}`,
+            'error'
+          );
+        }
+        return res.status === 'wait';
+      },
+      (err) => {
+        updateProviderState(provider, {
+          status: 'error',
+          error: getErrorMessage(err),
+          polling: false,
+        });
+      },
+      3000
+    );
+  };
+
+  const startAuth = async (provider: OAuthProvider) => {
+    const client = apiClient.captureConnection();
+    const attempt = attempts.current.begin(provider);
+    const geminiState = provider === 'gemini-cli' ? states[provider] : undefined;
+    const rawProjectId = provider === 'gemini-cli' ? (geminiState?.projectId || '').trim() : '';
+    const projectId = rawProjectId
+      ? rawProjectId.toUpperCase() === 'ALL'
+        ? 'ALL'
+        : rawProjectId
+      : undefined;
+    // 项目 ID 可选：留空自动选择第一个可用项目；输入 ALL 获取全部项目
+    if (provider === 'gemini-cli') {
+      updateProviderState(provider, { projectIdError: undefined });
+    }
+    updateProviderState(provider, {
+      url: undefined,
+      state: undefined,
+      status: 'waiting',
+      polling: true,
+      error: undefined,
+      callbackStatus: undefined,
+      callbackError: undefined,
+      callbackUrl: '',
+      callbackSubmitting: false,
+      userCode: undefined,
+    });
+    try {
+      const res = await oauthApi.startAuth(provider, {
+        client,
+        projectId: provider === 'gemini-cli' ? projectId : undefined,
+        signal: attempt.signal,
+      });
+      if (provider === 'devin' || provider === 'meta') {
+        if (res.state) {
+          const cancel = () => client.delete('/oauth/session', { params: { state: res.state } });
+          if (!attempt.isCurrent()) { void cancel().catch(() => {}); return; }
+          sessionCleanup.current.set(provider, cancel);
+        }
+      }
+      if (!attempt.isCurrent()) return;
+      if (!res.state) {
+        const message = t('auth_login.missing_state');
+        updateProviderState(provider, {
+          url: res.url,
+          state: undefined,
+          status: 'error',
+          error: message,
+          polling: false,
+        });
+        showNotification(message, 'error');
+        return;
+      }
+      updateProviderState(provider, {
+        url: res.url,
+        state: res.state,
+        userCode: res.user_code,
+        status: 'waiting',
+        polling: true,
+      });
+      if (provider === 'copilot') {
+        // 设备码由插件 login-info 管理路由下发；拉取失败不阻塞状态轮询，
+        // 用户可按提示直接打开授权链接重新获取。
+        try {
+          const info = await oauthApi.copilotLoginInfo(res.state, attempt.signal);
+          if (attempt.isCurrent()) {
+            updateProviderState(provider, { userCode: info.user_code || undefined });
+          }
+        } catch {
+          if (attempt.isCurrent()) updateProviderState(provider, { userCode: undefined });
+        }
+      }
+      startPolling(provider, res.state, attempt);
+    } catch (err: unknown) {
+      if (!attempt.isCurrent()) return;
+      const message = getErrorMessage(err);
+      updateProviderState(provider, { status: 'error', error: message, polling: false });
+      showNotification(
+        `${t(getAuthKey(provider, 'oauth_start_error'))}${message ? ` ${message}` : ''}`,
+        'error'
+      );
+    }
+  };
+
+  const copyLink = async (url?: string) => {
+    if (!url) return;
+    const copied = await copyToClipboard(url);
+    showNotification(
+      t(copied ? 'notification.link_copied' : 'notification.copy_failed'),
+      copied ? 'success' : 'error'
+    );
+  };
+
+  const submitCallback = async (provider: OAuthProvider) => {
+    const attempt = attempts.current.get(provider);
+    if (!attempt?.isCurrent()) return;
+    const callbackInput = (states[provider]?.callbackUrl || '').trim();
+    if (!callbackInput) {
+      showNotification(
+        t(
+          provider === 'xai'
+            ? 'auth_login.xai_callback_required'
+            : 'auth_login.oauth_callback_required'
+        ),
+        'warning'
+      );
+      return;
+    }
+    const redirectUrl = resolveCallbackUrl(provider, callbackInput, states[provider]?.state);
+    if (!redirectUrl) {
+      showNotification(
+        t(
+          provider === 'xai' ? 'auth_login.xai_callback_state_missing' : 'auth_login.missing_state'
+        ),
+        'warning'
+      );
+      return;
+    }
+    updateProviderState(provider, {
+      callbackSubmitting: true,
+      callbackStatus: undefined,
+      callbackError: undefined,
+    });
+    try {
+      await oauthApi.submitCallback(provider, redirectUrl, attempt.signal);
+      if (!attempt.isCurrent()) return;
+      updateProviderState(provider, { callbackSubmitting: false, callbackStatus: 'success' });
+      showNotification(t('auth_login.oauth_callback_success'), 'success');
+      const loginState = states[provider]?.state;
+      if (loginState && !attempt.isPolling()) {
+        updateProviderState(provider, { status: 'waiting', error: undefined, polling: true });
+        startPolling(provider, loginState, attempt);
+      }
+    } catch (err: unknown) {
+      const status = getErrorStatus(err);
+      if (!attempt.isCurrent()) return;
+      const message = getErrorMessage(err);
+      const errorMessage =
+        status === 404
+          ? t('auth_login.oauth_callback_upgrade_hint', {
+              defaultValue: 'Please update CPA or check the connection.',
+            })
+          : message || undefined;
+      updateProviderState(provider, {
+        callbackSubmitting: false,
+        callbackStatus: 'error',
+        callbackError: errorMessage,
+      });
+      const notificationMessage = errorMessage
+        ? `${t('auth_login.oauth_callback_error')} ${errorMessage}`
+        : t('auth_login.oauth_callback_error');
+      showNotification(notificationMessage, 'error');
+    }
+  };
+
+  const handleVertexFilePick = () => {
+    vertexFileInputRef.current?.click();
+  };
+
+  const handleVertexFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (!file.name.endsWith('.json')) {
+      showNotification(t('vertex_import.file_required'), 'warning');
+      event.target.value = '';
+      return;
+    }
+    setVertexState((prev) => ({
+      ...prev,
+      file,
+      fileName: file.name,
+      error: undefined,
+      result: undefined,
+    }));
+    event.target.value = '';
+  };
+
+  const handleVertexImport = async () => {
+    if (!vertexState.file) {
+      const message = t('vertex_import.file_required');
+      setVertexState((prev) => ({ ...prev, error: message }));
+      showNotification(message, 'warning');
+      return;
+    }
+    const location = vertexState.location.trim();
+    setVertexState((prev) => ({ ...prev, loading: true, error: undefined, result: undefined }));
+    try {
+      const res: VertexImportResponse = await vertexApi.importCredential(
+        vertexState.file,
+        location || undefined
+      );
+      const result: VertexImportResult = {
+        projectId: res.project_id,
+        email: res.email,
+        location: res.location,
+        authFile: res['auth-file'] ?? res.auth_file,
+      };
+      setVertexState((prev) => ({ ...prev, loading: false, result }));
+      showNotification(t('vertex_import.success'), 'success');
+    } catch (err: unknown) {
+      const message = getErrorMessage(err);
+      setVertexState((prev) => ({
+        ...prev,
+        loading: false,
+        error: message || t('notification.upload_failed'),
+      }));
+      const notification = message
+        ? `${t('notification.upload_failed')}: ${message}`
+        : t('notification.upload_failed');
+      showNotification(notification, 'error');
+    }
+  };
+
+  return (
+    <div className={styles.container}>
+      <h1 className={styles.pageTitle}>{t('nav.oauth', { defaultValue: 'OAuth' })}</h1>
+
+      <div className={styles.content}>
+        {PROVIDERS.map((provider) => {
+          const state = states[provider.id] || {};
+          const canSubmitCallback = CALLBACK_SUPPORTED.includes(provider.id) && Boolean(state.url);
+          const loginButtonLabel =
+            state.status === 'success'
+              ? t('auth_login.login_another_account')
+              : t(getAuthKey(provider.id, 'oauth_button'));
+          const statusBadgeClassName = [
+            'status-badge',
+            state.status === 'success' ? 'success' : '',
+            state.status === 'error' ? 'error' : '',
+          ]
+            .filter(Boolean)
+            .join(' ');
+          return (
+            <div
+              key={provider.id}
+              ref={(element) => {
+                providerCardRefs.current[provider.id] = element;
+              }}
+              className={styles.providerAnchor}
+              data-focused={
+                hasFocusedProvider && focusedProvider === provider.id ? 'true' : undefined
+              }
+            >
+              <Card
+                title={
+                  <span className={styles.cardTitle}>
+                    <img src={provider.icon} alt="" className={styles.cardTitleIcon} />
+                    {t(provider.titleKey)}
+                  </span>
+                }
+                extra={
+                  <Button onClick={() => startAuth(provider.id)} loading={state.polling}>
+                    {loginButtonLabel}
+                  </Button>
+                }
+              >
+                <div className={styles.cardContent}>
+                  <div className={styles.cardHint}>{t(provider.hintKey)}</div>
+                  {provider.id === 'gemini-cli' && (
+                    <div className={styles.geminiProjectField}>
+                      <Input
+                        label={t('auth_login.gemini_cli_project_id_label')}
+                        hint={t('auth_login.gemini_cli_project_id_hint')}
+                        value={state.projectId || ''}
+                        error={state.projectIdError}
+                        disabled={Boolean(state.polling)}
+                        onChange={(e) =>
+                          updateProviderState(provider.id, {
+                            projectId: e.target.value,
+                            projectIdError: undefined,
+                          })
+                        }
+                        placeholder={t('auth_login.gemini_cli_project_id_placeholder')}
+                      />
+                    </div>
+                  )}
+                  {state.url && (
+                    <div className={styles.authUrlBox}>
+                      <div className={styles.authUrlLabel}>{t(provider.urlLabelKey)}</div>
+                      <div className={styles.authUrlValue}>{state.url}</div>
+                      <div className={styles.authUrlActions}>
+                        <Button variant="secondary" size="sm" onClick={() => copyLink(state.url!)}>
+                          {t(getAuthKey(provider.id, 'copy_link'))}
+                        </Button>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          onClick={() => window.open(state.url, '_blank', 'noopener,noreferrer')}
+                        >
+                          {t(getAuthKey(provider.id, 'open_link'))}
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                  {state.userCode && (
+                    <div className={styles.authUrlBox}>
+                      <div className={styles.authUrlLabel}>
+                        {t('alignment_quota.device_code')}
+                      </div>
+                      <div className={styles.authUrlValue}>{state.userCode}</div>
+                      <div className={styles.authUrlActions}>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          onClick={async () => {
+                            const copied = await copyToClipboard(state.userCode!);
+                            showNotification(
+                              t(copied ? 'notification.link_copied' : 'notification.copy_failed'),
+                              copied ? 'success' : 'error'
+                            );
+                          }}
+                        >
+                          {t('auth_login.copilot_user_code_copy')}
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                  {(provider.id === 'devin' || provider.id === 'meta') && state.state && state.status !== 'success' && <Button variant="secondary" onClick={() => resetProviderAttempt(provider.id)}>{t('common.cancel')}</Button>}
+                  {canSubmitCallback && (
+                    <div className={styles.callbackSection}>
+                      <Input
+                        label={t(
+                          provider.id === 'xai'
+                            ? 'auth_login.xai_callback_label'
+                            : 'auth_login.oauth_callback_label'
+                        )}
+                        hint={t(
+                          provider.id === 'xai'
+                            ? 'auth_login.xai_callback_hint'
+                            : 'auth_login.oauth_callback_hint'
+                        )}
+                        value={state.callbackUrl || ''}
+                        onChange={(e) =>
+                          updateProviderState(provider.id, {
+                            callbackUrl: e.target.value,
+                            callbackStatus: undefined,
+                            callbackError: undefined,
+                          })
+                        }
+                        placeholder={t(
+                          provider.id === 'xai'
+                            ? 'auth_login.xai_callback_placeholder'
+                            : 'auth_login.oauth_callback_placeholder'
+                        )}
+                      />
+                      <div className={styles.callbackActions}>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          onClick={() => submitCallback(provider.id)}
+                          loading={state.callbackSubmitting}
+                        >
+                          {t('auth_login.oauth_callback_button')}
+                        </Button>
+                      </div>
+                      {state.callbackStatus === 'success' && state.status === 'waiting' && (
+                        <div className="status-badge success">
+                          {t('auth_login.oauth_callback_status_success')}
+                        </div>
+                      )}
+                      {state.callbackStatus === 'error' && (
+                        <div className="status-badge error">
+                          {t('auth_login.oauth_callback_status_error')} {state.callbackError || ''}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {state.status && state.status !== 'idle' && (
+                    <div className={statusBadgeClassName}>
+                      {state.status === 'success'
+                        ? t(getAuthKey(provider.id, 'oauth_status_success'))
+                        : state.status === 'error'
+                          ? `${t(getAuthKey(provider.id, 'oauth_status_error'))} ${state.error || ''}`
+                          : t(getAuthKey(provider.id, 'oauth_status_waiting'))}
+                    </div>
+                  )}
+                  {state.status === 'success' && (
+                    <div className={styles.successActions}>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() =>
+                          navigate(
+                            `/auth-files?provider=${provider.id === 'anthropic' ? 'claude' : provider.id}`
+                          )
+                        }
+                      >
+                        {t('auth_login.view_auth_files')}
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              </Card>
+            </div>
+          );
+        })}
+
+        {/* Vertex JSON 登录 */}
+        <Card
+          title={
+            <span className={styles.cardTitle}>
+              <img src={iconVertex} alt="" className={styles.cardTitleIcon} />
+              {t('vertex_import.title')}
+            </span>
+          }
+          extra={
+            <Button onClick={handleVertexImport} loading={vertexState.loading}>
+              {t('vertex_import.import_button')}
+            </Button>
+          }
+        >
+          <div className={styles.cardContent}>
+            <div className={styles.cardHint}>{t('vertex_import.description')}</div>
+            <Input
+              label={t('vertex_import.location_label')}
+              hint={t('vertex_import.location_hint')}
+              value={vertexState.location}
+              onChange={(e) =>
+                setVertexState((prev) => ({
+                  ...prev,
+                  location: e.target.value,
+                }))
+              }
+              placeholder={t('vertex_import.location_placeholder')}
+            />
+            <div className={styles.formItem}>
+              <label className={styles.formItemLabel}>{t('vertex_import.file_label')}</label>
+              <div className={styles.filePicker}>
+                <Button variant="secondary" size="sm" onClick={handleVertexFilePick}>
+                  {t('vertex_import.choose_file')}
+                </Button>
+                <div
+                  className={`${styles.fileName} ${
+                    vertexState.fileName ? '' : styles.fileNamePlaceholder
+                  }`.trim()}
+                >
+                  {vertexState.fileName || t('vertex_import.file_placeholder')}
+                </div>
+              </div>
+              <div className={styles.cardHintSecondary}>{t('vertex_import.file_hint')}</div>
+              <input
+                ref={vertexFileInputRef}
+                type="file"
+                accept=".json,application/json"
+                style={{ display: 'none' }}
+                onChange={handleVertexFileChange}
+              />
+            </div>
+            {vertexState.error && <div className="status-badge error">{vertexState.error}</div>}
+            {vertexState.result && (
+              <div className={styles.connectionBox}>
+                <div className={styles.connectionLabel}>{t('vertex_import.result_title')}</div>
+                <div className={styles.keyValueList}>
+                  {vertexState.result.projectId && (
+                    <div className={styles.keyValueItem}>
+                      <span className={styles.keyValueKey}>
+                        {t('vertex_import.result_project')}
+                      </span>
+                      <span className={styles.keyValueValue}>{vertexState.result.projectId}</span>
+                    </div>
+                  )}
+                  {vertexState.result.email && (
+                    <div className={styles.keyValueItem}>
+                      <span className={styles.keyValueKey}>{t('vertex_import.result_email')}</span>
+                      <span className={styles.keyValueValue}>{vertexState.result.email}</span>
+                    </div>
+                  )}
+                  {vertexState.result.location && (
+                    <div className={styles.keyValueItem}>
+                      <span className={styles.keyValueKey}>
+                        {t('vertex_import.result_location')}
+                      </span>
+                      <span className={styles.keyValueValue}>{vertexState.result.location}</span>
+                    </div>
+                  )}
+                  {vertexState.result.authFile && (
+                    <div className={styles.keyValueItem}>
+                      <span className={styles.keyValueKey}>{t('vertex_import.result_file')}</span>
+                      <span className={styles.keyValueValue}>{vertexState.result.authFile}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+}

@@ -3,7 +3,8 @@ import { type ChildProcess, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { AppConfig, DEFAULT_PROXY_CONFIG, ProxyConfigSchema } from '@/modules/config/types';
+import { effectiveProxyConfig, transformProxyConfig } from './proxy-config-update';
+import { AppConfig, ProxyConfig, ProxyConfigSchema } from '@/modules/config/types';
 
 const CONFIG_FILE_NAME = 'config.json';
 const LOCK_FILE_NAME = '.config.json.lock';
@@ -32,13 +33,6 @@ const LOCK_HELPER_SCRIPT = [
   "printf 'committed\\n'",
   'exec cat >/dev/null',
 ].join('\n');
-
-interface PartialProxyConfig {
-  host?: string;
-  port?: number;
-  api_key?: string;
-  admin_api_key?: string;
-}
 
 interface FileIdentity {
   dev: number;
@@ -786,18 +780,11 @@ function configPath(directory: AnchoredDataDirectory): string {
 export class ConfigManager {
   static loadConfig(): AppConfig {
     const fileBackedConfig = withAnchoredDataDirectory((directory) => readFileBackedConfig(configPath(directory)));
-    const fileProxy = isRecord(fileBackedConfig.config.proxy)
-      ? (fileBackedConfig.config.proxy as PartialProxyConfig)
-      : {};
-    const proxy = ProxyConfigSchema.parse({
-      ...DEFAULT_PROXY_CONFIG,
-      ...fileProxy,
-      host: process.env.AG_PROXY_HOST ?? fileProxy.host,
-      port: process.env.AG_PROXY_PORT ? Number(process.env.AG_PROXY_PORT) : fileProxy.port,
-      api_key: process.env.AG_PROXY_API_KEY ?? fileProxy.api_key,
-      admin_api_key: process.env.AG_PROXY_ADMIN_API_KEY ?? fileProxy.admin_api_key,
-    });
-    return { proxy };
+    return { proxy: effectiveProxyConfig(fileBackedConfig.config) };
+  }
+
+  static async updateProxyConfig(update: (current: ProxyConfig) => Partial<ProxyConfig>): Promise<void> {
+    await this.updateConfig((current) => transformProxyConfig(current, update));
   }
 
   static async saveConfig(config: AppConfig): Promise<void> {

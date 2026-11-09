@@ -1,0 +1,262 @@
+/**
+ * 主题样式
+ */
+
+// 中性纯白主题（默认）
+:root {
+  color-scheme: light;
+
+  --bg-secondary: #ffffff;
+  --bg-primary: #ffffff;
+  --bg-tertiary: #f6f6f6;
+  --bg-hover: var(--bg-tertiary);
+  --bg-quinary: #ffffff;
+  --bg-error-light: rgba(198, 87, 70, 0.08);
+  --floating-surface: #ffffff;
+  --floating-border: #d9d9d9;
+  --floating-shadow: 0 12px 26px rgba(0, 0, 0, 0.12);
+
+  --text-primary: #262626;
+  --text-secondary: #666666;
+  --text-tertiary: #8f8f8f;
+  --text-quaternary: #b8b8b8;
+  --text-muted: var(--text-tertiary);
+
+  --border-color: #e5e5e5;
+  --border-secondary: var(--border-color);
+  --border-primary: #d9d9d9;
+  --border-hover: #cccccc;
+
+  --primary-color: #737373;
+  --primary-hover: #5f5f5f;
+  --primary-active: #4d4d4d;
+  --primary-contrast: #ffffff;
+  // 实底主操作(按钮):允许比强调色深一档以满足文字对比度
+  --primary-button-bg: var(--primary-color);
+  --primary-button-bg-hover: var(--primary-hover);
+
+  --success-color: #10b981;
+  --quota-medium-color: #e0aa14;
+  --warning-color: #c65746; // 错误/警告色
+  --error-color: #c65746;
+  --danger-color: var(--error-color);
+  --info-color: var(--primary-color);
+
+  --warning-bg: rgba(198, 87, 70, 0.12);
+  --warning-border: rgba(198, 87, 70, 0.35);
+  --warning-text: var(--warning-color);
+
+  --success-badge-bg: #d1fae5;
+  --success-badge-text: #065f46;
+  --success-badge-border: #6ee7b7;
+
+  --failure-badge-bg: rgba(198, 87, 70, 0.14);
+  --failure-badge-text: #8a3a30;
+  --failure-badge-border: rgba(198, 87, 70, 0.35);
+
+  --count-badge-bg: rgba(115, 115, 115, 0.16);
+  --count-badge-text: var(--primary-active);
+
+  --shadow: 0 1px 2px 0 rgb(0 0 0 / 0.08);
+  --shadow-lg: 0 10px 18px -3px rgb(0 0 0 / 0.1);
+
+  --radius-md: 8px;
+  --accent-tertiary: var(--bg-tertiary);
+
+  // Workbench tokens (Home parity)
+  --primary-8: color-mix(in srgb, var(--primary-color) 8%, transparent);
+  --primary-10: color-mix(in srgb, var(--primary-color) 10%, transparent);
+  --primary-30: color-mix(in srgb, var(--primary-color) 30%, transparent);
+  --amber-color: #d97706;
+  --amber-text: #92400e;
+  --amber-10: color-mix(in srgb, var(--amber-color) 10%, transparent);
+  --amber-30: color-mix(in srgb, var(--amber-color) 30%, transparent);
+  --destructive-color: var(--error-color);
+  --destructive-10: color-mix(in srgb, var(--destructive-color) 10%, transparent);
+  --destructive-30: color-mix(in srgb, var(--destructive-color) 30%, transparent);
+  --muted-bg: var(--bg-tertiary);
+  --muted-foreground: var(--text-secondary);
+  --accent-bg: var(--bg-tertiary);
+
+  // Glass effect (blurred surfaces)
+  --glass-blur: 12px;
+  --glass-backdrop-filter: blur(var(--glass-blur));
+  --glass-filter: blur(var(--glass-blur));
+  --glass-bg: color-mix(in srgb, var(--bg-primary) 82%, transparent);
+  --glass-bg-secondary: color-mix(in srgb, var(--bg-secondary) 82%, transparent);
+  --glass-border: color-mix(in srgb, var(--border-color) 60%, transparent);
+
+  // 规则：翡翠绿只表达「活的流量」。
+  --viz-success: #10b981;
+  --viz-failure: #c65746;
+
+  // 动效词汇表：内置 ease 太弱，交互反馈统一用强减速曲线。
+  // 按压 160ms / 悬停 200ms，UI 动效不超过 300ms。
+  --ease-out-strong: cubic-bezier(0.23, 1, 0.32, 1);
+  --dur-press: 160ms;
+  --dur-hover: 200ms;
+}
+
+// 极光·星云（暗底）
+[data-theme='aurora-nebula'] {
+  color-scheme: dark;
+
+  --bg-primary: rgba(42, 17, 82, 0.72);
+  --bg-secondary: rgba(20, 11, 46, 0.6);
+  --bg-tertiary: rgba(255, 255, 255, 0.07);
+  --bg-hover: rgba(255, 255, 255, 0.11);
+  --bg-quinary: rgba(26, 13, 54, 0.9);
+  --bg-error-light: rgba(251, 113, 133, 0.1);
+  --floating-surface: rgba(30, 15, 60, 0.94);
+  --floating-border: rgba(255, 255, 255, 0.14);
+  --floating-shadow: 0 18px 42px rgba(0, 0, 0, 0.5);
+
+  --text-primary: #f5f0ff;
+  --text-secondary: #c9b8f0;
+  --text-tertiary: #9b8ac4;
+  --text-quaternary: #9182bf;
+
+  --border-color: rgba(255, 255, 255, 0.12);
+  --border-primary: rgba(255, 255, 255, 0.2);
+  --border-hover: rgba(255, 255, 255, 0.26);
+
+  --primary-color: #a855f7;
+  --primary-hover: #9333ea;
+  --primary-active: #7e22ce;
+  --primary-contrast: #fff5fb;
+  --primary-button-bg: #9333ea;
+  --primary-button-bg-hover: #7e22ce;
+
+  --success-color: #4ade80;
+  --quota-medium-color: #fbbf24;
+  --warning-color: #fbbf24;
+  --error-color: #fb7185;
+
+  --warning-bg: rgba(251, 191, 36, 0.16);
+  --warning-border: rgba(251, 191, 36, 0.34);
+  --success-badge-bg: rgba(74, 222, 128, 0.16);
+  --success-badge-text: #86efac;
+  --success-badge-border: rgba(74, 222, 128, 0.34);
+  --failure-badge-bg: rgba(251, 113, 133, 0.16);
+  --failure-badge-text: #fda4af;
+  --failure-badge-border: rgba(251, 113, 133, 0.34);
+  --count-badge-bg: rgba(168, 85, 247, 0.24);
+
+  --shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.55);
+  --amber-color: #fbbf24;
+  --amber-text: #fcd34d;
+  --viz-success: #4ade80;
+  --viz-failure: #fb7185;
+
+  --glass-bg: rgba(255, 255, 255, 0.07);
+  --glass-bg-secondary: rgba(255, 255, 255, 0.05);
+  --glass-border: rgba(255, 255, 255, 0.14);
+
+  // 极光专用
+  --bg-base-1: #140b2e;
+  --bg-base-2: #2a1152;
+  --aurora-1: rgba(244, 114, 182, 0.42);
+  --aurora-2: rgba(139, 92, 246, 0.42);
+  --aurora-3: rgba(56, 189, 248, 0.38);
+  --glow: rgba(168, 85, 247, 0.5);
+}
+
+// 极光·晨曦（浅底）
+[data-theme='aurora-dawn'] {
+  color-scheme: light;
+
+  --bg-primary: rgba(255, 255, 255, 0.72);
+  --bg-secondary: rgba(255, 255, 255, 0.6);
+  --bg-tertiary: rgba(124, 108, 240, 0.08);
+  --bg-hover: rgba(124, 108, 240, 0.12);
+  --bg-quinary: #fdfcff;
+  --bg-error-light: rgba(224, 82, 106, 0.08);
+  --floating-surface: rgba(255, 255, 255, 0.94);
+  --floating-border: rgba(124, 108, 240, 0.2);
+  --floating-shadow: 0 18px 42px rgba(90, 80, 140, 0.18);
+
+  --text-primary: #2a2440;
+  --text-secondary: #5b5675;
+  --text-tertiary: #78738f;
+  --text-quaternary: #8f8aab;
+
+  --border-color: rgba(124, 108, 240, 0.16);
+  --border-primary: rgba(124, 108, 240, 0.26);
+  --border-hover: rgba(124, 108, 240, 0.34);
+
+  --primary-color: #7c6cf0;
+  --primary-hover: #6355e6;
+  --primary-active: #5243d6;
+  --primary-contrast: #ffffff;
+  --primary-button-bg: #6355e6;
+  --primary-button-bg-hover: #5243d6;
+
+  --success-color: #10b981;
+  --quota-medium-color: #d97706;
+  --warning-color: #d97706;
+  --error-color: #e0526a;
+
+  --warning-bg: rgba(217, 119, 6, 0.14);
+  --warning-border: rgba(217, 119, 6, 0.3);
+  --success-badge-bg: rgba(16, 185, 129, 0.14);
+  --success-badge-text: #067a5b;
+  --success-badge-border: rgba(16, 185, 129, 0.32);
+  --failure-badge-bg: rgba(224, 82, 106, 0.14);
+  --failure-badge-text: #b03a52;
+  --failure-badge-border: rgba(224, 82, 106, 0.32);
+  --count-badge-bg: rgba(124, 108, 240, 0.16);
+
+  --shadow: 0 10px 30px rgba(90, 80, 140, 0.16);
+  --shadow-lg: 0 24px 60px rgba(90, 80, 140, 0.22);
+  --amber-color: #d97706;
+  --amber-text: #92400e;
+  --viz-success: #10b981;
+  --viz-failure: #e0526a;
+
+  --glass-bg: rgba(255, 255, 255, 0.68);
+  --glass-bg-secondary: rgba(255, 255, 255, 0.5);
+  --glass-border: rgba(124, 108, 240, 0.18);
+
+  // 极光专用
+  --bg-base-1: #fbfaff;
+  --bg-base-2: #eef0ff;
+  --aurora-1: rgba(253, 164, 175, 0.5);
+  --aurora-2: rgba(147, 197, 253, 0.45);
+  --aurora-3: rgba(196, 181, 253, 0.5);
+  --glow: rgba(124, 108, 240, 0.35);
+}
+
+// 极光表面：渐变极光背景 + 磨砂玻璃（仅极光主题生效）
+[data-theme^='aurora-'] body {
+  background:
+    radial-gradient(42% 55% at 18% 12%, var(--aurora-1), transparent 62%),
+    radial-gradient(46% 52% at 82% 8%, var(--aurora-2), transparent 60%),
+    radial-gradient(52% 60% at 68% 88%, var(--aurora-3), transparent 62%),
+    linear-gradient(160deg, var(--bg-base-1), var(--bg-base-2));
+  background-attachment: fixed;
+}
+
+[data-theme^='aurora-'] .layout-tower {
+  background: transparent;
+}
+
+[data-theme^='aurora-'] .card,
+[data-theme^='aurora-'] .sidebar {
+  background: var(--glass-bg);
+  border-color: var(--glass-border);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.3);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.3);
+}
+
+@media (max-width: 768px),
+  (prefers-reduced-motion: reduce),
+  (prefers-reduced-transparency: reduce) {
+  :root {
+    --glass-backdrop-filter: none;
+    --glass-filter: none;
+    --glass-bg: var(--bg-primary);
+    --glass-bg-secondary: var(--bg-secondary);
+    --glass-border: var(--border-color);
+  }
+}

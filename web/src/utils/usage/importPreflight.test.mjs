@@ -1,0 +1,843 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import * as esbuild from 'esbuild';
+
+const importTypeScriptModule = async (url) => {
+  const compiled = await esbuild.build({ entryPoints: [url.pathname], bundle: true, format: 'esm', platform: 'node', write: false, target: 'es2020' });
+  return import(`data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].contents).toString('base64')}`);
+};
+
+const { analyzeUsageImport } = await importTypeScriptModule(
+  new URL('./importPreflight.ts', import.meta.url)
+);
+const {
+  decodeUsageImportReceipt,
+  getUsageImportErrorCode,
+  getUsageImportErrorTranslationKey,
+  isMigratedV1UsageImportReceipt,
+  isMigratedV2UsageImportReceipt,
+  USAGE_IMPORT_ERROR_CODES,
+} = await importTypeScriptModule(
+  new URL('../../services/api/usageImportContract.ts', import.meta.url)
+);
+
+const detail = (tokens, overrides = {}) => ({
+  timestamp: '2026-07-10T12:00:00.123456789Z',
+  latency_ms: 10,
+  ttfb_ms: 3,
+  source: 'auths/codex.json',
+  auth_index: '0',
+  tokens,
+  failed: false,
+  generate: true,
+  ...overrides,
+});
+
+const v1Tokens = (overrides = {}) => ({
+  input_tokens: 10,
+  output_tokens: 1,
+  reasoning_tokens: 0,
+  cached_tokens: 0,
+  total_tokens: 11,
+  ...overrides,
+});
+
+const v2Tokens = (overrides = {}) => ({
+  input_tokens: 12,
+  output_tokens: 2,
+  reasoning_tokens: 0,
+  cached_tokens: 3,
+  cache_read_tokens: 3,
+  total_tokens: 14,
+  ...overrides,
+});
+
+const v1PayloadForModel = (modelName, ...details) => ({
+  version: 1,
+  usage: {
+    apis: {
+      'POST /v1/responses': {
+        models: {
+          [modelName]: { details },
+        },
+      },
+    },
+  },
+});
+
+const v1Payload = (...details) => v1PayloadForModel('gpt-5.6-sol', ...details);
+
+const v2PayloadForModel = (modelName, ...details) => {
+  const totalTokens = details.reduce((total, item) => total + item.tokens.total_tokens, 0);
+  return {
+    version: 2,
+    usage: {
+      total_requests: details.length,
+      success_count: details.length,
+      failure_count: 0,
+      total_tokens: totalTokens,
+      apis: {
+        'POST /v1/responses': {
+          total_requests: details.length,
+          total_tokens: totalTokens,
+          models: {
+            [modelName]: {
+              total_requests: details.length,
+              total_tokens: totalTokens,
+              details,
+            },
+          },
+        },
+      },
+      requests_by_day: { '2026-07-10': details.length },
+      requests_by_hour: { 12: details.length },
+      tokens_by_day: { '2026-07-10': totalTokens },
+      tokens_by_hour: { 12: totalTokens },
+    },
+  };
+};
+
+const v2Payload = (...details) => v2PayloadForModel('gpt-5.6-sol', ...details);
+
+const v3Payload = (...details) => ({
+  ...v2PayloadForModel('gpt-5.6-sol', ...details),
+  version: 3,
+});
+
+const clone = (value) => JSON.parse(JSON.stringify(value));
+
+test('accepts canonical v2 and rejects unsupported or malformed envelopes', () => {
+  assert.equal(
+    analyzeUsageImport(
+      v2Payload(
+        detail(v2Tokens(), {
+          request_service_tier: 'priority',
+          outbound_service_tier: 'standard',
+          effective_service_tier: 'standard',
+        })
+      )
+    ).valid,
+    true
+  );
+
+  const cases = [
+    [null, 'usage_shape_invalid'],
+    [{ usage: { apis: {} } }, 'usage_version_unsupported'],
+    [{ version: 0, usage: { apis: {} } }, 'usage_version_unsupported'],
+    [{ version: 4, usage: { apis: {} } }, 'usage_version_unsupported'],
+    [{ version: '2', usage: { apis: {} } }, 'usage_shape_invalid'],
+    [{ version: 2 }, 'usage_shape_invalid'],
+    [{ version: 2, usage: [] }, 'usage_shape_invalid'],
+  ];
+
+  for (const [payload, issue] of cases) {
+    const result = analyzeUsageImport(payload);
+    assert.equal(result.valid, false);
+    assert.deepEqual(result.issues, [issue]);
+  }
+});
+
+test('accepts canonical v3 timing fields and rejects legacy semantic timing', () => {
+  const semanticDetail = detail(v2Tokens(), {
+    latency_ms: 2_000,
+    timing_version: 1,
+    ttfb_ms: 500,
+    ttft_ms: 900,
+    ttfa_ms: 1_500,
+  });
+  assert.equal(analyzeUsageImport(v3Payload(semanticDetail)).valid, true);
+
+  const missingTTFB = clone(v3Payload(semanticDetail));
+  delete missingTTFB.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details[0].ttfb_ms;
+  assert.deepEqual(analyzeUsageImport(missingTTFB).issues, ['usage_v3_timing_contract_invalid']);
+
+  const legacyV2Semantic = v2Payload(
+    detail(v2Tokens(), {
+      latency_ms: 2_000,
+      timing_version: 1,
+      ttft_ms: 900,
+    })
+  );
+  assert.deepEqual(analyzeUsageImport(legacyV2Semantic).issues, [
+    'usage_v2_timing_semantics_ambiguous',
+  ]);
+
+  for (const version of [1, 2]) {
+    const legacyNegativeLatency = version === 1 ? v1Payload(detail(v1Tokens())) : v2Payload(detail(v2Tokens()));
+    legacyNegativeLatency.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details[0].latency_ms = -1;
+    assert.deepEqual(analyzeUsageImport(legacyNegativeLatency).issues, ['usage_shape_invalid']);
+  }
+  const v3NegativeLatency = v3Payload(detail(v2Tokens(), { latency_ms: -1 }));
+  assert.deepEqual(analyzeUsageImport(v3NegativeLatency).issues, [
+    'usage_v3_timing_contract_invalid',
+  ]);
+});
+
+test('rejects malformed nested containers and known field types', () => {
+  const mutations = [
+    (payload) => (payload.usage.apis = []),
+    (payload) => (payload.usage.apis = null),
+    (payload) => (payload.usage.apis['POST /v1/responses'] = []),
+    (payload) => (payload.usage.apis['POST /v1/responses'] = null),
+    (payload) => (payload.usage.apis['POST /v1/responses'].models = []),
+    (payload) => (payload.usage.apis['POST /v1/responses'].models = null),
+    (payload) => (payload.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'] = []),
+    (payload) => (payload.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'] = null),
+    (payload) => (payload.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details = {}),
+    (payload) => (payload.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details = null),
+    (payload) => (payload.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details[0] = []),
+    (payload) => (payload.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details[0] = null),
+    (payload) =>
+      (payload.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details[0].tokens = []),
+    (payload) =>
+      (payload.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details[0].source = 7),
+    (payload) =>
+      (payload.usage.apis['POST /v1/responses'].models[
+        'gpt-5.6-sol'
+      ].details[0].outbound_service_tier = 7),
+    (payload) =>
+      (payload.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details[0].ttfb_ms = '3'),
+    (payload) =>
+      (payload.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details[0].failed = 'false'),
+    (payload) => (payload.usage.requests_by_day = []),
+    (payload) => (payload.usage.requests_by_day = null),
+    (payload) => (payload.usage.tokens_by_hour['12'] = '14'),
+  ];
+
+  for (const mutate of mutations) {
+    const payload = v2Payload(detail(v2Tokens()));
+    mutate(payload);
+    assert.deepEqual(analyzeUsageImport(payload).issues, ['usage_shape_invalid']);
+  }
+});
+
+test('v2 requires all non-omitempty token fields with strict integer types', () => {
+  for (const field of [
+    'input_tokens',
+    'output_tokens',
+    'reasoning_tokens',
+    'cached_tokens',
+    'total_tokens',
+  ]) {
+    const payload = v2Payload(detail(v2Tokens()));
+    delete payload.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details[0].tokens[field];
+    assert.deepEqual(analyzeUsageImport(payload).issues, ['usage_v2_token_contract_invalid']);
+  }
+
+  for (const invalidValue of [null, '1', -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    const result = analyzeUsageImport(v2Payload(detail(v2Tokens({ input_tokens: invalidValue }))));
+    assert.deepEqual(result.issues, ['usage_v2_token_contract_invalid']);
+  }
+
+  for (const missingTokensValue of [undefined, null]) {
+    const payload = v2Payload(detail(v2Tokens()));
+    const importedDetail =
+      payload.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details[0];
+    if (missingTokensValue === undefined) delete importedDetail.tokens;
+    else importedDetail.tokens = missingTokensValue;
+    assert.deepEqual(analyzeUsageImport(payload).issues, ['usage_v2_token_contract_invalid']);
+  }
+
+  const emptyTokens = v2Payload(detail(v2Tokens()));
+  emptyTokens.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details[0].tokens = {};
+  assert.deepEqual(analyzeUsageImport(emptyTokens).issues, ['usage_v2_token_contract_invalid']);
+});
+
+test('v2 enforces canonical cache mirrors, input coverage, totals, and retired-field rejection', () => {
+  const invalidTokens = [
+    { cached_tokens: 3, cache_read_tokens: 0 },
+    { input_tokens: 3, cached_tokens: 3, cache_read_tokens: 3, cache_creation_tokens: 1 },
+    { input_tokens: 12, output_tokens: 3, total_tokens: 14 },
+    { input_tokens: 0, output_tokens: 0, reasoning_tokens: 1, cached_tokens: 0, total_tokens: 0 },
+    {
+      input_tokens: Number.MAX_SAFE_INTEGER,
+      output_tokens: 1,
+      cached_tokens: 0,
+      cache_read_tokens: 0,
+      total_tokens: Number.MAX_SAFE_INTEGER,
+    },
+    {
+      input_tokens: Number.MAX_SAFE_INTEGER,
+      output_tokens: 0,
+      cached_tokens: Number.MAX_SAFE_INTEGER,
+      cache_read_tokens: Number.MAX_SAFE_INTEGER,
+      cache_creation_tokens: 1,
+      total_tokens: Number.MAX_SAFE_INTEGER,
+    },
+    { uncached_input_tokens: 9 },
+  ];
+
+  for (const overrides of invalidTokens) {
+    assert.deepEqual(analyzeUsageImport(v2Payload(detail(v2Tokens(overrides)))).issues, [
+      'usage_v2_token_contract_invalid',
+    ]);
+  }
+});
+
+test('v1 safe matrix accepts markerless no-cache details and rejects markerless cache ambiguity', () => {
+  assert.equal(analyzeUsageImport(v1Payload(detail(v1Tokens()))).valid, true);
+
+  for (const cacheTokens of [
+    { cached_tokens: 1 },
+    { cache_read_tokens: 1, cached_tokens: 1 },
+    { cache_creation_tokens: 1 },
+  ]) {
+    const result = analyzeUsageImport(v1Payload(detail(v1Tokens(cacheTokens))));
+    assert.equal(result.valid, false);
+    assert.deepEqual(result.issues, ['usage_v1_cache_semantics_ambiguous']);
+  }
+});
+
+test('v1 treats omitted legacy zero reasoning and cached fields as zero', () => {
+  const markerless = analyzeUsageImport(
+    v1Payload(detail({ input_tokens: 10, output_tokens: 1, total_tokens: 11 }))
+  );
+  assert.equal(markerless.valid, true);
+
+  const markerBearing = v1PayloadForModel(
+    'claude-sonnet-4-5',
+    detail(
+      {
+        input_tokens: 3085,
+        output_tokens: 253,
+        cache_read_tokens: 7,
+        cache_creation_tokens: 19514,
+        uncached_input_tokens: 3085,
+        total_tokens: 22859,
+      },
+      { source: 'auths/claude.json' }
+    )
+  );
+  const canonicalCurrent = v2PayloadForModel(
+    'claude-sonnet-4-5',
+    detail(
+      v2Tokens({
+        input_tokens: 22606,
+        output_tokens: 253,
+        cached_tokens: 7,
+        cache_read_tokens: 7,
+        cache_creation_tokens: 19514,
+        total_tokens: 22859,
+      }),
+      { source: 'auths/claude.json' }
+    )
+  ).usage;
+  const projected = analyzeUsageImport(markerBearing, canonicalCurrent);
+  assert.equal(projected.valid, true);
+  assert.equal(projected.overlapCount, 1);
+});
+
+test('v1 validates legacy required fields and uncached marker bounds before canonical migration', () => {
+  const valid = analyzeUsageImport(
+    v1Payload(
+      detail(
+        v1Tokens({
+          input_tokens: 12,
+          output_tokens: 2,
+          cached_tokens: 3,
+          cache_read_tokens: 3,
+          uncached_input_tokens: 9,
+          total_tokens: 14,
+        })
+      )
+    )
+  );
+  assert.equal(valid.valid, true);
+
+  for (const marker of [null, '9', -1, 13, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    const result = analyzeUsageImport(
+      v1Payload(
+        detail(
+          v1Tokens({
+            input_tokens: 12,
+            cached_tokens: 3,
+            cache_read_tokens: 3,
+            uncached_input_tokens: marker,
+            total_tokens: 14,
+          })
+        )
+      )
+    );
+    assert.deepEqual(result.issues, ['usage_v1_token_contract_invalid']);
+  }
+
+  for (const field of ['input_tokens', 'output_tokens', 'total_tokens']) {
+    const missingField = v1Payload(detail(v1Tokens()));
+    delete missingField.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details[0].tokens[
+      field
+    ];
+    assert.deepEqual(analyzeUsageImport(missingField).issues, ['usage_v1_token_contract_invalid']);
+  }
+
+  for (const field of [
+    'reasoning_tokens',
+    'cached_tokens',
+    'cache_read_tokens',
+    'cache_creation_tokens',
+  ]) {
+    for (const invalid of [null, '0', -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      const invalidOptional = v1Payload(detail(v1Tokens({ [field]: invalid })));
+      assert.deepEqual(analyzeUsageImport(invalidOptional).issues, [
+        'usage_v1_token_contract_invalid',
+      ]);
+    }
+  }
+});
+
+test('v1 released marker fixtures project to the same canonical v2 identities', () => {
+  const cases = [
+    {
+      name: 'cache read',
+      legacy: {
+        input_tokens: 100,
+        output_tokens: 10,
+        uncached_input_tokens: 80,
+        cached_tokens: 20,
+        cache_read_tokens: 20,
+        total_tokens: 110,
+      },
+      canonical: {
+        input_tokens: 100,
+        output_tokens: 10,
+        cached_tokens: 20,
+        cache_read_tokens: 20,
+        total_tokens: 110,
+      },
+    },
+    {
+      name: 'cache creation alias',
+      legacy: {
+        input_tokens: 1_200,
+        output_tokens: 10,
+        uncached_input_tokens: 176,
+        cached_tokens: 1_024,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 1_024,
+        total_tokens: 1_210,
+      },
+      canonical: {
+        input_tokens: 1_200,
+        output_tokens: 10,
+        cached_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 1_024,
+        total_tokens: 1_210,
+      },
+    },
+    {
+      name: 'cache read and creation',
+      legacy: {
+        input_tokens: 100,
+        output_tokens: 10,
+        uncached_input_tokens: 70,
+        cached_tokens: 20,
+        cache_read_tokens: 20,
+        cache_creation_tokens: 10,
+        total_tokens: 110,
+      },
+      canonical: {
+        input_tokens: 100,
+        output_tokens: 10,
+        cached_tokens: 20,
+        cache_read_tokens: 20,
+        cache_creation_tokens: 10,
+        total_tokens: 110,
+      },
+    },
+    {
+      name: 'known zero',
+      legacy: {
+        input_tokens: 0,
+        output_tokens: 0,
+        uncached_input_tokens: 0,
+        cached_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        total_tokens: 0,
+      },
+      canonical: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        total_tokens: 0,
+      },
+    },
+  ];
+
+  for (const fixture of cases) {
+    const imported = v1Payload(detail(v1Tokens(fixture.legacy)));
+    const current = v2Payload(detail(v2Tokens(fixture.canonical))).usage;
+    const result = analyzeUsageImport(imported, current);
+    assert.equal(result.valid, true, fixture.name);
+    assert.equal(result.overlapCount, 1, fixture.name);
+  }
+});
+
+test('released Core v1 current usage projects to canonical v2 overlap identity', () => {
+  const releasedCurrent = v1Payload(
+    detail(
+      v1Tokens({
+        input_tokens: 3085,
+        output_tokens: 253,
+        cached_tokens: 7,
+        cache_read_tokens: 7,
+        cache_creation_tokens: 19514,
+        uncached_input_tokens: 3085,
+        total_tokens: 22859,
+      })
+    )
+  ).usage;
+  const candidateImport = v2Payload(
+    detail(
+      v2Tokens({
+        input_tokens: 22606,
+        output_tokens: 253,
+        cached_tokens: 7,
+        cache_read_tokens: 7,
+        cache_creation_tokens: 19514,
+        total_tokens: 22859,
+      })
+    )
+  );
+
+  const result = analyzeUsageImport(candidateImport, releasedCurrent);
+  assert.equal(result.valid, true);
+  assert.equal(result.currentUsageAvailable, true);
+  assert.equal(result.overlapCount, 1);
+});
+
+test('v1 migration recognizes the released cache-creation alias without double counting', () => {
+  const imported = v1Payload(
+    detail(
+      v1Tokens({
+        input_tokens: 1_200,
+        output_tokens: 10,
+        uncached_input_tokens: 176,
+        cached_tokens: 1_024,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 1_024,
+        total_tokens: 1_210,
+      })
+    )
+  );
+  const current = v2Payload(
+    detail(
+      v2Tokens({
+        input_tokens: 1_200,
+        output_tokens: 10,
+        cached_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 1_024,
+        total_tokens: 1_210,
+      })
+    )
+  ).usage;
+
+  const result = analyzeUsageImport(imported, current);
+  assert.equal(result.valid, true);
+  assert.equal(result.overlapCount, 1);
+});
+
+test('missing timestamps remain legacy-compatible while invalid timestamps fail shape validation', () => {
+  const missingV1 = v1Payload(detail(v1Tokens()));
+  delete missingV1.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details[0].timestamp;
+  assert.equal(analyzeUsageImport(missingV1).valid, true);
+
+  const missingV2 = v2Payload(detail(v2Tokens()));
+  delete missingV2.usage.apis['POST /v1/responses'].models['gpt-5.6-sol'].details[0].timestamp;
+  assert.equal(analyzeUsageImport(missingV2).valid, true);
+
+  for (const invalidTimestamp of ['not-a-timestamp', '2026-02-30T12:00:00Z']) {
+    assert.deepEqual(
+      analyzeUsageImport(v1Payload(detail(v1Tokens(), { timestamp: invalidTimestamp }))).issues,
+      ['usage_shape_invalid']
+    );
+    assert.deepEqual(
+      analyzeUsageImport(v2Payload(detail(v2Tokens(), { timestamp: invalidTimestamp }))).issues,
+      ['usage_shape_invalid']
+    );
+  }
+  assert.deepEqual(analyzeUsageImport(v1Payload(detail(v1Tokens(), { timestamp: 7 }))).issues, [
+    'usage_shape_invalid',
+  ]);
+});
+
+test('canonical identity mirrors v1 migration and RFC3339 UTC normalization', () => {
+  const first = detail(
+    v1Tokens({
+      input_tokens: 12,
+      output_tokens: 2,
+      cached_tokens: 3,
+      uncached_input_tokens: 9,
+      total_tokens: 14,
+    }),
+    { timestamp: '2026-07-10T20:00:00.123456789+08:00' }
+  );
+  const second = detail(
+    v1Tokens({
+      input_tokens: 10,
+      output_tokens: 2,
+      cached_tokens: 3,
+      uncached_input_tokens: 9,
+      total_tokens: 14,
+    }),
+    { timestamp: '2026-07-10T12:00:00.123456789Z' }
+  );
+  const current = v2Payload(detail(v2Tokens())).usage;
+
+  const result = analyzeUsageImport(v1Payload(first, second), current);
+  assert.equal(result.valid, true);
+  assert.equal(result.duplicateCount, 1);
+  assert.equal(result.overlapCount, 1);
+});
+
+test('missing, null, and Go zero timestamps are uncertain and excluded from identity checks', () => {
+  const missing = detail(v1Tokens());
+  delete missing.timestamp;
+  const nullTimestamp = detail(v1Tokens(), { timestamp: null });
+  const goZeroTimestamp = detail(v1Tokens(), { timestamp: '0001-01-01T00:00:00Z' });
+
+  const result = analyzeUsageImport(
+    v1Payload(missing, nullTimestamp, goZeroTimestamp),
+    v2Payload(detail(v2Tokens())).usage
+  );
+  assert.equal(result.valid, true);
+  assert.equal(result.uncertainIdentityCount, 3);
+  assert.equal(result.duplicateCount, 0);
+  assert.equal(result.overlapCount, 0);
+});
+
+test('RFC3339 fractional seconds mirror Go RFC3339Nano identity normalization', () => {
+  const wholeSecond = detail(v1Tokens(), { timestamp: '2026-07-10T12:00:00Z' });
+  const zeroFraction = detail(v1Tokens(), { timestamp: '2026-07-10T12:00:00.000Z' });
+  const nanoseconds = detail(v1Tokens(), { timestamp: '2026-07-10T12:00:01.123456789Z' });
+  const beyondNanoseconds = detail(v1Tokens(), {
+    timestamp: '2026-07-10T12:00:01.1234567899Z',
+  });
+  const zeroTimeWithFraction = detail(v1Tokens(), {
+    timestamp: '0001-01-01T00:00:00.000Z',
+  });
+
+  const result = analyzeUsageImport(
+    v1Payload(wholeSecond, zeroFraction, nanoseconds, beyondNanoseconds, zeroTimeWithFraction)
+  );
+  assert.equal(result.valid, true);
+  assert.equal(result.duplicateCount, 2);
+  assert.equal(result.uncertainIdentityCount, 1);
+});
+
+test('v1 canonical projection fails closed when its token sum is not safely representable', () => {
+  const result = analyzeUsageImport(
+    v1Payload(
+      detail(
+        v1Tokens({
+          input_tokens: Number.MAX_SAFE_INTEGER,
+          output_tokens: 0,
+          uncached_input_tokens: Number.MAX_SAFE_INTEGER,
+          cached_tokens: 1,
+          cache_read_tokens: 1,
+          total_tokens: Number.MAX_SAFE_INTEGER,
+        })
+      )
+    )
+  );
+
+  assert.equal(result.valid, false);
+  assert.deepEqual(result.issues, ['usage_v1_token_contract_invalid']);
+});
+
+test('preflight analysis never mutates the uploaded snapshot', () => {
+  const payload = v1Payload(
+    detail(
+      v1Tokens({
+        input_tokens: 12,
+        output_tokens: 2,
+        cached_tokens: 3,
+        uncached_input_tokens: 9,
+        total_tokens: 14,
+      })
+    )
+  );
+  const before = clone(payload);
+
+  analyzeUsageImport(payload, v2Payload(detail(v2Tokens())).usage);
+
+  assert.deepEqual(payload, before);
+});
+
+test('receipt decoder is strict on known fields and ignores unknown additions', () => {
+  const decoded = decodeUsageImportReceipt({
+    added: 1,
+    skipped: 2,
+    total_requests: 7,
+    failed_requests: 1,
+    schema_version: 2,
+    migrated_from_version: 1,
+    migration: 'v1_uncached_input_tokens_to_v2',
+    future_receipt_field: { retained_by_core: true },
+  });
+
+  assert.deepEqual(decoded, {
+    added: 1,
+    skipped: 2,
+    total_requests: 7,
+    failed_requests: 1,
+    schema_version: 2,
+    migrated_from_version: 1,
+    migration: 'v1_uncached_input_tokens_to_v2',
+  });
+  assert.equal(isMigratedV1UsageImportReceipt(decoded), true);
+
+  const migratedV3 = decodeUsageImportReceipt({
+    added: 1,
+    skipped: 0,
+    total_requests: 1,
+    failed_requests: 0,
+    schema_version: 3,
+    migrated_from_version: 2,
+    migrations: ['v2_timing_contract_to_v3'],
+  });
+  assert.equal(isMigratedV2UsageImportReceipt(migratedV3), true);
+
+  const releasedCoreReceipt = decodeUsageImportReceipt({
+    added: 1,
+    skipped: 0,
+    total_requests: 1,
+    failed_requests: 0,
+    released_core_extension: true,
+  });
+  assert.deepEqual(releasedCoreReceipt, {
+    added: 1,
+    skipped: 0,
+    total_requests: 1,
+    failed_requests: 0,
+  });
+  assert.equal(isMigratedV1UsageImportReceipt(releasedCoreReceipt), false);
+
+  assert.equal(
+    decodeUsageImportReceipt({
+      added: 1,
+      skipped: 0,
+      total_requests: 1,
+      failed_requests: 0,
+      schema_version: 1,
+    }),
+    null
+  );
+  assert.equal(
+    decodeUsageImportReceipt({
+      added: 1,
+      skipped: 0,
+      total_requests: 1,
+      failed_requests: 0,
+      schema_version: 2,
+      migrated_from_version: 1,
+    }),
+    null
+  );
+  assert.equal(
+    decodeUsageImportReceipt({
+      added: 1,
+      skipped: 0,
+      total_requests: 1,
+      failed_requests: 0,
+      migrated_from_version: 1,
+      migration: 'v1_uncached_input_tokens_to_v2',
+    }),
+    null
+  );
+});
+
+test('stable Core error decoder recognizes all approved top-level codes', () => {
+  assert.deepEqual(USAGE_IMPORT_ERROR_CODES, [
+    'usage_version_unsupported',
+    'usage_shape_invalid',
+    'usage_v1_token_contract_invalid',
+    'usage_v1_cache_semantics_ambiguous',
+    'usage_v2_token_contract_invalid',
+    'usage_v1_timing_semantics_ambiguous',
+    'usage_v2_timing_semantics_ambiguous',
+    'usage_v3_token_contract_invalid',
+    'usage_v3_timing_contract_invalid',
+    'usage_aggregate_overflow',
+  ]);
+
+  for (const code of USAGE_IMPORT_ERROR_CODES) {
+    assert.equal(getUsageImportErrorCode({ data: { error: 'localized by Panel', code } }), code);
+    assert.equal(getUsageImportErrorCode({ details: { code } }), code);
+    assert.equal(getUsageImportErrorTranslationKey(code), `usage_stats.import_error_${code}`);
+  }
+  assert.equal(getUsageImportErrorCode({ data: { code: 'future_usage_error' } }), null);
+  assert.equal(getUsageImportErrorCode({ code: 'ERR_BAD_REQUEST' }), null);
+});
+
+
+test('accepts optional response cyber program without requiring it on legacy rows', () => {
+  for (const program of ['daybreak_blue', 'standard', 'unknown', undefined]) {
+    const result = analyzeUsageImport(clone(v3Payload(detail(v2Tokens(), {
+      response_cyber_program: program,
+      ttfb_ms: undefined,
+    }))));
+    assert.equal(result.valid, true, JSON.stringify({ program, issues: result.issues }));
+  }
+  assert.equal(analyzeUsageImport(v3Payload(detail(v2Tokens(), {
+    response_cyber_program: 42,
+  }))).valid, false);
+});
+
+test('accepts Core request size fields and rejects only types Core cannot decode', () => {
+  const sized = detail(v2Tokens(), {
+    trace_id: 'abc123',
+    size_version: 1,
+    client_request_bytes: 1_080_429,
+    upstream_transport: 'websocket',
+    upstream_request_bytes: 1_080_631,
+    upstream_request_wire_bytes: 1_080_631,
+    upstream_request_encoding: 'zstd',
+    upstream_response_bytes: 8_135,
+  });
+  assert.equal(analyzeUsageImport(v3Payload(sized)).valid, true);
+  // Unknown versions and negative byte counts are dropped or clamped by Core, not rejected.
+  assert.equal(analyzeUsageImport(v3Payload(detail(v2Tokens(), { size_version: 2 }))).valid, true);
+  assert.equal(
+    analyzeUsageImport(v3Payload(detail(v2Tokens(), { size_version: 1, upstream_request_bytes: -5 }))).valid,
+    true
+  );
+
+  for (const overrides of [
+    { size_version: -1 },
+    { size_version: '1' },
+    { upstream_request_bytes: 1.5 },
+    { upstream_response_bytes: '10' },
+    { upstream_transport: 1 },
+    { trace_id: 7 },
+  ]) {
+    assert.deepEqual(analyzeUsageImport(v3Payload(detail(v2Tokens(), overrides))).issues, [
+      'usage_shape_invalid',
+    ]);
+  }
+});
+
+test('validates optional output window metadata without accepting it as legacy timing', () => {
+  const measured = { version: 1, streamed: true, duration_ms: 200 };
+  const row = detail(v2Tokens(), { latency_ms: 1000, ttfb_ms: 100, timing_version: 1, output_timing: measured });
+  assert.equal(analyzeUsageImport(v3Payload(row)).valid, true);
+  for (const output_timing of [null, {}, { version: 1, streamed: false, duration_ms: 0 }, { version: 1, streamed: true, duration_ms: 901 }, { version: 1, streamed: true, duration_ms: 1.5 }]) {
+    assert.deepEqual(analyzeUsageImport(v3Payload({ ...row, output_timing })).issues, ['usage_v3_timing_contract_invalid']);
+  }
+  assert.deepEqual(analyzeUsageImport(v2Payload({ ...row, timing_version: undefined })).issues, ['usage_v2_timing_semantics_ambiguous']);
+});
+
+test('validates canonical output accounting and raw-counter correspondence', () => {
+  const token_breakdown = { schema_version: 2, quality: 'complete', total_tokens: 150, unclassified_tokens: 0, input: { total_tokens: 10, uncached_tokens: 10, cache_read_tokens: 0, cache_write_tokens: 0 }, output: { total_tokens: 140, non_reasoning_tokens: 100, reasoning_tokens: 40 } };
+  const row = detail(v2Tokens({ input_tokens: 10, output_tokens: 100, reasoning_tokens: 40, cached_tokens: 0, cache_read_tokens: 0, total_tokens: 150 }), { token_breakdown });
+  assert.equal(analyzeUsageImport(v3Payload(row)).valid, true);
+  for (const b of [null, {}, { ...token_breakdown, quality: 'guess' }, { ...token_breakdown, output: { ...token_breakdown.output, total_tokens: 141 } }]) {
+    assert.deepEqual(analyzeUsageImport(v3Payload({ ...row, token_breakdown: b })).issues, ['usage_v3_token_contract_invalid']);
+  }
+  assert.deepEqual(analyzeUsageImport(v3Payload({ ...row, tokens: { ...row.tokens, output_tokens: 60 } })).issues, ['usage_v3_token_contract_invalid']);
+  assert.deepEqual(analyzeUsageImport(v3Payload({ ...row, tokens: { ...row.tokens, input_tokens: 20 } })).issues, ['usage_v3_token_contract_invalid']);
+  assert.deepEqual(analyzeUsageImport(v2Payload(row)).issues, ['usage_v2_token_contract_invalid']);
+});

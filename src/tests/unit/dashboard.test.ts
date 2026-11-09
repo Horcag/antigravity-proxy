@@ -1,5 +1,4 @@
 import 'reflect-metadata';
-import { Script } from 'node:vm';
 import { Module } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, type NestFastifyApplication } from '@nestjs/platform-fastify';
@@ -31,10 +30,10 @@ describe('private dashboard', () => {
       const page = await server.inject({ url: '/dashboard' });
       expect(page.statusCode).toBe(200);
       expect(page.headers['cache-control']).toBe('no-store');
-      expect(page.body).toContain('type="password"');
-      expect(page.body).toContain('Authorization:');
-      expect(() => new Script(page.body.match(/<script>([\s\S]*?)<\/script>/)![1])).not.toThrow();
-      expect(page.body).not.toMatch(/localStorage|sessionStorage|proxy-secret|admin-secret/);
+      expect(page.body).toMatch(/id=["']?root/);
+      expect(page.body).toContain('<script type="module"');
+      expect(page.headers['content-security-policy']).toContain("connect-src 'self'");
+      expect(page.body).not.toMatch(/proxy-secret|admin-secret/);
       expect((await server.inject({ url: '/admin/dashboard' })).statusCode).toBe(401);
       expect((await server.inject({ url: '/admin/dashboard', headers: { authorization: 'Bearer proxy-secret' } })).statusCode).toBe(401);
       const result = await server.inject({ url: '/admin/dashboard', headers: { authorization: 'Bearer admin-secret' } });

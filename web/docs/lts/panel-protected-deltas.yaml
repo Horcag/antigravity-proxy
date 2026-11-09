@@ -1,0 +1,128 @@
+maintenance_model:
+  type: protected-selective-port
+  product_branch: main
+  upstream_source: router-for-me/Cli-Proxy-API-Management-Center main
+  paired_core: BlueSkyXN/CPA-Core-LTS main
+  release_asset: management.html
+
+protected_deltas:
+  - id: codex-cache-affinity-config
+    reason: Core-owned cache optimization controls must explain user choices without changing private sessions or promising cache hits.
+    must_keep:
+      - codex.cache-affinity.strategy visual and YAML roundtrip
+      - three modes with descriptions in all four LTS locale overlays
+      - absent strategy stays absent until the user edits it
+      - unknown strategies and sibling YAML fields survive unrelated saves
+      - only ChatGPT sign-in Codex scope; API key connections unaffected
+      - disabling enhanced optimization does not disable upstream caching
+      - independent from abnormal reasoning retry activation
+  - id: multi-instance-connections
+    reason: Instance selection remains available without an authenticated business workspace.
+    must_keep:
+      - shared connection profiles with per-profile credential opt-in
+      - independent tab-local active sessions and bounded one-shot credential handoff
+      - isolated target probe; failed target preserves the current instance and drafts
+      - independent same-origin frame runtimes isolate each instance client, stores and authentication
+      - switching connected instances preserves mounted drafts without replacing the global client
+      - dirty and busy checks before disconnect; paused flow observation in hidden instances
+      - credentials never enter navigation URLs; bounded parent-to-frame credential handoff
+      - full usage and global pricing semantics unchanged
+  - id: full-usage-statistics-ui
+    reason: CPA-Panel-LTS exists to preserve the full usage statistics UI after upstream moved toward recent requests and API-key summaries.
+    must_keep:
+      - /usage route
+      - UsagePage
+      - complete usage components
+      - usage API client
+      - usage Zustand store
+      - usage aggregation utilities
+      - import/export
+      - canonical version 3 usage export compatibility
+      - safe version 1 migration, including omitted legacy zero fields and fail-closed cache ambiguity
+      - Core-compatible duplicate and overlap identity with uncertain-record disclosure
+      - invalid canonical token rejection before upload
+      - request events table
+      - derived first-content timing without redefining canonical Core fields
+      - model/API/credential breakdowns
+      - cached/reasoning token breakdown
+      - local model price settings
+  - id: cpa-core-lts-management-api-compatibility
+    reason: The panel is shipped as the management UI for CPA-Core-LTS.
+    must_keep:
+      - /v0/management/usage
+      - /v0/management/usage/export
+      - /v0/management/usage/import
+      - usage-statistics-enabled config visibility
+      - auth file/provider status surfaces backed by complete usage details (Workbench resource table, auth-index attribution)
+      - v8-only pairing - apiClient on /v8/management with If-Match from the same read for every config write; LTS extensions on /v0/management via the shared ltsExtensionClient
+      - auth_index/auth-index injected by Core v8 GET /config are read for attribution and stripped before writes
+  - id: panel-release-contract
+    reason: CPA-Core-LTS downloads the latest panel release asset by exact name.
+    must_keep:
+      - release asset named management.html
+      - npm/package-lock based build
+      - v*-lts-* release tag guard
+      - release source resolves to the exact requested tag commit
+  - id: local-downstream-customizations
+    reason: This repository contains downstream panel work that is not present upstream.
+    must_keep:
+      - CPA-Panel-LTS documentation and release links
+      - Panel built-in Codex quota/cloud UI unless intentionally replaced
+      - Codex remote cloud connect environment UI unless intentionally replaced
+      - visual config support for codex.abnormal-reasoning-retry unless intentionally replaced
+      - commercial-neutral documentation and runtime UI with no referral incentives, paid placement, or empty-state provider recommendations
+      - local i18n and panel compatibility fixes
+      - Pure White default plus Aurora Nebula and Aurora Dawn themes; removed Paper/Dark/Auto/Mist values migrate to White
+      - Tower-only workspace shell, /core, Command Palette, and compact/classic navigation; removed layouts migrate to Tower
+  - id: local-flow-control-config
+    reason: The optional Core-owned Flow V3 surface must survive selective ports without replacing usage statistics or implementing a second admission algorithm in the browser.
+    must_keep:
+      - schema-version 3 capability gate and resolved-model-options feature gate
+      - disabled defaults for execution, realtime observation and resource sampling
+      - separate draft, configured policy and last successfully applied policy
+      - opaque caller and Auth references, explicit legacy migration, and unknown YAML/comment preservation
+      - /v0/management/flow-control read-only status, preview, migration-preview and paged details
+      - authenticated SSE with no management key in URLs and no automatic polling fallback
+      - actual producer lifetime owned by Core, not page visibility or observation switches
+      - src/lts/flowControl/ sidecar and four matching locale overlays
+      - separate /analytics/flow and /analytics/flow/config routes with login-time capability probe; /flow-control and /config?section=flow-control redirect to configuration; no flow domain inside the visual config editor
+
+upstream_boundaries:
+  baseline_tag: v1.8.4
+  baseline_commit: 8ed837c3d734c3970a6d6799c557bb6a6753360d
+  known_full_usage_retained_tag: v1.9.3
+  removal_start_commits:
+    - b25f722
+    - 632be0b
+  unsafe_upstream_directions:
+    - replacing complete usage statistics with recent requests only
+    - replacing complete usage statistics with API-key summaries only
+    - deleting src/components/usage
+    - deleting src/pages/UsagePage.tsx
+    - deleting src/services/api/usage.ts
+    - deleting src/stores/useUsageStatsStore.ts
+    - deleting src/utils/usage.ts
+    - deleting src/utils/usageIndex.ts
+
+sentinel_markers:
+  paths:
+    - src/router/MainRoutes.tsx
+    - src/pages/UsagePage.tsx
+    - src/pages/UsagePage.module.scss
+    - src/components/usage/
+    - src/services/api/usage.ts
+    - src/stores/useUsageStatsStore.ts
+    - src/types/usage.ts
+    - src/utils/usage.ts
+    - src/utils/usageIndex.ts
+    - src/utils/usage/
+    - .github/workflows/release.yml
+  strings:
+    - /usage
+    - /usage/export
+    - /usage/import
+    - usage-statistics-enabled
+    - CPA-Core-LTS
+    - management.html
+    - v*-lts-*
+    - full-usage-statistics-ui

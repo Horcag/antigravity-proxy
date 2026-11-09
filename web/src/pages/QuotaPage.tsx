@@ -1,0 +1,259 @@
+/**
+ * Quota management page - coordinates the six LTS quota sections.
+ */
+
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useSearchParams } from 'react-router-dom';
+import { useHeaderRefresh } from '@/hooks/useHeaderRefresh';
+import { useCountUp, useRevealGroup } from '@/hooks/motion';
+import { useAuthStore, useQuotaStore } from '@/stores';
+import { authFilesApi } from '@/services/api';
+import {
+  QuotaSection,
+  ANTIGRAVITY_CONFIG,
+  CLAUDE_CONFIG,
+  CODEX_CONFIG,
+  GEMINI_CLI_CONFIG,
+  KIMI_CONFIG,
+  XAI_CONFIG,
+  PLUGIN_CONFIG,
+  DEVIN_CONFIG,
+  META_CONFIG,
+} from '@/components/quota';
+import { ProviderTabs } from '@/features/authFiles/components/ProviderTabs';
+import type { QuotaProviderType } from '@/features/authFiles/constants';
+import type { AuthFileItem } from '@/types';
+import styles from './QuotaPage.module.scss';
+
+type QuotaTabId = 'all' | QuotaProviderType;
+
+const QUOTA_PROVIDERS = [
+  { id: 'claude', config: CLAUDE_CONFIG },
+  { id: 'antigravity', config: ANTIGRAVITY_CONFIG },
+  { id: 'codex', config: CODEX_CONFIG },
+  { id: 'xai', config: XAI_CONFIG },
+  { id: 'gemini-cli', config: GEMINI_CLI_CONFIG },
+  { id: 'kimi', config: KIMI_CONFIG },
+  { id: 'plugin', config: PLUGIN_CONFIG },
+  { id: 'devin', config: DEVIN_CONFIG },
+  { id: 'meta', config: META_CONFIG },
+] as const;
+
+const QUOTA_TAB_IDS: string[] = ['all', ...QUOTA_PROVIDERS.map(({ id }) => id)];
+
+export function QuotaPage() {
+  const { t } = useTranslation();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const connectionStatus = useAuthStore((state) => state.connectionStatus);
+
+  const [files, setFiles] = useState<AuthFileItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const requestedProvider = searchParams.get('provider')?.trim().toLowerCase() || '';
+  const normalizedRequestedProvider = requestedProvider === 'anthropic' ? 'claude' : requestedProvider;
+  const initialProvider = QUOTA_TAB_IDS.includes(normalizedRequestedProvider)
+    ? (normalizedRequestedProvider as QuotaTabId)
+    : 'all';
+  const [activeProvider, setActiveProvider] = useState<QuotaTabId>(initialProvider);
+
+  const antigravityQuota = useQuotaStore((state) => state.antigravityQuota);
+  const claudeQuota = useQuotaStore((state) => state.claudeQuota);
+  const codexQuota = useQuotaStore((state) => state.codexQuota);
+  const geminiCliQuota = useQuotaStore((state) => state.geminiCliQuota);
+  const devinQuota = useQuotaStore((state) => state.devinQuota);
+  const metaQuota = useQuotaStore((state) => state.metaQuota);
+  const kimiQuota = useQuotaStore((state) => state.kimiQuota);
+  const xaiQuota = useQuotaStore((state) => state.xaiQuota);
+
+  const revealRef = useRevealGroup<HTMLDivElement>();
+
+  const pluginSupported = useAuthStore((state) => state.pluginSupportKnown && state.supportsPlugin);
+  const pluginQuota = useQuotaStore((state) => state.pluginQuota);
+
+  const disableControls = connectionStatus !== 'connected';
+
+  const loadFiles = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const data = await authFilesApi.list();
+      setFiles(data?.files || []);
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : t('notification.refresh_failed');
+      setError(errorMessage);
+    } finally {
+      setLoading(false);
+    }
+  }, [t]);
+
+  useHeaderRefresh(loadFiles);
+
+  useEffect(() => {
+    loadFiles();
+  }, [loadFiles]);
+
+  useEffect(() => {
+    if (!QUOTA_TAB_IDS.includes(normalizedRequestedProvider)) return;
+    setActiveProvider(normalizedRequestedProvider as QuotaTabId);
+  }, [normalizedRequestedProvider]);
+
+  const handleProviderChange = useCallback(
+    (provider: string) => {
+      const nextProvider = QUOTA_TAB_IDS.includes(provider) ? (provider as QuotaTabId) : 'all';
+      setActiveProvider(nextProvider);
+      const nextParams = new URLSearchParams(searchParams);
+      if (nextProvider === 'all') nextParams.delete('provider');
+      else nextParams.set('provider', nextProvider);
+      setSearchParams(nextParams, { replace: true });
+    },
+    [searchParams, setSearchParams]
+  );
+
+  const providerCounts = useMemo(() => {
+    const counts: Record<string, number> = { all: 0 };
+    QUOTA_PROVIDERS.forEach(({ id, config }) => {
+      const count = id === 'plugin' && !pluginSupported ? 0 : files.filter((file) => config.filterFn(file)).length;
+      counts[id] = count;
+      counts.all += count;
+    });
+    return counts;
+  }, [files, pluginSupported]);
+
+  const quotaByProvider = useMemo(
+    () => ({
+      antigravity: antigravityQuota,
+      claude: claudeQuota,
+      codex: codexQuota,
+      'gemini-cli': geminiCliQuota,
+      kimi: kimiQuota,
+      xai: xaiQuota,
+      plugin: pluginQuota,
+      devin: devinQuota,
+      meta: metaQuota,
+    }),
+    [antigravityQuota, claudeQuota, codexQuota, geminiCliQuota, kimiQuota, xaiQuota, pluginQuota, devinQuota, metaQuota]
+  );
+
+  const { loadedCount, attentionCount } = useMemo(() => {
+    let loaded = 0;
+    let attention = 0;
+
+    QUOTA_PROVIDERS.forEach(({ id, config }) => {
+      files.filter((file) => config.filterFn(file)).forEach((file) => {
+        const status = quotaByProvider[id][file.name]?.status;
+        if (status === 'success') loaded += 1;
+        if (status === 'error') attention += 1;
+      });
+    });
+
+    return { loadedCount: loaded, attentionCount: attention };
+  }, [files, quotaByProvider]);
+
+  const displayLoadedCount = useCountUp(loadedCount);
+  const showProvider = (provider: QuotaProviderType) =>
+    providerCounts[provider] > 0 && (activeProvider === 'all' || activeProvider === provider);
+
+  return (
+    <div className={styles.container} ref={revealRef}>
+      <header className={styles.pageHeader}>
+        <h1 className={styles.pageTitle} data-reveal>
+          {t('quota_management.title')}
+        </h1>
+        <p className={styles.description} data-reveal>
+          {t('quota_management.description')}
+        </p>
+        <p className={styles.pageMeta} data-reveal>
+          <span className={styles.metaTotal}>
+            {t('quota_management.meta_credentials', { count: providerCounts.all })}
+          </span>
+          <span className={styles.metaDot} aria-hidden="true">
+            ·
+          </span>
+          <span className={loadedCount > 0 ? styles.metaLoaded : styles.metaMuted}>
+            {t('quota_management.meta_loaded', { count: displayLoadedCount })}
+          </span>
+          {attentionCount > 0 && (
+            <>
+              <span className={styles.metaDot} aria-hidden="true">
+                ·
+              </span>
+              <span className={styles.metaAttention}>
+                {t('quota_management.meta_attention', { count: attentionCount })}
+              </span>
+            </>
+          )}
+        </p>
+      </header>
+
+      <div className={styles.providerTabs} data-reveal>
+        <ProviderTabs
+          types={QUOTA_TAB_IDS}
+          counts={providerCounts}
+          active={activeProvider}
+          onChange={handleProviderChange}
+        />
+      </div>
+
+      {error && (
+        <div className={styles.errorBox} role="alert">
+          {error}
+        </div>
+      )}
+
+      <div hidden={!showProvider('claude')}>
+        <QuotaSection
+          config={CLAUDE_CONFIG}
+          files={files}
+          loading={loading}
+          disabled={disableControls}
+        />
+      </div>
+      <div hidden={!showProvider('antigravity')}>
+        <QuotaSection
+          config={ANTIGRAVITY_CONFIG}
+          files={files}
+          loading={loading}
+          disabled={disableControls}
+        />
+      </div>
+      <div hidden={!showProvider('codex')}>
+        <QuotaSection
+          config={CODEX_CONFIG}
+          files={files}
+          loading={loading}
+          disabled={disableControls}
+        />
+      </div>
+      <div hidden={!showProvider('xai')}>
+        <QuotaSection
+          config={XAI_CONFIG}
+          files={files}
+          loading={loading}
+          disabled={disableControls}
+        />
+      </div>
+      <div hidden={!showProvider('gemini-cli')}>
+        <QuotaSection
+          config={GEMINI_CLI_CONFIG}
+          files={files}
+          loading={loading}
+          disabled={disableControls}
+        />
+      </div>
+      {pluginSupported && <div hidden={!showProvider('plugin')}>
+        <QuotaSection config={PLUGIN_CONFIG} files={files} loading={loading} disabled={disableControls}/>
+      </div>}
+      <div hidden={!showProvider('devin')}><QuotaSection config={DEVIN_CONFIG} files={files} loading={loading} disabled={disableControls} /></div>
+      <div hidden={!showProvider('meta')}><QuotaSection config={META_CONFIG} files={files} loading={loading} disabled={disableControls} /></div>
+      <div hidden={!showProvider('kimi')}>
+        <QuotaSection
+          config={KIMI_CONFIG}
+          files={files}
+          loading={loading}
+          disabled={disableControls}
+        />
+      </div>
+    </div>
+  );
+}

@@ -1,3 +1,5 @@
+import { isPerformanceFailure } from './proxy-attempt-performance';
+import { observeUpstreamStreamFailure } from '../../../observability/request-context';
 import { createHash } from 'node:crypto';
 import { BadRequestException, HttpException, HttpStatus, Injectable, Logger, Inject } from '@nestjs/common';
 import { isEmpty, isFunction, isNil, isNumber, isPlainObject, isString } from 'lodash-es';
@@ -238,6 +240,7 @@ export class ProxyService {
           return;
         }
         hasRecordedFailure = true;
+        observeUpstreamStreamFailure(accountId, model);
         if (!hasMarkedSuccess) {
           this.recordPerformanceFailureForAttempt(accountId, model, error);
         }
@@ -286,20 +289,10 @@ export class ProxyService {
   }
 
   private recordPerformanceFailureForAttempt(accountId: string, model: string, error: unknown): void {
-    if (!this.isPerformanceFailure(error)) {
+    if (!isPerformanceFailure(error)) {
       return;
     }
     this.accountLeaseService.recordPerformanceFailure?.(accountId, model);
-  }
-
-  private isPerformanceFailure(error: unknown): boolean {
-    if (error instanceof BadRequestException || error instanceof OpenAIProtocolException) {
-      return false;
-    }
-    if (error instanceof Error) {
-      return error.name !== 'AbortError' && (error as { code?: unknown }).code !== 'ERR_CANCELED';
-    }
-    return false;
   }
 
   private recordBoundedStreamPenalty(accountId: string, model: string, error: unknown): void {

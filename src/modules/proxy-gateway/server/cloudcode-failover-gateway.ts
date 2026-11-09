@@ -1,3 +1,5 @@
+import { createRelayCompletionPromise } from './native-relay-completion';
+import { observeAttemptStart, observeAccountOutcome, observeUpstreamStreamFailure } from '../../../observability/request-context';
 import http from 'node:http';
 import http2 from 'node:http2';
 import https from 'node:https';
@@ -394,6 +396,8 @@ export class CloudCodeFailoverGateway {
           account && requestedModel && typeof this.accountLeaseService?.resolveDynamicModelForAccount === 'function'
             ? this.accountLeaseService.resolveDynamicModelForAccount(account.id, requestedModel)
             : requestedModel;
+        observeAttemptStart(account?.id, effectiveModel);
+        const attemptStartedAt = performance.now();
         const { urlPath: attemptUrlPath, headers: upstreamHeaders, payloadToSend } = composeAttemptRequest({
           rawBody, reqHeaders: req.headers, targetHost, method, urlPath,
           accessToken: account?.token?.access_token,
@@ -405,6 +409,7 @@ export class CloudCodeFailoverGateway {
         const handleFailureOutcome = async (
           failureEvidence: FailureEvidence, status: number, responseHeaders: http.IncomingHttpHeaders, responseBody?: Buffer,
         ): Promise<'continue' | 'terminal'> => {
+          if (account) observeAccountOutcome(account.id, effectiveModel, 'failure', undefined, status);
           const hasAlternatives = resolveHasAlternativeAccounts(this.accountLeaseService, account, attemptedAccountIds, attempt, maxAttempts);
           const decision = evaluateRetryDecision({
             evidence: failureEvidence, attempt, maxAttempts, downstreamCommitted: responseCommitted,
@@ -813,6 +818,7 @@ export class CloudCodeFailoverGateway {
             return;
           }
           case 'VALIDATED_RESPONSE': {
+            if (account) observeAccountOutcome(account.id, effectiveModel, 'success', performance.now() - attemptStartedAt);
             if (sessionKey && account) {
               if (isHintSessionKey(sessionKey)) {
                 if (typeof this.accountLeaseService?.recordCacheHint === 'function') {
@@ -891,6 +897,7 @@ export class CloudCodeFailoverGateway {
         });
         bodyStream.once('error', (err) => {
           if (downstreamClosed || (res as any).destroyed || res.writableEnded) return;
+          observeUpstreamStreamFailure(account?.id, effectiveModel);
           logger.warn(
             '[CloudCodeGateway] Upstream streaming error: operation=upstream_stream reason=stream_error',
           );
@@ -960,6 +967,7 @@ export class CloudCodeFailoverGateway {
         releaseActiveLease();
         return;
       } catch (err) {
+        if (currentAttemptAccount && currentUpstreamReq && !clientAborted) observeAccountOutcome(currentAttemptAccount.id, undefined, 'failure');
         if (currentAttemptAccount) { attemptedAccountIds.add(currentAttemptAccount.id); issueMigrationAuthorization('upstream-transient', attemptGeneration, attemptTableIncarnation); }
         releaseActiveLease(); activeStopCandidateRenewal?.();
         if (deadlineWriteFailure) throw deadlineWriteFailure;
@@ -1527,51 +1535,6 @@ export class CloudCodeFailoverGateway {
     bodyStream: Readable,
     releaseUpstreamReservation: () => void = () => {},
   ): Promise<void> {
-    return new Promise<void>((resolve) => {
-      let resolved = false;
-      const onDone = () => {
-        if (!resolved) {
-          resolved = true;
-          resolve();
-        }
-      };
-      // Downstream completion
-      res.once('finish', () => {
-        releaseUpstreamReservation();
-        onDone();
-      });
-      res.once('close', () => {
-        releaseUpstreamReservation();
-        onDone();
-      });
-      res.once('error', () => {
-        releaseUpstreamReservation();
-        onDone();
-      });
-      // Upstream events release upstream reservation slot without settling downstream promise prematurely
-      bodyStream.once('end', () => {
-        releaseUpstreamReservation();
-      });
-      bodyStream.once('error', (err: unknown) => {
-        releaseUpstreamReservation();
-        if (!res.writableEnded) {
-          res.destroy(err instanceof Error ? err : new Error(String(err)));
-        }
-      });
-      bodyStream.once('close', () => {
-        releaseUpstreamReservation();
-        if (!bodyStream.readableEnded && !res.writableEnded) {
-          res.destroy(new Error('Upstream stream closed prematurely'));
-        }
-      });
-      req.once?.('close', () => {
-        releaseUpstreamReservation();
-        onDone();
-      });
-      req.once?.('aborted', () => {
-        releaseUpstreamReservation();
-        onDone();
-      });
-    });
+    return createRelayCompletionPromise(req, res, bodyStream, releaseUpstreamReservation);
   }
 }
