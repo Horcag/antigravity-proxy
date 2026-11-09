@@ -313,12 +313,12 @@ describe('native release admission', () => {
     server.emit('connect', { url: 'daily-cloudcode-pa.googleapis.com:443' }, client, Buffer.alloc(0));
     expect(admission.status().activeTunnels).toBe(1);
     const first = response();
-    handler({}, first);
+    handler({ headers: {} }, first);
     await Promise.resolve();
     expect(gateway).toHaveBeenCalledTimes(1);
     gate();
     const next = response();
-    handler({}, next);
+    handler({ headers: {} }, next);
     expect(next.writeHead).toHaveBeenCalledWith(503, expect.anything());
     expect(gateway).toHaveBeenCalledTimes(1);
     const denied = Object.assign(new EventEmitter(), client, { end: vi.fn() });
