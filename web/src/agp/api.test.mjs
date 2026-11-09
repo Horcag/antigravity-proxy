@@ -5,9 +5,17 @@ import ts from 'typescript';
 const code = ts.transpileModule(fs.readFileSync(new URL('./api.ts', import.meta.url), 'utf8'), {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const { api, setCsrf, mapping, display, localDateValue } = await import(
-  `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`
-);
+const {
+  api,
+  setCsrf,
+  mapping,
+  display,
+  localDateValue,
+  requestAccountLabel,
+  requestModelLabel,
+  statisticsQueryDates,
+  statisticsTraffic,
+} = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
 globalThis.window = { setTimeout, clearTimeout, dispatchEvent: () => {} };
 test('API uses same origin HttpOnly session with CSRF only on mutations; no management Authorization', async () => {
   let seen;
@@ -79,4 +87,101 @@ test('date filters preserve local calendar day in Samara after ISO roundtrip', (
     if (original === undefined) delete process.env.TZ;
     else process.env.TZ = original;
   }
+});
+
+test('hourly and daily traffic preserve filtered totals and distinct UTC buckets', () => {
+  const statistics = {
+    total_requests: 7,
+    success_requests: 5,
+    failed_requests: 2,
+    by_hour: [
+      { hour: '2026-11-08T23:00:00.000Z', total_requests: 2, failed_requests: 0 },
+      { hour: '2026-11-09T00:00:00.000Z', total_requests: 5, failed_requests: 2 },
+    ],
+    by_day: [
+      { date: '2026-11-08', total_requests: 2, failed_requests: 0 },
+      { date: '2026-11-09', total_requests: 5, failed_requests: 2 },
+    ],
+  };
+  const hourly = statisticsTraffic(statistics, 'hour');
+  const daily = statisticsTraffic(statistics, 'day');
+  assert.deepEqual(hourly.buckets, [
+    { time: '2026.11.08 23:00 UTC', success: 2, failed: 0 },
+    { time: '2026.11.09 00:00 UTC', success: 3, failed: 2 },
+  ]);
+  assert.deepEqual(
+    daily.buckets.map((bucket) => bucket.time),
+    ['2026.11.08 UTC', '2026.11.09 UTC']
+  );
+  for (const traffic of [hourly, daily]) {
+    assert.equal(traffic.total, 7);
+    assert.equal(traffic.totalSuccess, 5);
+    assert.equal(traffic.totalFailure, 2);
+    assert.equal(traffic.peakTotal, 5);
+    assert.equal(traffic.peakIndex, 1);
+    assert.equal(traffic.activeBuckets, 2);
+  }
+  assert.equal(hourly.windowMinutes, 120);
+  assert.equal(daily.windowMinutes, 2880);
+});
+
+test('traffic has an honest empty state before loading and without measurements', () => {
+  for (const granularity of ['hour', 'day']) {
+    const traffic = statisticsTraffic(undefined, granularity);
+    assert.deepEqual(traffic.buckets, []);
+    assert.equal(traffic.total, 0);
+    assert.equal(traffic.successRate, null);
+    assert.equal(traffic.peakIndex, -1);
+    assert.equal(traffic.windowMinutes, 0);
+  }
+});
+
+test('both granularities share local day filters, including partial UTC days', () => {
+  const original = process.env.TZ;
+  process.env.TZ = 'Europe/Samara';
+  try {
+    const params = statisticsQueryDates('2026-11-09', '2026-11-09');
+    assert.equal(params.get('from'), '2026-11-08T20:00:00.000Z');
+    assert.equal(params.get('to'), '2026-11-09T19:59:59.999Z');
+    assert.equal(statisticsQueryDates('', '').toString(), '');
+  } finally {
+    if (original === undefined) delete process.env.TZ;
+    else process.env.TZ = original;
+  }
+});
+
+test('request labels distinguish known service calls, inference and unknown history', () => {
+  assert.equal(
+    requestModelLabel({ request_kind: 'service', route: 'recordClientEvent' }),
+    'Служебный запрос'
+  );
+  assert.equal(
+    requestModelLabel({
+      request_kind: 'inference',
+      route: 'chat',
+      requested_model: 'gemini',
+      effective_model: null,
+    }),
+    'gemini → Не измерена'
+  );
+  assert.equal(
+    requestModelLabel({ route: 'other', requested_model: null, effective_model: null }),
+    'Историческая запись: операция не сохранена'
+  );
+});
+
+test('account labels use verified authorization source and resolve pool identities', () => {
+  assert.equal(requestAccountLabel({ authorization_source: 'client' }, []), 'Исходная авторизация');
+  assert.equal(
+    requestAccountLabel({ request_kind: 'service', protocol: 'connect' }, []),
+    'Аккаунт неизвестен'
+  );
+  assert.equal(
+    requestAccountLabel({ account_id: 'id' }, [
+      { id: 'id', email: 'pool@example.com', name: 'Pool' },
+    ]),
+    'pool@example.com'
+  );
+  assert.equal(requestAccountLabel({ account_id: 'id' }, [{ id: 'id', name: 'Pool' }]), 'Pool');
+  assert.equal(requestAccountLabel({ account_id: 'removed' }, []), 'removed');
 });

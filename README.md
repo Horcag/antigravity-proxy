@@ -338,6 +338,10 @@ Request metadata is retained locally in `request-history.db` for seven days, cap
 outcomes, including failed attempts before a successful account failover. Prompts, response
 bodies and credentials are never recorded. Token/cache/TTFT fields are unknown when the
 upstream protocol did not provide trustworthy measurements; unknown does not mean zero.
+Overview and statistics offer hourly or daily UTC buckets over the same selected date range.
+The request journal labels native service operations separately from inference and distinguishes
+client authorization from managed pool accounts. Older opaque `other` records retain an explicit
+missing-operation label; their original operation cannot be reconstructed.
 Old in-memory request history cannot be reconstructed after the upgrade.
 
 `npm ci` installs the pinned frontend dependencies when the `web/` source is present.

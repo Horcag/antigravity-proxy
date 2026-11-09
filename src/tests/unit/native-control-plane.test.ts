@@ -1,3 +1,5 @@
+import { configureRequestHistory, closeRequestHistory, getRequestHistory } from '../../observability/request-history';
+import { observeNativeRequest } from '../../dashboard/native-request-journal';
 import http from 'node:http';
 import https from 'node:https';
 import type { AddressInfo } from 'node:net';
@@ -15,6 +17,7 @@ async function listen(handler: http.RequestListener): Promise<number> {
   return (server.address() as AddressInfo).port;
 }
 afterEach(async () => {
+  closeRequestHistory();
   vi.restoreAllMocks();
   setServerConfig(null);
   await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => {
@@ -24,6 +27,7 @@ afterEach(async () => {
 });
 
 async function setup(status = 200, hang = false) {
+  configureRequestHistory(':memory:');
   const calls: Array<{ headers: http.IncomingHttpHeaders; body: Buffer; url?: string }> = [];
   let reportReceived!: () => void;
   let reportClosed!: () => void;
@@ -47,7 +51,7 @@ async function setup(status = 200, hang = false) {
   }) as typeof https.request);
   const leases = { getNextToken: vi.fn().mockResolvedValue(null), getAccountCount: vi.fn(() => 0) };
   const gateway = new CloudCodeFailoverGateway(leases as never);
-  const port = await listen((req, res) => { void gateway.handleRequest(req, res); });
+  const port = await listen((req, res) => { observeNativeRequest(req, res, () => { void gateway.handleRequest(req, res); }); });
   return { calls, transport, leases, port, received, upstreamClosed };
 }
 
@@ -88,6 +92,7 @@ describe('native control-plane separation', () => {
     expect(calls[0]).toMatchObject({ url: '/v1internal:loadCodeAssist?raw=%2f%2F+test', headers: { authorization: 'Bearer original-user-token', 'x-goog-user-project': 'caller-project' } });
     expect(calls[0].body.equals(body)).toBe(true);
     expect(leases.getNextToken).not.toHaveBeenCalled();
+    expect(getRequestHistory().items[0]).toMatchObject({ request_kind: 'service', authorization_source: 'client', requested_model: null, account_id: null });
   });
 
   it('returns the original upstream 403 without retry or pool fallback', async () => {

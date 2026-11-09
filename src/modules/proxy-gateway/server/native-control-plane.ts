@@ -6,19 +6,8 @@ import { getServerConfig } from '../../../server/server-config';
 import { parseTargetAuthority } from './cert/ca-manager';
 import { composeAttemptRequest } from './cloudcode-request-adapter';
 
-const CONTROL_OPERATIONS = new Set([
-  'loadCodeAssist', 'onboardUser', 'fetchUserInfo', 'fetchAvailableModels',
-  'retrieveUserQuota', 'retrieveUserQuotaSummary', 'fetchLicenses', 'fetchCredits',
-  'listAgents', 'listInstances', 'listAuthorizedDevices', 'listRemoteRepositories',
-  'listCloudAICompanionProjects', 'listModelConfigs', 'listExperiments',
-  'fetchCodeCustomizationState', 'fetchAdminControls', 'getCodeAssistGlobalUserSetting',
-  'fetchQuotaStatus', 'fetchConfig', 'fetchFromTrawlerCache',
-]);
-
-export function isNativeControlPlaneRequest(method: string, urlPath: string): boolean {
-  const match = /^\/v1internal:([A-Za-z]+)(?:\?[^#]*)?$/.exec(urlPath);
-  return method.toUpperCase() === 'POST' && Boolean(match && CONTROL_OPERATIONS.has(match[1]));
-}
+import { isNativeControlPlaneRequest } from '../../../shared/native-operations';
+export { isNativeControlPlaneRequest } from '../../../shared/native-operations';
 
 export async function forwardNativeControlPlane(
   req: http.IncomingMessage | http2.Http2ServerRequest,

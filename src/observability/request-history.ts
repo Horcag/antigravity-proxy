@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getDataDir } from '../shared/paths';
-import { safeLabel, normalizedRoute, nullableCount, errorCategory } from './metadata';
+import { safeLabel, normalizedRoute, nullableCount, errorCategory, requestMetadata } from './metadata';
 
 export interface AttemptRecord {
   account_id: string;
@@ -43,6 +43,8 @@ export interface HistoryFilters {
   to?: string | number;
 }
 export interface HistoryEntry {
+  request_kind: 'inference' | 'service' | 'unknown';
+  authorization_source: 'client' | 'pool' | 'unknown';
   request_id: string;
   id: string;
   time: string;
@@ -65,7 +67,7 @@ export interface HistoryEntry {
   cache_tokens: number | null;
   attempts: AttemptRecord[];
 }
-interface StoredEntry extends Omit<HistoryEntry, 'id' | 'project' | 'attempts'> { sequence: number }
+interface StoredEntry extends Omit<HistoryEntry, 'id' | 'project' | 'attempts' | 'request_kind' | 'authorization_source'> { sequence: number }
 interface StoreOptions { retentionDays?: number; maxEntries?: number; now?: () => number }
 const nullableLabel = (value: unknown) => safeLabel(value, '') || null;
 const milliseconds = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.round(value)) : null;
@@ -150,7 +152,7 @@ export class RequestHistoryStore {
     const offset = Math.max(0, Math.floor(filters.offset ?? 0));
     const rows = this.db.prepare(`SELECT * FROM requests ${where} ORDER BY time DESC, sequence DESC LIMIT ? OFFSET ?`).all(...params, limit, offset) as StoredEntry[];
     const attempts = this.db.prepare('SELECT account_id,effective_model,outcome,error_category,ttft_ms FROM attempts WHERE request_id = ? ORDER BY sequence');
-    return { total, items: rows.map(({ sequence: _sequence, ...row }) => ({ ...row, id: row.request_id,
+    return { total, items: rows.map(({ sequence: _sequence, ...row }) => ({ ...row, ...requestMetadata(row.route, row.protocol, row.account_id), id: row.request_id,
       project: { id: row.project_id, name: row.project_name }, attempts: attempts.all(row.request_id) as AttemptRecord[] })) };
   }
   getUsageSummary(filters: HistoryFilters = {}) {
@@ -165,9 +167,10 @@ export class RequestHistoryStore {
       requests_with_input_tokens: number; requests_with_output_tokens: number; requests_with_cache_tokens: number;
     };
     const by_day = this.db.prepare(`SELECT substr(time,1,10) AS date, COUNT(*) AS total_requests, SUM(CASE WHEN ${failedSql} THEN 1 ELSE 0 END) AS failed_requests, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens FROM requests ${where} GROUP BY substr(time,1,10) ORDER BY date`).all(...params);
+    const by_hour = this.db.prepare(`SELECT substr(time,1,13) || ':00:00.000Z' AS hour, COUNT(*) AS total_requests, SUM(CASE WHEN ${failedSql} THEN 1 ELSE 0 END) AS failed_requests, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens FROM requests ${where} GROUP BY substr(time,1,13) ORDER BY hour`).all(...params);
     const by_model = this.db.prepare(`SELECT requested_model AS model, COUNT(*) AS total_requests, SUM(CASE WHEN ${failedSql} THEN 1 ELSE 0 END) AS failed_requests, AVG(duration_ms) AS avg_duration_ms, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens FROM requests ${where} GROUP BY requested_model ORDER BY total_requests DESC`).all(...params);
     const { value: started_at } = this.db.prepare("SELECT value FROM history_metadata WHERE key='started_at'").get() as { value: string };
-    return { ...summary, started_at, available_since: started_at, by_day, by_model, success_requests: summary.total_requests - summary.failed_requests,
+    return { ...summary, started_at, available_since: started_at, by_day, by_hour, by_model, success_requests: summary.total_requests - summary.failed_requests,
       token_metrics_available: summary.requests_with_input_tokens > 0 || summary.requests_with_output_tokens > 0,
       cache_metrics_available: summary.requests_with_cache_tokens > 0, retention_days: this.retentionMs / 86_400_000, max_entries: this.maxEntries };
   }

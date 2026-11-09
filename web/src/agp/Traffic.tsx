@@ -1,18 +1,18 @@
-import { localDateValue } from './api';
+import {
+  localDateValue,
+  requestAccountLabel,
+  requestModelLabel,
+  statisticsQueryDates,
+  statisticsTraffic,
+  type StatisticsGranularity,
+} from './api';
 import { useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { Input } from '@/components/ui/Input';
 import { Modal } from '@/components/ui/Modal';
 import { ThroughputChart } from '@/features/dashboard/components/ThroughputChart';
-import type { TrafficWindow } from '@/features/dashboard/types';
 import type { Account, Project, RequestEntry, Statistics } from './types';
 import { Button, Card, DataTable, PageHeader, display, useResource } from './shared';
-function queryDates(from: string, to: string) {
-  const params = new URLSearchParams();
-  if (from) params.set('from', new Date(`${from}T00:00:00`).toISOString());
-  if (to) params.set('to', new Date(`${to}T23:59:59.999`).toISOString());
-  return params;
-}
 function Dates({
   from,
   to,
@@ -144,9 +144,12 @@ export function Requests() {
               new Date(r.time).toLocaleString('ru'),
               <>
                 {r.project_name}
-                <small>{r.account_id ?? 'Аккаунт неизвестен'}</small>
+                <small>{requestAccountLabel(r, accounts.data ?? [])}</small>
               </>,
-              `${display(r.requested_model)} → ${display(r.effective_model)}`,
+              <>
+                {requestModelLabel(r)}
+                <small>{r.route}</small>
+              </>,
               <span
                 className={`agp-badge ${r.status >= 400 || (r.grpc_status && r.grpc_status !== '0') ? 'agp-warning' : ''}`}
               >
@@ -219,32 +222,28 @@ export function Requests() {
 export function StatisticsPage({ overview = false }: { overview?: boolean }) {
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
-  const resource = useResource<Statistics>(`/statistics?${queryDates(from, to)}`);
+  const [granularity, setGranularity] = useState<StatisticsGranularity>(overview ? 'hour' : 'day');
+  const resource = useResource<Statistics>(`/statistics?${statisticsQueryDates(from, to)}`);
   const accounts = useResource<Account[]>('/accounts');
   const projects = useResource<Project[]>('/projects');
   const s = resource.data;
-  const buckets = (s?.by_day ?? []).map((day) => ({
-    time: day.date.replace(/-/g, '.'),
-    success: day.total_requests - day.failed_requests,
-    failed: day.failed_requests,
-  }));
-  const peak = Math.max(0, ...buckets.map((b) => b.success + b.failed));
-  const traffic: TrafficWindow = {
-    buckets,
-    totalSuccess: s?.success_requests ?? 0,
-    totalFailure: s?.failed_requests ?? 0,
-    total: s?.total_requests ?? 0,
-    successRate: s?.total_requests ? (s.success_requests / s.total_requests) * 100 : null,
-    peakTotal: peak,
-    peakIndex: buckets.findIndex((b) => b.success + b.failed === peak),
-    activeBuckets: buckets.filter((b) => b.success + b.failed > 0).length,
-    windowMinutes: buckets.length * 1440,
-  };
+  const traffic = statisticsTraffic(s, granularity);
   return (
     <>
       <PageHeader title={overview ? 'Обзор' : 'Статистика'} resource={resource} />
       <div className="agp-filters">
         <Dates from={from} to={to} setFrom={setFrom} setTo={setTo} />
+        <label className="agp-field">
+          Группировка
+          <select
+            className="input"
+            value={granularity}
+            onChange={(e) => setGranularity(e.target.value as StatisticsGranularity)}
+          >
+            <option value="hour">По часам</option>
+            <option value="day">По дням</option>
+          </select>
+        </label>
         <Button
           variant="secondary"
           onClick={() => {
@@ -275,8 +274,11 @@ export function StatisticsPage({ overview = false }: { overview?: boolean }) {
           </Card>
         ))}
       </div>
-      <Card title="Запросы по дням (UTC)">
-        <ThroughputChart traffic={traffic} />
+      <Card title={granularity === 'hour' ? 'Запросы по часам (UTC)' : 'Запросы по дням (UTC)'}>
+        <p className="agp-muted">
+          Границы выбранных дат — по местному времени. Интервалы графика — в UTC.
+        </p>
+        <ThroughputChart key={granularity} traffic={traffic} />
       </Card>
       {s && (
         <>

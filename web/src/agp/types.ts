@@ -39,6 +39,8 @@ export interface RequestEntry {
   request_id: string;
   time: string;
   protocol: string;
+  request_kind?: 'inference' | 'service';
+  authorization_source?: 'client' | 'pool' | 'unknown';
   route: string;
   model: string | null;
   requested_model: string | null;
@@ -86,6 +88,7 @@ export interface AccountMetric {
 export interface Statistics extends Metric {
   accounts: AccountMetric[];
   by_model: Array<Metric & { model: string }>;
+  by_hour: Array<{ hour: string; total_requests: number; failed_requests: number }>;
   by_day: Array<{ date: string; total_requests: number; failed_requests: number }>;
   retention_days: number;
   max_entries: number;
