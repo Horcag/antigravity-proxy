@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { classifyAxiosFailure, readForbiddenErrorBody } from './upstream-error-classification';
 import { UserProjectCapabilityCache } from './user-project-capability-cache';
 import { Injectable, Logger } from '@nestjs/common';
 import axios, { AxiosError, AxiosProxyConfig, AxiosRequestConfig, AxiosResponse } from 'axios';
@@ -66,6 +67,7 @@ export class GeminiClient {
     } catch (error) {
       throwIfUpstreamRequestCanceled(error, signal);
       if (axios.isAxiosError(error)) {
+        await readForbiddenErrorBody(error);
         const upstreamError = this.toUpstreamRequestError(error);
         this.logUpstreamFailure('stream_generate', upstreamError);
         throw upstreamError;
@@ -96,6 +98,7 @@ export class GeminiClient {
     } catch (error) {
       throwIfUpstreamRequestCanceled(error, signal);
       if (axios.isAxiosError(error)) {
+        await readForbiddenErrorBody(error);
         const upstreamError = this.toUpstreamRequestError(error);
         this.logUpstreamFailure('generate', upstreamError);
         throw upstreamError;
@@ -304,6 +307,7 @@ export class GeminiClient {
           throwIfUpstreamRequestCanceled(error, signal ?? config.signal);
           diagnostics.httpStatus = axios.isAxiosError(error) ? error.response?.status : undefined;
           logUpstreamTerminalDiagnostic(diagnostics, 'failure');
+          if (axios.isAxiosError(error)) await readForbiddenErrorBody(error);
           lastError = error;
 
           if (this.shouldRetryWithoutProjectHeader(error, projectHeaders)) {
@@ -373,12 +377,14 @@ export class GeminiClient {
     return (
       axios.isAxiosError(error) &&
       error.response?.status === 403 &&
+      classifyAxiosFailure(403, error.response.data, error.message) !== 'tos_violation' &&
       Boolean(projectHeaders['x-goog-user-project'])
     );
   }
 
   private async throwUpstreamRequestError(error: unknown, operation: string): Promise<never> {
     if (axios.isAxiosError(error)) {
+      await readForbiddenErrorBody(error);
       const upstreamError = this.toUpstreamRequestError(error);
       this.logUpstreamFailure(operation, upstreamError);
       throw upstreamError;
@@ -391,50 +397,8 @@ export class GeminiClient {
     return new UpstreamRequestError({
       status,
       headers: { retryAfter: this.extractRetryAfterHeader(error.response?.headers) },
-      reason: this.classifyAxiosFailure(status, error.response?.data, error.message),
+      reason: classifyAxiosFailure(status, error.response?.data, error.message),
     });
-  }
-
-  private classifyAxiosFailure(
-    status: number | undefined,
-    responseData: unknown,
-    transportMessage: string,
-  ): UpstreamRequestError['reason'] {
-    if (status === 401 || status === 403) {
-      return 'authentication';
-    }
-    if (status === 404) {
-      return 'model_not_found';
-    }
-
-    const classificationText = this.toClassificationText(responseData).toLowerCase();
-    if (classificationText.includes('quota')) {
-      return 'quota_exhausted';
-    }
-    if (status === 429 || classificationText.includes('resource_exhausted')) {
-      return 'rate_limited';
-    }
-    if (status === undefined && /timeout|socket|connect|network|reset/i.test(transportMessage)) {
-      return 'transport';
-    }
-    return 'upstream_error';
-  }
-
-  private toClassificationText(value: unknown): string {
-    if (isString(value)) {
-      return value;
-    }
-    if (Buffer.isBuffer(value)) {
-      return value.toString('utf-8');
-    }
-    if (!isObjectLike(value)) {
-      return '';
-    }
-    try {
-      return JSON.stringify(value);
-    } catch {
-      return '';
-    }
   }
 
   private logUpstreamFailure(operation: string, error: UpstreamRequestError): void {

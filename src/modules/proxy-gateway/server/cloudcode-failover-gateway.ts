@@ -6,6 +6,8 @@ import zlib from 'node:zlib';
 import type { Readable } from 'node:stream';
 import { logger } from '../../../shared/logging/logger';
 import { getServerConfig } from '../../../server/server-config';
+import { observeNativeModel } from '../../../shared/request-observation';
+import { forwardNativeControlPlane, isNativeControlPlaneRequest } from './native-control-plane';
 import { AccountLeaseService } from './account-lease.service';
 import { CloudAccount } from '../../cloud-account/types';
 import { RateLimitReason } from './rate-limit-tracker';
@@ -105,6 +107,11 @@ export class CloudCodeFailoverGateway {
       return;
     }
     const targetHost = parsedAuthority.hostname;
+    if (isNativeControlPlaneRequest(method, urlPath)) {
+      receiptOwner.expectDownstreamCommit('validated_response');
+      await forwardNativeControlPlane(req, res, targetHost, urlPath);
+      return;
+    }
     const requestAbortController = new AbortController(), LOGICAL_REQUEST_DEADLINE_MS = (getServerConfig()?.request_timeout ?? 120) * 1000, affinityOwnerTimeoutMs = LOGICAL_REQUEST_DEADLINE_MS + 5000;
     const deadlineAt = Date.now() + LOGICAL_REQUEST_DEADLINE_MS;
     let logicalDeadlineTimer: NodeJS.Timeout | null = null;
@@ -214,6 +221,7 @@ export class CloudCodeFailoverGateway {
     }
     const parsedBody = preflight.parsedBody || null;
     const modelName = extractModelName(urlPath, parsedBody);
+    observeNativeModel(req, modelName);
     const requestedModel = modelName;
     const isReplaySafe = isReplaySafeOperation(method, urlPath, {
       hasAccountPinnedResources: preflight.hasAccountPinnedResources,
@@ -1030,18 +1038,6 @@ export class CloudCodeFailoverGateway {
     if (typeof anyRes.writeHead === 'function') {
       anyRes.writeHead(statusCode, responseHeaders);
     }
-  }
-  private isQuotaErrorText(text?: string): boolean {
-    if (!text) return false;
-    const lower = text.toLowerCase();
-    if (lower.includes('quota project') || lower.includes('serviceusage')) return false;
-    return (
-      lower.includes('quota') ||
-      lower.includes('resource_exhausted') ||
-      lower.includes('rate limit') ||
-      lower.includes('credit') ||
-      lower.includes('429')
-    );
   }
   private classifyParsedEnvelope(
     parsed: any,

@@ -85,7 +85,7 @@ describe('Terms of Service (TOS_VIOLATION) Recognition and Recovery', () => {
     expect(evidence.isQuota).toBe(false);
   });
 
-  it('evaluates retry decision for TOS_VIOLATION to migrate account and mark as credential-rejected', () => {
+  it('evaluates retry decision for TOS_VIOLATION to commit error and mark as credential-rejected', () => {
     const evidence = classifyUpstreamFailure({
       statusCode: 403,
       headers: { 'content-type': 'application/json' },
@@ -104,12 +104,11 @@ describe('Terms of Service (TOS_VIOLATION) Recognition and Recovery', () => {
       hasAlternativeAccounts: true,
     });
 
-    expect(decision.action.kind).toBe('migrate-account');
-    expect(decision.action).toEqual({ kind: 'migrate-account', reason: 'permission-denied' });
+    expect(decision.action).toEqual({ kind: 'commit-error' });
     expect(decision.healthEffect.kind).toBe('credential-rejected');
   });
 
-  it('gateway fails over from TOS-violated account to healthy account with markAsForbidden(tos_violation)', async () => {
+  it('gateway stops on TOS violation and marks only the rejected account', async () => {
     const accBanned = createMockAccount('acc-banned', 'banned@gmail.com');
     const accHealthy = createMockAccount('acc-healthy', 'healthy@gmail.com');
 
@@ -173,9 +172,9 @@ describe('Terms of Service (TOS_VIOLATION) Recognition and Recovery', () => {
     await gateway.handleRequest(req, res);
 
     expect(markAsForbidden).toHaveBeenCalledWith('acc-banned', 'tos_violation');
-    expect(leaseCallCount).toBe(2);
-    expect(upstreamCallCount).toBe(2);
-    expect(res.statusCode).toBe(200);
-    expect(res.body).toContain('"parts":[{"text":"OK"}]');
+    expect(leaseCallCount).toBe(1);
+    expect(upstreamCallCount).toBe(1);
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toContain('TOS_VIOLATION');
   });
 });

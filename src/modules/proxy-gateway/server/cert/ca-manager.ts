@@ -14,6 +14,7 @@ export const TARGET_CLOUDCODE_HOSTS = [
   'daily-cloudcode-pa.sandbox.googleapis.com',
   'autopush-cloudcode-pa.sandbox.googleapis.com',
   'preprod-daily-cloudcode-pa.sandbox.googleapis.com',
+  'aicode.googleapis.com',
 ] as const;
 
 export const ALLOWED_TARGET_HOSTS = new Set<string>(TARGET_CLOUDCODE_HOSTS);
@@ -73,7 +74,8 @@ export class CaManager {
       try {
         const certObj = new crypto.X509Certificate(fs.readFileSync(leafCertPath));
         const san = certObj.subjectAltName || '';
-        if (san.includes('*') || san.includes('localhost') || san.includes('127.0.0.1')) {
+        if (san.includes('*') || san.includes('localhost') || san.includes('127.0.0.1') ||
+            TARGET_CLOUDCODE_HOSTS.some((host) => !certObj.checkHost(host, { wildcards: false }))) {
           logger.info('Existing leaf certificate contains obsolete/wildcard SANs. Regenerating leaf certificate under existing root CA...');
           shouldRegenerateLeaf = true;
         }
@@ -207,7 +209,7 @@ export class CaManager {
       ? publicTrustBundle
       : path.join(getCertsDir(), 'agy-trust.pem');
     const rawPort = Number(process.env.AG_PROXY_PORT?.trim());
-    const proxyPort = Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535 ? rawPort : 8045;
+    const proxyPort = Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535 ? rawPort : 8317;
     const rawHost = process.env.AG_PROXY_HOST?.trim() || '127.0.0.1';
     const proxyHost = /^[a-zA-Z0-9.-]+$/.test(rawHost) ? rawHost : '127.0.0.1';
     const proxyUrl = `http://${proxyHost}:${proxyPort}`;

@@ -14,6 +14,7 @@ import {
 import { FastifyReply } from 'fastify';
 import { isEmpty, isFunction, isNumber, isString } from 'lodash-es';
 import { Observable } from 'rxjs';
+import { getRequestProject } from './request-project-context';
 
 import { ProxyGuard } from './proxy.guard';
 import { ProxyService } from './proxy.service';
@@ -197,7 +198,7 @@ export class GeminiController {
   private buildGeminiModelList(): GeminiModelMetadata[] {
     const config = getServerConfig();
     const dynamicModelIds = getAllDynamicModels(
-      config?.custom_mapping ?? {},
+      { ...config?.custom_mapping, ...config?.anthropic_mapping, ...getRequestProject()?.model_mapping },
       this.accountLeaseService?.getAllCollectedModels(),
     );
 

@@ -119,14 +119,18 @@ export function evaluateRetryDecision(params: EvaluateRetryParams): RetryDecisio
       };
 
     case 'permission-denied':
+      if (evidence.ruleId === 'google.tos.violation') {
+        return {
+          action: { kind: 'commit-error' },
+          healthEffect: { kind: 'credential-rejected' },
+        };
+      }
       return {
         action: hasAlternativeAccounts
           ? { kind: 'migrate-account', reason: 'permission-denied' }
           : { kind: 'commit-error' },
         healthEffect: evidence.ruleId === 'google.location.unsupported-location'
           ? { kind: 'rate-limited', isQuota: false }
-          : evidence.ruleId === 'google.tos.violation'
-          ? { kind: 'credential-rejected' }
           : { kind: 'none' }, // CRUCIAL: zero credential penalty for generic permission-denied, never markAsForbidden!
       };
 

@@ -305,3 +305,36 @@ Wildcard binds (`0.0.0.0` and `::`) are rejected. Other non-Tailscale addresses 
 `AG_PROXY_ALLOW_NON_TAILSCALE_BIND=true` is set explicitly. For the WSL2 deployment, keeping the
 service on `127.0.0.1` and publishing it through Windows Tailscale forwarding/firewall is the
 recommended path.
+
+## Projects, application ports and dashboard
+
+`proxy.projects` accepts separate application credentials while preserving the original
+`proxy.api_key`. Each project has an `id`, `name`, `api_key`, `enabled` flag and optional
+`model_mapping`. Disabled project keys reject authentication. Project keys never authorize
+administration. Exact aliases take precedence over wildcard mappings; project mappings
+apply only within that request. Catalogs advertise explicit aliases only when their
+upstream target is available.
+
+In the separated deployment, the primary port is 8317 for native Antigravity CONNECT,
+administration and `/dashboard`. Set `proxy.compatibility_ports` to `[8045]` for the
+existing `/v1/` and `/v1beta/` application APIs on loopback. They retain the same authentication
+and streaming behavior, but reject administration, dashboard, upgrades and CONNECT.
+
+The dashboard uses the separate admin key, held in browser memory until logout/reload.
+It shows account/quota availability, project activity and the latest 500 request outcomes
+from the current service run. It does not store prompts, responses or credentials.
+HTTP and native gRPC failures are counted separately from successful HTTP 200 transport.
+
+The offline `migration import-easycli --stdin` command accepts a validated version-1 JSON
+payload with `projects`, raw Antigravity `accounts`, and `model_mapping`. Every account
+requires an explicit `migration_status`: `active`, `blocked`, or `disabled`. This makes
+source-app shutdown distinct from upstream bans. OAuth tokens are encrypted in the
+existing account database; unsupported Codex credentials are counted and skipped.
+Back up the destination configuration and encrypted database before migration: configuration
+and account updates use separate persistence operations. Do not store the payload in Git.
+
+Native login/setup operations preserve the caller's original OAuth and project and work
+without a generation pool. Native audio uses an HTTP/2 duplex connection for the exact
+Antigravity audio RPC, with one account lease held for the stream and no replay. Explicit
+ToS suspension stops the request and excludes that credential; it does not trigger a
+cross-account retry. These safeguards do not establish immunity from provider restrictions.

@@ -1,5 +1,35 @@
 import { timingSafeEqual } from 'node:crypto';
 import { isEmpty, isString } from 'lodash-es';
+import type { ProxyConfig } from '../../../config/types';
+
+type ProxyApiKeyConfig = Pick<ProxyConfig, 'api_key' | 'projects'> | null | undefined;
+
+export interface ApiProjectIdentity {
+  id: string;
+  name: string;
+}
+
+export function isProxyApiKeyConfigured(config: ProxyApiKeyConfig): boolean {
+  return hasConfiguredApiKey(config?.api_key) ||
+    (config?.projects ?? []).some((project) => hasConfiguredApiKey(project.api_key));
+}
+
+export function resolveApiProject(config: ProxyApiKeyConfig, token: string | null): ApiProjectIdentity | null {
+  const matches = (config?.projects ?? []).filter((project) => hasMatchingApiKey(token, project.api_key));
+  const project = matches[0];
+  if (matches.length !== 1 || !project?.enabled ||
+    (hasConfiguredApiKey(config?.api_key) && hasMatchingApiKey(token, config.api_key))) {
+    return null;
+  }
+  return { id: project.id, name: project.name };
+}
+
+export function hasMatchingProxyApiKey(config: ProxyApiKeyConfig, token: string | null): boolean {
+  if ((config?.projects ?? []).some((project) => hasMatchingApiKey(token, project.api_key))) {
+    return resolveApiProject(config, token) !== null;
+  }
+  return hasConfiguredApiKey(config?.api_key) && hasMatchingApiKey(token, config.api_key);
+}
 
 export type RequestHeaderValue = string | string[] | undefined;
 

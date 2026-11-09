@@ -51,7 +51,7 @@ export function resolveLauncherConfig(options: LauncherOptions = {}): {
     (fs.existsSync(publicTrustBundle) ? publicTrustBundle : path.join(getCertsDir(), 'agy-trust.pem'));
 
   const rawPort = options.proxyPort ?? Number(process.env.AG_PROXY_PORT?.trim());
-  const proxyPort = Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535 ? rawPort : 8045;
+  const proxyPort = Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535 ? rawPort : 8317;
 
   const rawHost = options.proxyHost?.trim() || process.env.AG_PROXY_HOST?.trim() || '127.0.0.1';
   const proxyHost = /^[a-zA-Z0-9.-]+$/.test(rawHost) ? rawHost : '127.0.0.1';

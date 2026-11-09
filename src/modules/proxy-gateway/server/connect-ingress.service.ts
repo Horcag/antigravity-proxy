@@ -9,36 +9,11 @@ import { CaManager } from './cert/ca-manager';
 import { CloudCodeFailoverGateway, GatewayReceiptTransferError } from './cloudcode-failover-gateway';
 import { AnonymousTransportReceiptOwner } from './anonymous-transport-receipt';
 import { AccountLeaseService } from './account-lease.service';
-export interface ParsedConnectAuthority {
-  hostname: string;
-  port: number;
-}
-export function parseConnectAuthority(destination: string | undefined): ParsedConnectAuthority | null {
-  if (!destination || typeof destination !== 'string') return null;
-  const trimmed = destination.trim();
-  let hostname = '';
-  let port = 0;
-  const ipv6Match = /^\[([a-fA-F0-9:.%]+)\]:([0-9]{1,5})$/.exec(trimmed);
-  if (ipv6Match) {
-    hostname = ipv6Match[1].toLowerCase();
-    port = Number(ipv6Match[2]);
-  } else {
-    const standardMatch = /^([a-zA-Z0-9.-]+):([0-9]{1,5})$/.exec(trimmed);
-    if (!standardMatch) return null;
-    hostname = standardMatch[1].toLowerCase();
-    port = Number(standardMatch[2]);
-  }
-  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
-  if (!ipv6Match && (
-    hostname.startsWith('.') ||
-    hostname.endsWith('.') ||
-    hostname.includes('..') ||
-    hostname.startsWith('-')
-  )) {
-    return null;
-  }
-  return { hostname, port };
-}
+import { observeNativeRequest } from '../../../dashboard/native-request-journal';
+import { NativeBidiGateway, NATIVE_AUDIO_HOST } from './native-bidi-gateway';
+import { parseConnectAuthority } from './connect-authority';
+export { parseConnectAuthority };
+export type { ParsedConnectAuthority } from './connect-authority';
 export function parseIpToUint32(ipStr: string): number | null {
   if (/^\d+$/.test(ipStr)) {
     const n = Number(ipStr);
@@ -187,8 +162,10 @@ export class ConnectIngressService {
   private reservedSockets = 0;
   private pendingRequests = 0;
   private isClosed = false;
+  private readonly nativeBidiGateway: NativeBidiGateway;
   constructor(accountLeaseService?: AccountLeaseService, private readonly admission: ReleaseAdmission = releaseAdmission()) {
     this.failoverGateway = new CloudCodeFailoverGateway(accountLeaseService);
+    this.nativeBidiGateway = new NativeBidiGateway(accountLeaseService);
   }
   attach(httpServer: http.Server): void {
     this.isClosed = false;
@@ -206,8 +183,12 @@ export class ConnectIngressService {
         },
       },
       (req, res) => {
+        observeNativeRequest(req, res);
         this.pendingRequests++;
-        const admitted = this.admission.runResponse(res, () => this.failoverGateway.handleRequest(req, res).catch((err: unknown) => {
+        const nativeAuthority = String(req.headers[':authority'] ?? req.headers.host ?? '').toLowerCase();
+        const gateway = nativeAuthority === NATIVE_AUDIO_HOST || nativeAuthority === `${NATIVE_AUDIO_HOST}:443`
+          ? this.nativeBidiGateway : this.failoverGateway;
+        const admitted = this.admission.runResponse(res, () => gateway.handleRequest(req, res).catch((err: unknown) => {
           logger.error(formatSafeEvent('connect_ingress_gateway_failure', {
             classification: err instanceof GatewayReceiptTransferError ? 'receipt_transfer' : 'gateway_failure',
           }, ['classification']));

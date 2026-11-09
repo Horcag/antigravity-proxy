@@ -7,12 +7,17 @@ import { AppModule } from './app.module';
 import { logger } from '../shared/logging/logger';
 import { AccountLeaseService } from '../modules/proxy-gateway/server/account-lease.service';
 import { ConnectIngressService } from '../modules/proxy-gateway/server/connect-ingress.service';
+import { installDashboardHooks } from '../dashboard/request-journal';
+import { installProjectContextHook } from '../modules/proxy-gateway/server/request-project-context';
+import { openCompatibilityListeners, closeCompatibilityListeners } from './compatibility-listeners';
+import type http from 'node:http';
 
 import { ProxyConfig } from '@/modules/config/types';
 import { setServerConfig } from './server-config';
 
 let app: NestFastifyApplication | null = null;
 let connectIngress: ConnectIngressService | null = null;
+let compatibilityListeners: http.Server[] = [];
 let currentPort: number = 0;
 let currentHost = '127.0.0.1';
 
@@ -54,6 +59,8 @@ function isTailscaleHost(host: string): boolean {
 
 async function cleanupFailedServerStart() {
   releaseAdmission().beginClose();
+  await closeCompatibilityListeners(compatibilityListeners);
+  compatibilityListeners = [];
   if (connectIngress) {
     try {
       await connectIngress.close();
@@ -141,7 +148,10 @@ export async function bootstrapNestServer(config: ProxyConfig): Promise<NestServ
     });
 
     const admission = releaseAdmission();
-    installReleaseHooks(app.getHttpAdapter().getInstance() as unknown as FastifyInstance, admission);
+    const fastify = app.getHttpAdapter().getInstance() as unknown as FastifyInstance;
+    installProjectContextHook(fastify);
+    installDashboardHooks(fastify);
+    installReleaseHooks(fastify, admission);
     await app.listen(port, host);
     currentPort = port;
     currentHost = host;
@@ -153,6 +163,7 @@ export async function bootstrapNestServer(config: ProxyConfig): Promise<NestServ
     }
     connectIngress = new ConnectIngressService(accountLeaseService);
     connectIngress.attach(rawHttpServer);
+    compatibilityListeners = await openCompatibilityListeners(rawHttpServer, config.compatibility_ports ?? []);
     admission.start();
 
     logger.info(`NestJS Proxy Server running on http://${host}:${port}`);
@@ -187,6 +198,13 @@ export async function bootstrapNestServer(config: ProxyConfig): Promise<NestServ
 
 export async function stopNestServer(): Promise<boolean> {
   releaseAdmission().beginClose();
+  try {
+    await closeCompatibilityListeners(compatibilityListeners);
+    compatibilityListeners = [];
+  } catch {
+    logger.warn('Compatibility listeners did not drain');
+    return false;
+  }
   if (connectIngress) {
     try {
       await connectIngress.close();

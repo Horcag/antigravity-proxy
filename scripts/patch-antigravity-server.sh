@@ -4,7 +4,7 @@ set -euo pipefail
 
 ACTION="${1:-status}"
 SERVER_BASE="${2:-$HOME/.antigravity-server/bin}"
-PROXY_URL="${AG_PROXY_URL:-http://127.0.0.1:8045}"
+PROXY_URL="${AG_PROXY_URL:-http://127.0.0.1:8317}"
 TRUST_BUNDLE="/usr/local/share/antigravity-proxy/agy-trust.pem"
 if [ ! -r "$TRUST_BUNDLE" ] && [ -r "$HOME/.antigravity-proxy/certs/agy-trust.pem" ]; then
     TRUST_BUNDLE="$HOME/.antigravity-proxy/certs/agy-trust.pem"
@@ -74,7 +74,7 @@ TRUST_BUNDLE="/usr/local/share/antigravity-proxy/agy-trust.pem"
 if [ ! -r "$TRUST_BUNDLE" ] && [ -r "$HOME/.antigravity-proxy/certs/agy-trust.pem" ]; then
     TRUST_BUNDLE="$HOME/.antigravity-proxy/certs/agy-trust.pem"
 fi
-PROXY_URL="http://127.0.0.1:8045"
+PROXY_URL="http://127.0.0.1:8317"
 
 if [ ! -x "$SERVER_REAL" ]; then
     printf '%s\n' 'antigravity language_server: real binary is unavailable' >&2

@@ -22,7 +22,7 @@ describe('CaManager', () => {
     // Non-cloudcode-pa endpoints and unverified services are left outside interception (T10-F06)
     expect(CaManager.isTargetHost('generativelanguage.googleapis.com:443')).toBe(false);
     expect(CaManager.isTargetHost('businessaicode.googleapis.com:443')).toBe(false);
-    expect(CaManager.isTargetHost('aicode.googleapis.com:443')).toBe(false);
+    expect(CaManager.isTargetHost('aicode.googleapis.com:443')).toBe(true);
     expect(CaManager.isTargetHost('aiplatform.googleapis.com:443')).toBe(false);
     // Rejects attacker and unauthorized domains (Probe C25)
     expect(CaManager.isTargetHost('aicode.attacker.invalid:443')).toBe(false);
@@ -37,6 +37,9 @@ describe('CaManager', () => {
   });
 
   it('generates and provides a valid secureContext and CA cert', () => {
+    const fixtureHome = fs.mkdtempSync(path.join(os.tmpdir(), 'proxy-ca-fixture-'));
+    const home = vi.spyOn(os, 'homedir').mockReturnValue(fixtureHome);
+    try {
     const ctx = CaManager.ensureCertificates();
     expect(ctx).toBeDefined();
 
@@ -52,6 +55,10 @@ describe('CaManager', () => {
     expect(fs.existsSync(bundlePath)).toBe(true);
     const bundleContent = fs.readFileSync(bundlePath, 'utf-8');
     expect(bundleContent).toContain('Antigravity Proxy Local Root CA');
+    } finally {
+      home.mockRestore();
+      fs.rmSync(fixtureHome, { recursive: true, force: true });
+    }
   });
 
   it('publishes managed launcher in libexec and establishes baseline update observer', () => {
@@ -80,7 +87,7 @@ describe('CaManager', () => {
       expect(fs.existsSync(launcherPath)).toBe(true);
       const wrapperScript = fs.readFileSync(launcherPath, 'utf-8');
       expect(wrapperScript).toContain('#!/bin/sh');
-      expect(wrapperScript).toContain('PROXY_URL="http://127.0.0.1:8045"');
+      expect(wrapperScript).toContain('PROXY_URL="http://127.0.0.1:8317"');
       expect(wrapperScript).toContain('www.googleapis.com,oauth2.googleapis.com,accounts.google.com');
       expect(wrapperScript).toContain(agyNativePath);
 
@@ -97,18 +104,6 @@ describe('CaManager', () => {
 });
 
 describe('CloudCodeFailoverGateway', () => {
-  it('detects quota error strings accurately', () => {
-    const gateway = new CloudCodeFailoverGateway();
-    const isQuotaError = (gateway as any).isQuotaErrorText.bind(gateway);
-
-    expect(isQuotaError('RESOURCE_EXHAUSTED')).toBe(true);
-    expect(isQuotaError('Quota exceeded for quota metric')).toBe(true);
-    expect(isQuotaError('Rate limit exceeded')).toBe(true);
-    expect(isQuotaError('Insufficient AI credit')).toBe(true);
-    expect(isQuotaError('normal valid response')).toBe(false);
-    expect(isQuotaError(undefined)).toBe(false);
-  });
-
   it('filters out forbidden HTTP/2 connection headers', () => {
     const gateway = new CloudCodeFailoverGateway();
     const mockRes: any = {

@@ -1,3 +1,4 @@
+import { getRequestProject } from './request-project-context';
 import { getServerConfig } from '../../../server/server-config';
 import { normalizeGeminiModelAlias, resolveModelRoute } from '../antigravity/ModelMapping';
 
@@ -12,6 +13,7 @@ export class ProxyModelRoutingPolicy {
     const configuredMapping = {
       ...(config?.custom_mapping ?? {}),
       ...(config?.anthropic_mapping ?? {}),
+      ...(getRequestProject()?.model_mapping ?? {}),
     };
 
     const customExactMapping: Record<string, string> = {};
@@ -35,6 +37,10 @@ export class ProxyModelRoutingPolicy {
       }
 
       customExactMapping[key] = target;
+    }
+
+    if (customExactMapping[normalizedModel]) {
+      return normalizeGeminiModelAlias(customExactMapping[normalizedModel]);
     }
 
     for (const wildcardRule of wildcardMapping) {

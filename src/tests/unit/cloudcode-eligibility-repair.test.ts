@@ -1,12 +1,12 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { Readable } from 'node:stream';
+import type http from 'node:http';
 import { CloudCodeFailoverGateway } from '../../modules/proxy-gateway/server/cloudcode-failover-gateway.js';
 import { extractSanitizedOperation } from '../../modules/proxy-gateway/server/cloudcode-diagnostics.js';
 import { isReplaySafeOperation } from '../../modules/proxy-gateway/server/cloudcode-request-adapter.js';
 import { evaluateRetryDecision } from '../../modules/proxy-gateway/server/upstream-retry-decision.js';
 import { classifyUpstreamFailure } from '../../modules/proxy-gateway/server/upstream-failure.js';
-import type { CloudAccount } from '../../modules/cloud-account/types.js';
+import * as nativeControl from '../../modules/proxy-gateway/server/native-control-plane.js';
 
 const READ_ONLY_RPCS = [
   ':loadCodeAssist',
@@ -31,11 +31,6 @@ const READ_ONLY_RPCS = [
   ':fetchConfig',
   ':fetchFromTrawlerCache',
 ];
-
-function createMockStream(chunks: Array<string | Buffer> = ['{}']): any {
-  const readable = Readable.from(chunks.map((chunk) => Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-  return Object.assign(readable, { destroy: vi.fn() });
-}
 
 function createMockRequest(options: {
   method?: string;
@@ -82,25 +77,8 @@ function createMockResponse(): any {
   return res;
 }
 
-function createMockAccount(projectId: string): CloudAccount {
-  return {
-    id: 'acc-eligibility',
-    provider: 'google',
-    email: 'eligibility@test.local',
-    token: {
-      access_token: 'token-eligibility',
-      refresh_token: 'refresh-eligibility',
-      token_type: 'Bearer',
-      expires_in: 3600,
-      expiry_timestamp: Math.floor(Date.now() / 1000) + 3600,
-      project_id: projectId,
-    },
-    created_at: Math.floor(Date.now() / 1000),
-    last_used: Math.floor(Date.now() / 1000),
-  };
-}
-
 describe('Cloud Code eligibility project-context handling', () => {
+  afterEach(() => vi.restoreAllMocks());
   let leaseService: any;
   let gateway: CloudCodeFailoverGateway;
 
@@ -185,34 +163,16 @@ describe('Cloud Code eligibility project-context handling', () => {
   });
 
   it('returns fetchUserInfo project rejection without modifying native request context', async () => {
-    const account = createMockAccount('disabled-proj');
     const calls: Array<{ headers: Record<string, string>; body: Buffer }> = [];
-    leaseService.getNextToken.mockResolvedValue(account);
-    leaseService.getUsableAccountCount = vi.fn(() => 1);
-    vi.spyOn(gateway as any, 'executeUpstreamCall').mockImplementation(async (...args: any[]) => {
-      const headers = (args[2] || {}) as Record<string, string>;
-      const body = args[3] as Buffer;
-      calls.push({ headers, body });
-      if (calls.length === 1) {
-        return {
-          statusCode: 403,
-          headers: { 'content-type': 'application/json' },
-          bufferedBody: Buffer.from(JSON.stringify({
-            error: {
-              code: 403,
-              status: 'PERMISSION_DENIED',
-              message: 'Cloud Code Private API has not been used in project disabled-proj before or it is disabled.',
-            },
-          })),
-          bodyStream: createMockStream(),
-        };
-      }
-      return {
-        statusCode: 200,
-        headers: { 'content-type': 'application/json' },
-        bufferedBody: Buffer.from('{"userTier":"PAID"}'),
-        bodyStream: createMockStream(['{"userTier":"PAID"}']),
-      };
+    const managedTransport = vi.spyOn(gateway as any, 'executeUpstreamCall');
+    vi.spyOn(nativeControl, 'forwardNativeControlPlane').mockImplementation(async (req, res, host, urlPath) => {
+      expect(host).toBe('daily-cloudcode-pa.googleapis.com');
+      expect(urlPath).toBe('/v1internal:fetchUserInfo');
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      calls.push({ headers: req.headers as Record<string, string>, body: Buffer.concat(chunks) });
+      (res as http.ServerResponse).writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { code: 403, status: 'PERMISSION_DENIED', message: 'Original caller project rejected' } }));
     });
 
     const req = createMockRequest({
@@ -229,6 +189,8 @@ describe('Cloud Code eligibility project-context handling', () => {
     await gateway.handleRequest(req, res);
 
     expect(calls).toHaveLength(1);
+    expect(managedTransport).not.toHaveBeenCalled();
+    expect(leaseService.getNextToken).not.toHaveBeenCalled();
     expect(calls[0].headers['x-goog-user-project']).toBe('disabled-proj');
     expect(calls[0].body.equals(Buffer.from(JSON.stringify({ metadata: { ide: 'antigravity' } })))).toBe(true);
     expect(res.statusCode).toBe(403);
