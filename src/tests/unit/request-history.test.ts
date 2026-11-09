@@ -42,6 +42,38 @@ describe('persistent request history', () => {
     expect(fs.statSync(file).mode & 0o777).toBe(0o600);
   });
 
+  it('groups UTC hours with the same filters and preserves daily totals', () => {
+    const store = new RequestHistoryStore(':memory:', { now: () => Date.parse('2026-11-09T12:00:00Z') }); stores.push(store);
+    for (const [time, status, project_id] of [
+      ['2026-11-08T23:59:00Z', 200, 'one'], ['2026-11-09T00:00:00Z', 502, 'one'],
+      ['2026-11-09T00:59:59Z', 200, 'one'], ['2026-11-09T01:00:00Z', 200, 'two'],
+    ] as const) store.record({ ...input, time, status, project_id });
+    const summary = store.getUsageSummary({ projectId: 'one', from: '2026-11-09T00:00:00Z', to: '2026-11-09T00:59:59Z' });
+    expect(summary.by_hour).toEqual([expect.objectContaining({ hour: '2026-11-09T00:00:00.000Z', total_requests: 2, failed_requests: 1, input_tokens: null })]);
+    expect(summary.by_day).toEqual([expect.objectContaining({ date: '2026-11-09', total_requests: 2, failed_requests: 1 })]);
+    expect(summary.total_requests).toBe(2);
+    expect(store.getUsageSummary().by_hour).toHaveLength(3);
+    expect(store.getUsageSummary({ projectId: 'missing' }).by_hour).toEqual([]);
+  });
+
+  it('retains safe service operations and distinguishes pool, client and historical attribution', () => {
+    const store = new RequestHistoryStore(':memory:'); stores.push(store);
+    for (const row of [
+      { route: '/v1internal:fetchAvailableModels?token=private', protocol: 'connect' as const, model: undefined },
+      { route: '/v1internal:recordClientEvent', protocol: 'connect' as const, account_id: 'A', model: undefined },
+      { route: 'other', protocol: 'connect' as const, model: undefined },
+      { route: '/v1internal:generateContent', protocol: 'connect' as const, model: 'gemini-pro', account_id: 'B', effective_model: 'gemini-pro' },
+    ]) store.record({ ...input, ...row });
+    const rows = store.getRequestHistory().items;
+    expect(rows.find(r => r.route === '/v1internal:fetchAvailableModels')).toMatchObject({ request_kind: 'service', authorization_source: 'client', requested_model: null });
+    expect(rows.find(r => r.route === '/v1internal:recordClientEvent')).toMatchObject({ request_kind: 'service', authorization_source: 'pool', account_id: 'A' });
+    expect(rows.find(r => r.route === 'other')).toMatchObject({ request_kind: 'unknown', authorization_source: 'unknown' });
+    expect(rows.find(r => r.route === '/v1internal:generateContent')).toMatchObject({ request_kind: 'inference', requested_model: 'gemini-pro', effective_model: 'gemini-pro', account_id: 'B' });
+    expect(JSON.stringify(rows)).not.toContain('private');
+    store.record({ ...input, route: '/v1internal:privateUnknownOperation' });
+    expect(store.getRequestHistory().items[0].route).toBe('other');
+  });
+
   it('prunes by age and count, cascades attempt records, and filters safely', () => {
     let now = Date.parse('2026-11-09T12:00:00Z');
     const store = new RequestHistoryStore(temporaryDatabase(), { now: () => now, maxEntries: 2 }); stores.push(store);
