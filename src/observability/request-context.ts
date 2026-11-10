@@ -52,18 +52,32 @@ export function observeAccountOutcome(accountId: string, model: string | undefin
   if (outcome === 'success') context.ttft_ms = selected.ttft_ms;
 }
 
+export type ResponseUsage = Partial<Pick<RequestObservation, 'input_tokens' | 'output_tokens' | 'cache_tokens'>>;
+
 /** Read numeric usage fields only, retaining no payload text or response structure. */
+export function extractResponseUsage(payload: unknown): ResponseUsage {
+  if (!payload || typeof payload !== 'object') return {};
+  const object = payload as Record<string, unknown>;
+  if (object.error) return {};
+  const nested = object.response && typeof object.response === 'object' ? object.response as Record<string, unknown> : object;
+  if (nested.error) return {};
+  const usage = (nested.usageMetadata ?? nested.usage) as Record<string, unknown> | undefined;
+  if (!usage || typeof usage !== 'object') return {};
+  const details = usage.prompt_tokens_details && typeof usage.prompt_tokens_details === 'object' ? usage.prompt_tokens_details as Record<string, unknown> : undefined;
+  const result: ResponseUsage = {};
+  for (const [key, value] of [
+    ['input_tokens', usage.promptTokenCount ?? usage.input_tokens ?? usage.prompt_tokens],
+    ['output_tokens', usage.candidatesTokenCount ?? usage.output_tokens ?? usage.completion_tokens],
+    ['cache_tokens', usage.cachedContentTokenCount ?? usage.cache_read_input_tokens ?? details?.cached_tokens],
+  ] as const) {
+    const count = nullableCount(value);
+    if (count !== null) result[key] = count;
+  }
+  return result;
+}
 export function observeResponseUsage(payload: unknown): void {
   const context = observations.getStore();
-  if (!context || context.finished || !payload || typeof payload !== 'object') return;
-  const object = payload as Record<string, unknown>;
-  const nested = object.response && typeof object.response === 'object' ? object.response as Record<string, unknown> : object;
-  const usage = (nested.usageMetadata ?? nested.usage) as Record<string, unknown> | undefined;
-  if (!usage || typeof usage !== 'object') return;
-  const details = usage.prompt_tokens_details && typeof usage.prompt_tokens_details === 'object' ? usage.prompt_tokens_details as Record<string, unknown> : undefined;
-  context.input_tokens = nullableCount(usage.promptTokenCount ?? usage.input_tokens ?? usage.prompt_tokens);
-  context.output_tokens = nullableCount(usage.candidatesTokenCount ?? usage.output_tokens ?? usage.completion_tokens);
-  context.cache_tokens = nullableCount(usage.cachedContentTokenCount ?? usage.cache_read_input_tokens ?? details?.cached_tokens);
+  if (context && !context.finished) Object.assign(context, extractResponseUsage(payload));
 }
 
 /** A validated first frame is not proof that an upstream stream completed. */
@@ -71,9 +85,10 @@ export function observeUpstreamStreamFailure(accountId?: string, model?: string)
   const context = observations.getStore();
   if (!context || context.finished) return;
   const attempt = context.attempts.at(-1);
-  if (!attempt || (accountId && attempt.account_id !== accountId)) return;
+  if (attempt && accountId && attempt.account_id !== accountId) return;
+  context.upstream_failed = true;
+  if (!attempt) return;
   attempt.outcome = 'failure';
   attempt.error_category = 'upstream_error';
   if (model) attempt.effective_model = safeLabel(model, '') || null;
-  context.upstream_failed = true;
 }

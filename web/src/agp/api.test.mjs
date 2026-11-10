@@ -5,9 +5,15 @@ import ts from 'typescript';
 const code = ts.transpileModule(fs.readFileSync(new URL('./api.ts', import.meta.url), 'utf8'), {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const { api, setCsrf, mapping, display, requestAccountLabel, requestModelLabel } = await import(
-  `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`
-);
+const {
+  api,
+  setCsrf,
+  mapping,
+  display,
+  requestAccountLabel,
+  requestModelLabel,
+  missingMeasurement,
+} = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
 globalThis.window = { setTimeout, clearTimeout, dispatchEvent: () => {} };
 test('API uses same origin HttpOnly session with CSRF only on mutations; no management Authorization', async () => {
   let seen;
@@ -102,4 +108,29 @@ test('account labels use verified authorization source and resolve pool identiti
   );
   assert.equal(requestAccountLabel({ account_id: 'id' }, [{ id: 'id', name: 'Pool' }]), 'Pool');
   assert.equal(requestAccountLabel({ account_id: 'removed' }, []), 'removed');
+});
+
+test('missing metrics distinguish non-applicable service calls, failed requests, old metadata and absent counters', () => {
+  for (const request_kind of ['service', 'probe']) {
+    const message = missingMeasurement({ request_kind, route: '/' }, 'input_tokens');
+    assert.equal(message.label, '—');
+    assert.match(message.reason, /Не применяется/);
+  }
+  assert.equal(
+    missingMeasurement({ route: 'other', status: 200 }, 'input_tokens').label,
+    'Не сохранено'
+  );
+  assert.equal(
+    missingMeasurement({ route: 'other', status: 404 }, 'input_tokens').label,
+    'Нет данных'
+  );
+  assert.equal(
+    missingMeasurement({ route: '/v1/chat/completions', status: 200 }, 'input_tokens').label,
+    'Не передано'
+  );
+  assert.equal(requestModelLabel({ request_kind: 'probe', route: '/' }), 'Корневой адрес сервиса');
+  assert.equal(
+    requestModelLabel({ request_kind: 'unknown', route: '/v1internal:NewRpc' }),
+    'Модель не записана'
+  );
 });

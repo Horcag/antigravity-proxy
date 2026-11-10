@@ -345,7 +345,11 @@ requests with the selected period and filters; exclusive interval ends prevent b
 double-counting. Request filters are editable to the second in Samara time, and separate
 attempt counts explain retries within one logical request.
 The request journal labels native service operations separately from inference and distinguishes
-client authorization from managed pool accounts. Older opaque `other` records retain an explicit
+client authorization from managed pool accounts. Native JSON/SSE usage (including gzip,
+deflate and Brotli) is observed without changing relayed bytes; binary protocols and absent
+counters remain unmeasured. Service/root probes display non-applicable metrics separately
+from failed responses and missing saved metadata. Bounded RPC method names are retained
+without query values or resource identifiers. Older opaque `other` records retain an explicit
 missing-operation label; their original operation cannot be reconstructed.
 Old in-memory request history cannot be reconstructed after the upgrade.
 

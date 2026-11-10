@@ -70,6 +70,8 @@ export function requestModelLabel(request: RequestEntry): string {
   if (request.route === 'other' && !request.requested_model && !request.effective_model)
     return 'Операция не сохранена';
   if (request.request_kind === 'service') return 'Служебный запрос';
+  if (request.request_kind === 'probe') return 'Корневой адрес сервиса';
+  if (!request.requested_model && !request.effective_model) return 'Модель не записана';
   return `${request.requested_model ?? 'Не измерена'} → ${request.effective_model ?? 'Не измерена'}`;
 }
 
@@ -80,4 +82,27 @@ export function requestAccountLabel(request: RequestEntry, accounts: Account[]):
       : 'Аккаунт неизвестен';
   const account = accounts.find((item) => item.id === request.account_id);
   return account?.email || account?.name || request.account_id;
+}
+
+export function missingMeasurement(request: RequestEntry, metric: string) {
+  if (request.request_kind === 'service' || request.request_kind === 'probe')
+    return { label: '—', reason: 'Не применяется: эта операция не является генерацией модели.' };
+  if (request.status >= 400 || (request.grpc_status && request.grpc_status !== '0'))
+    return {
+      label: 'Нет данных',
+      reason: 'Запрос завершился ошибкой; это измерение не было получено.',
+    };
+  if (request.route === 'other')
+    return {
+      label: 'Не сохранено',
+      reason:
+        'Измерение не сохранено, а операция записана как other. Из этой записи нельзя определить, применим ли показатель.',
+    };
+  return {
+    label: 'Не передано',
+    reason:
+      metric === 'ttft_ms'
+        ? 'Время до первого токена не было измерено для этого запроса.'
+        : 'Ответ не передал этот счётчик, либо он отсутствует в сохранённых метаданных. Это не ноль.',
+  };
 }

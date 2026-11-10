@@ -1,3 +1,4 @@
+import { createNativeResponseUsage } from '../../../observability/native-response-usage';
 import { observeUpstreamStreamFailure } from '../../../observability/request-context';
 import type http from 'node:http';
 import type http2 from 'node:http2';
@@ -57,4 +58,30 @@ export function createRelayCompletionPromise(
       onDone();
     });
   });
+}
+
+/** Завершает учёт метаданных до события finish и сохраняет исходные trailers. */
+export function createNativeRelayEnd(
+  res: http.ServerResponse | http2.Http2ServerResponse,
+  bodyStream: Readable & { trailers?: http.IncomingHttpHeaders },
+  headers: http.IncomingHttpHeaders,
+  endDownstream: () => boolean,
+  rejectDownstream: (error: unknown) => void,
+  onUpstreamEnd: () => void = () => {},
+) {
+  const contentType = headers['content-type'] ? String(headers['content-type']) : undefined;
+  const responseUsage = createNativeResponseUsage(contentType, headers['content-encoding'] as string | undefined);
+  const onStreamEnd = async () => {
+    onUpstreamEnd();
+    await responseUsage.finish(!bodyStream.trailers?.['grpc-status'] || String(bodyStream.trailers['grpc-status']) === '0');
+    try {
+      if (bodyStream.trailers && typeof res.addTrailers === 'function' && !res.writableEnded) res.addTrailers(bodyStream.trailers);
+      if (!res.writableEnded) endDownstream();
+    } catch (error) { rejectDownstream(error); }
+  };
+  bodyStream.once('end', onStreamEnd);
+  bodyStream.once('error', responseUsage.discard);
+  res.once('close', responseUsage.discard);
+  res.once('error', responseUsage.discard);
+  return { responseUsage, onStreamEnd };
 }
