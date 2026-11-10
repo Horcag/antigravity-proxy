@@ -77,9 +77,14 @@ and JSON `{ "error": { "code": ..., "message": ... } }`.
 `default_model`, and `source`. `models/proactive-observer-v10` was observed on 2026-11-10;
 query the endpoint instead of assuming it remains available.
 
-Transport and mock integration have been tested, but successful native transcription with a real
-account has not yet been verified. The currently active existing pool token lacks the
-`https://www.googleapis.com/auth/aicode` scope and returns HTTP 403 `speech_scope_required`;
-this is not a ToS violation. The existing OAuth authorization request already includes that scope.
-Use the management console's Add account or reconnect flow to grant it and import the same account,
-then retry. A successful real transcription is still needed to establish end-to-end acceptance.
+Native speech requires an OAuth grant containing `https://www.googleapis.com/auth/aicode`.
+The proxy substitutes the selected pool account's access token; it does not depend on the
+account currently signed in to the native application. `speech_scope_required` (HTTP 403)
+means the selected credential lacks that permission, and is distinct from a ToS restriction.
+
+An account can have multiple refresh tokens with different grants. Before requesting a new
+sign-in, check whether the same account already has a working credential in Antigravity Manager
+or a native client. Refresh and import that existing credential through the normal account
+import route; switching the application's active account is unnecessary. Request OAuth consent
+only when no existing credential has the required grant. The existing account authorization
+flow already includes the speech scope.
