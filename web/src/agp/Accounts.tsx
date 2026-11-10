@@ -4,6 +4,7 @@ import { Input } from '@/components/ui/Input';
 import { Modal } from '@/components/ui/Modal';
 import { consoleApi } from './api';
 import type { Account } from './types';
+import { formatConsoleValue, formatSamaraDateTime } from './time';
 import {
   Button,
   Card,
@@ -105,7 +106,7 @@ export function Accounts() {
       />
       <Card>
         <DataTable
-          headers={['Аккаунт', 'Статус', 'Квота', 'Успех / ошибки', 'Действия']}
+          headers={['Аккаунт', 'Статус', 'Квота', 'Успешные / неудачные попытки', 'Действия']}
           rows={(resource.data ?? [])
             .filter((a) =>
               `${a.id} ${a.name} ${a.email}`.toLowerCase().includes(search.toLowerCase())
@@ -134,17 +135,48 @@ export function Accounts() {
                       .slice(0, 3)
                       .map(([model, quota]) => (
                         <small key={model}>
-                          {model}: {quota.percentage}%
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => setSelected(a)}
+                            aria-label={`Снимок квоты ${model} аккаунта ${a.name || a.email}: ${quota.percentage}%`}
+                          >
+                            {model}: {quota.percentage}%
+                          </Button>
                         </small>
                       ))}
                     {Object.keys(a.quota.models).length > 3 && (
-                      <small>Ещё {Object.keys(a.quota.models).length - 3} — в подробностях</small>
+                      <small>
+                        <Button size="sm" variant="secondary" onClick={() => setSelected(a)}>
+                          Ещё {Object.keys(a.quota.models).length - 3} — в подробностях
+                        </Button>
+                      </small>
                     )}
                   </>
                 ) : (
                   'Неизвестно'
                 ),
-                `${display(s?.success_attempts ?? (stats.data ? 0 : undefined))} / ${display(s?.failed_attempts ?? (stats.data ? 0 : undefined))}`,
+                <>
+                  {stats.data ? (
+                    <>
+                      <Link
+                        to={`/requests?accountId=${encodeURIComponent(a.id)}&attemptOutcome=success`}
+                        aria-label={`Успешные попытки аккаунта ${a.name || a.email}: ${s?.success_attempts ?? 0}`}
+                      >
+                        {display(s?.success_attempts ?? 0)}
+                      </Link>
+                      {' / '}
+                      <Link
+                        to={`/requests?accountId=${encodeURIComponent(a.id)}&attemptOutcome=failure`}
+                        aria-label={`Неудачные попытки аккаунта ${a.name || a.email}: ${s?.failed_attempts ?? 0}`}
+                      >
+                        {display(s?.failed_attempts ?? 0)}
+                      </Link>
+                    </>
+                  ) : (
+                    'Неизвестно'
+                  )}
+                </>,
                 <div className="agp-actions">
                   <Button size="sm" variant="secondary" onClick={() => setSelected(a)}>
                     Подробнее
@@ -186,19 +218,26 @@ export function Accounts() {
                 .map(([k, v]) => (
                   <div key={k}>
                     <dt>{k}</dt>
-                    <dd>{display(v)}</dd>
+                    <dd>{formatConsoleValue(k, v)}</dd>
                   </div>
                 ))}
             </dl>
             {selected.quota && (
-              <DataTable
-                headers={['Модель', 'Осталось, %', 'Сброс квоты']}
-                rows={Object.entries(selected.quota.models).map(([model, quota]) => [
-                  model,
-                  quota.percentage,
-                  quota.resetTime,
-                ])}
-              />
+              <>
+                <p>
+                  Источник: сохранённый сервером снимок квоты Google. Последнее успешное обновление:{' '}
+                  {formatSamaraDateTime(selected.quota.last_successful_refresh_at)}. Проценты
+                  отражают снимок провайдера, а не сумму записанных запросов.
+                </p>
+                <DataTable
+                  headers={['Модель', 'Осталось, %', 'Сброс квоты']}
+                  rows={Object.entries(selected.quota.models).map(([model, quota]) => [
+                    model,
+                    quota.percentage,
+                    formatSamaraDateTime(quota.resetTime),
+                  ])}
+                />
+              </>
             )}
             <Link
               className="btn btn-secondary"

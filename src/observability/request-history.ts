@@ -32,15 +32,23 @@ export interface HistoryInput {
   cache_tokens?: number | null;
   attempts?: AttemptRecord[];
 }
+export type HistoryGranularity = 'minute' | 'five_minutes' | 'hour' | 'day';
+export type HistoryMetric = 'input_tokens' | 'output_tokens' | 'cache_tokens' | 'ttft_ms' | 'duration_ms';
 export interface HistoryFilters {
   limit?: number;
   offset?: number;
   accountId?: string;
+  finalAccountId?: string;
+  attemptOutcome?: AttemptRecord['outcome'];
+  metric?: HistoryMetric;
+  missingModel?: boolean;
   projectId?: string;
   model?: string;
   status?: number | string;
+  result?: 'success' | 'failure' | 'none';
   from?: string | number;
   to?: string | number;
+  toExclusive?: string | number;
 }
 export interface HistoryEntry {
   request_kind: 'inference' | 'service' | 'unknown';
@@ -144,7 +152,7 @@ export class RequestHistoryStore {
     this.db.prepare('DELETE FROM requests WHERE time < ?').run(new Date(this.now() - this.retentionMs).toISOString());
     this.db.prepare('DELETE FROM requests WHERE sequence IN (SELECT sequence FROM requests ORDER BY sequence DESC LIMIT -1 OFFSET ?)').run(this.maxEntries);
   }
-  getRequestHistory(filters: HistoryFilters = {}): { items: HistoryEntry[]; total: number } {
+  getRequestHistory(filters: HistoryFilters = {}): { items: HistoryEntry[]; total: number; matching_attempts?: number } {
     this.prune();
     const { where, params } = this.filter(filters);
     const total = (this.db.prepare(`SELECT COUNT(*) AS total FROM requests ${where}`).get(...params) as { total: number }).total;
@@ -152,10 +160,16 @@ export class RequestHistoryStore {
     const offset = Math.max(0, Math.floor(filters.offset ?? 0));
     const rows = this.db.prepare(`SELECT * FROM requests ${where} ORDER BY time DESC, sequence DESC LIMIT ? OFFSET ?`).all(...params, limit, offset) as StoredEntry[];
     const attempts = this.db.prepare('SELECT account_id,effective_model,outcome,error_category,ttft_ms FROM attempts WHERE request_id = ? ORDER BY sequence');
-    return { total, items: rows.map(({ sequence: _sequence, ...row }) => ({ ...row, ...requestMetadata(row.route, row.protocol, row.account_id), id: row.request_id,
+    const matchingAttempts = filters.attemptOutcome === undefined ? {} : {
+      matching_attempts: (this.db.prepare(`SELECT COUNT(*) AS total FROM attempts matched
+        WHERE matched.request_id IN (SELECT request_id FROM requests ${where}) AND matched.outcome = ?
+        ${filters.accountId !== undefined ? 'AND matched.account_id = ?' : ''}`).get(...params, filters.attemptOutcome,
+        ...(filters.accountId !== undefined ? [filters.accountId] : [])) as { total: number }).total,
+    };
+    return { total, ...matchingAttempts, items: rows.map(({ sequence: _sequence, ...row }) => ({ ...row, ...requestMetadata(row.route, row.protocol, row.account_id), id: row.request_id,
       project: { id: row.project_id, name: row.project_name }, attempts: attempts.all(row.request_id) as AttemptRecord[] })) };
   }
-  getUsageSummary(filters: HistoryFilters = {}) {
+  getUsageSummary(filters: HistoryFilters = {}, granularity: HistoryGranularity = 'hour') {
     this.prune();
     const { where, params } = this.filter(filters);
     const summary = this.db.prepare(`SELECT COUNT(*) AS total_requests, COALESCE(SUM(CASE WHEN ${failedSql} THEN 1 ELSE 0 END),0) AS failed_requests,
@@ -170,29 +184,70 @@ export class RequestHistoryStore {
     const by_hour = this.db.prepare(`SELECT substr(time,1,13) || ':00:00.000Z' AS hour, COUNT(*) AS total_requests, SUM(CASE WHEN ${failedSql} THEN 1 ELSE 0 END) AS failed_requests, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens FROM requests ${where} GROUP BY substr(time,1,13) ORDER BY hour`).all(...params);
     const by_model = this.db.prepare(`SELECT requested_model AS model, COUNT(*) AS total_requests, SUM(CASE WHEN ${failedSql} THEN 1 ELSE 0 END) AS failed_requests, AVG(duration_ms) AS avg_duration_ms, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens FROM requests ${where} GROUP BY requested_model ORDER BY total_requests DESC`).all(...params);
     const { value: started_at } = this.db.prepare("SELECT value FROM history_metadata WHERE key='started_at'").get() as { value: string };
-    return { ...summary, started_at, available_since: started_at, by_day, by_hour, by_model, success_requests: summary.total_requests - summary.failed_requests,
+    return { ...summary, ...this.timeBuckets(filters, granularity), started_at, available_since: started_at, by_day, by_hour, by_model, success_requests: summary.total_requests - summary.failed_requests,
       token_metrics_available: summary.requests_with_input_tokens > 0 || summary.requests_with_output_tokens > 0,
       cache_metrics_available: summary.requests_with_cache_tokens > 0, retention_days: this.retentionMs / 86_400_000, max_entries: this.maxEntries };
+  }
+  private timeBuckets(filters: HistoryFilters, granularity: HistoryGranularity) {
+    const { where, params } = this.filter(filters);
+    const interval = { minute: 60_000, five_minutes: 300_000, hour: 3_600_000, day: 86_400_000 }[granularity];
+    const offset = 4 * 3_600_000;
+    const bounds = this.db.prepare(`SELECT MIN(time) AS first, MAX(time) AS last FROM requests ${where}`).get(...params) as { first: string | null; last: string | null };
+    const earliest = this.now() - this.retentionMs;
+    const from = Math.max(earliest, filters.from === undefined ? Date.parse(bounds.first ?? '') : new Date(filters.from).getTime());
+    const selectedEnd = filters.toExclusive !== undefined || filters.to !== undefined
+      ? Math.min(filters.toExclusive === undefined ? Infinity : new Date(filters.toExclusive).getTime(), filters.to === undefined ? Infinity : new Date(filters.to).getTime() + 1)
+      : Date.parse(bounds.last ?? '') + 1;
+    const toExclusive = Math.min(this.now() + 1, selectedEnd);
+    const range = { from: null as string | null, toExclusive: null as string | null };
+    const buckets: { start: string; end: string; total_requests: number; failed_requests: number; input_tokens: number | null; output_tokens: number | null }[] = [];
+    if (!Number.isFinite(from) || !Number.isFinite(toExclusive) || from >= toExclusive) return { granularity, time_zone: 'Europe/Samara', range, buckets };
+    const first = Math.floor((from + offset) / interval) * interval - offset;
+    const last = Math.floor((toExclusive - 1 + offset) / interval) * interval - offset;
+    // Ограничиваем заполнение пропусков даже при ошибочно большом диапазоне.
+    const start = Math.max(first, last - 10_081 * interval);
+    range.from = new Date(Math.max(from, start)).toISOString();
+    range.toExclusive = new Date(toExclusive).toISOString();
+    const rows = this.db.prepare(`SELECT CAST((CAST(strftime('%s', time) AS INTEGER) * 1000 + ${offset}) / ${interval} AS INTEGER) * ${interval} - ${offset} AS bucket,
+      COUNT(*) AS total_requests, SUM(CASE WHEN ${failedSql} THEN 1 ELSE 0 END) AS failed_requests,
+      SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens FROM requests ${where} GROUP BY bucket`).all(...params) as {
+        bucket: number; total_requests: number; failed_requests: number; input_tokens: number | null; output_tokens: number | null;
+      }[];
+    const counts = new Map(rows.map(({ bucket, ...row }) => [bucket, row]));
+    for (let time = start; time < toExclusive; time += interval) {
+      buckets.push({ start: new Date(Math.max(time, from)).toISOString(), end: new Date(Math.min(time + interval, toExclusive)).toISOString(),
+        ...(counts.get(time) ?? { total_requests: 0, failed_requests: 0, input_tokens: null, output_tokens: null }) });
+    }
+    return { granularity, time_zone: 'Europe/Samara', range, buckets };
   }
   getAccountStats(filters: HistoryFilters = {}) {
     this.prune();
     const { where, params } = this.filter(filters);
     return this.db.prepare(`WITH selected_requests AS (SELECT * FROM requests ${where}),
+      account_ids AS (SELECT account_id FROM selected_requests WHERE account_id IS NOT NULL
+        UNION SELECT a.account_id FROM attempts a JOIN selected_requests r ON a.request_id=r.request_id),
       final_usage AS (SELECT account_id, AVG(duration_ms) AS avg_duration_ms, SUM(input_tokens) AS input_tokens,
-        SUM(output_tokens) AS output_tokens, SUM(cache_tokens) AS cache_tokens FROM selected_requests GROUP BY account_id)
-      SELECT a.account_id, COUNT(*) AS total_attempts,
-      MAX(u.avg_duration_ms) AS avg_duration_ms, MAX(u.input_tokens) AS input_tokens, MAX(u.output_tokens) AS output_tokens, MAX(u.cache_tokens) AS cache_tokens,
-      SUM(CASE WHEN a.outcome='success' THEN 1 ELSE 0 END) AS success_attempts,
-      SUM(CASE WHEN a.outcome='failure' THEN 1 ELSE 0 END) AS failed_attempts,
-      SUM(CASE WHEN a.outcome='unknown' THEN 1 ELSE 0 END) AS unknown_attempts,
-      AVG(a.ttft_ms) AS avg_ttft_ms, MAX(r.time) AS last_request_at,
-      COUNT(DISTINCT r.request_id) AS logical_requests,
-      COUNT(DISTINCT CASE WHEN r.account_id=a.account_id THEN r.request_id END) AS final_requests,
-      COUNT(DISTINCT CASE WHEN r.account_id=a.account_id AND r.status<400 AND (r.grpc_status IS NULL OR r.grpc_status='0') THEN r.request_id END) AS success_requests,
-      COUNT(DISTINCT CASE WHEN r.account_id=a.account_id AND (r.status>=400 OR (r.grpc_status IS NOT NULL AND r.grpc_status!='0')) THEN r.request_id END) AS failed_requests
-      FROM attempts a JOIN selected_requests r ON a.request_id=r.request_id LEFT JOIN final_usage u ON u.account_id=a.account_id
-      ${filters.accountId !== undefined ? 'WHERE a.account_id = ?' : ''}
-      GROUP BY a.account_id ORDER BY a.account_id`).all(...params, ...(filters.accountId !== undefined ? [filters.accountId] : [])) as {
+        SUM(output_tokens) AS output_tokens, SUM(cache_tokens) AS cache_tokens, COUNT(*) AS final_requests,
+        SUM(CASE WHEN ${failedSql} THEN 1 ELSE 0 END) AS failed_requests FROM selected_requests GROUP BY account_id),
+      attempt_usage AS (SELECT a.account_id, COUNT(*) AS total_attempts,
+        SUM(CASE WHEN a.outcome='success' THEN 1 ELSE 0 END) AS success_attempts,
+        SUM(CASE WHEN a.outcome='failure' THEN 1 ELSE 0 END) AS failed_attempts,
+        SUM(CASE WHEN a.outcome='unknown' THEN 1 ELSE 0 END) AS unknown_attempts, AVG(a.ttft_ms) AS avg_ttft_ms
+        FROM attempts a JOIN selected_requests r ON a.request_id=r.request_id
+        ${filters.attemptOutcome !== undefined ? 'WHERE a.outcome = ?' : ''} GROUP BY a.account_id)
+      SELECT ids.account_id, COALESCE(a.total_attempts,0) AS total_attempts,
+        COALESCE(a.success_attempts,0) AS success_attempts, COALESCE(a.failed_attempts,0) AS failed_attempts,
+        COALESCE(a.unknown_attempts,0) AS unknown_attempts, a.avg_ttft_ms,
+        u.avg_duration_ms, u.input_tokens, u.output_tokens, u.cache_tokens,
+        COALESCE(u.final_requests,0) AS final_requests, COALESCE(u.failed_requests,0) AS failed_requests,
+        COALESCE(u.final_requests-u.failed_requests,0) AS success_requests,
+        (SELECT COUNT(*) FROM selected_requests r WHERE r.account_id=ids.account_id OR EXISTS
+          (SELECT 1 FROM attempts participant WHERE participant.request_id=r.request_id AND participant.account_id=ids.account_id)) AS logical_requests,
+        (SELECT MAX(r.time) FROM selected_requests r WHERE r.account_id=ids.account_id OR EXISTS
+          (SELECT 1 FROM attempts participant WHERE participant.request_id=r.request_id AND participant.account_id=ids.account_id)) AS last_request_at
+      FROM account_ids ids LEFT JOIN final_usage u ON u.account_id=ids.account_id LEFT JOIN attempt_usage a ON a.account_id=ids.account_id
+      ${filters.accountId !== undefined || filters.attemptOutcome !== undefined ? `WHERE ${[filters.accountId !== undefined ? 'ids.account_id = ?' : '', filters.attemptOutcome !== undefined ? 'a.total_attempts > 0' : ''].filter(Boolean).join(' AND ')}` : ''}
+      ORDER BY ids.account_id`).all(...params, ...(filters.attemptOutcome !== undefined ? [filters.attemptOutcome] : []), ...(filters.accountId !== undefined ? [filters.accountId] : [])) as {
         account_id: string; total_attempts: number; success_attempts: number; failed_attempts: number; unknown_attempts: number;
         avg_duration_ms: number | null; input_tokens: number | null; output_tokens: number | null; cache_tokens: number | null; avg_ttft_ms: number | null; last_request_at: string; logical_requests: number; final_requests: number; success_requests: number; failed_requests: number;
       }[];
@@ -200,9 +255,18 @@ export class RequestHistoryStore {
   close(): void { if (!this.closed) { this.db.close(); this.closed = true; } }
   private filter(filters: HistoryFilters) {
     const clauses: string[] = [], params: (string | number)[] = [];
-    if (filters.accountId !== undefined) {
+    if (filters.attemptOutcome !== undefined) {
+      clauses.push(`EXISTS (SELECT 1 FROM attempts participant WHERE participant.request_id = requests.request_id AND participant.outcome = ?${filters.accountId !== undefined ? ' AND participant.account_id = ?' : ''})`);
+      params.push(filters.attemptOutcome, ...(filters.accountId !== undefined ? [filters.accountId] : []));
+    } else if (filters.accountId !== undefined) {
       clauses.push('(account_id = ? OR EXISTS (SELECT 1 FROM attempts participant WHERE participant.request_id = requests.request_id AND participant.account_id = ?))');
       params.push(filters.accountId, filters.accountId);
+    }
+    if (filters.finalAccountId !== undefined) { clauses.push('account_id = ?'); params.push(filters.finalAccountId); }
+    if (filters.missingModel !== undefined) clauses.push(`requested_model IS ${filters.missingModel ? '' : 'NOT '}NULL`);
+    if (filters.metric !== undefined) {
+      const columns: HistoryMetric[] = ['input_tokens', 'output_tokens', 'cache_tokens', 'ttft_ms', 'duration_ms'];
+      if (columns.includes(filters.metric)) clauses.push(`${filters.metric} IS NOT NULL`);
     }
     for (const [column, value] of [['project_id', filters.projectId], ['requested_model', filters.model]] as const) {
       if (value !== undefined) { clauses.push(`${column} = ?`); params.push(value); }
@@ -212,7 +276,8 @@ export class RequestHistoryStore {
       else if (filters.status === 'error' || filters.status === 'failure') clauses.push(failedSql);
       else if (Number.isInteger(Number(filters.status))) { clauses.push('status = ?'); params.push(Number(filters.status)); }
     }
-    for (const [operator, value] of [['>=', filters.from], ['<=', filters.to]] as const) {
+    if (filters.result !== undefined) clauses.push(filters.result === 'none' ? '0' : filters.result === 'success' ? `NOT ${failedSql}` : failedSql);
+    for (const [operator, value] of [['>=', filters.from], ['<=', filters.to], ['<', filters.toExclusive]] as const) {
       if (value !== undefined && Number.isFinite(new Date(value).getTime())) { clauses.push(`time ${operator} ?`); params.push(new Date(value).toISOString()); }
     }
     return { where: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '', params };
@@ -230,5 +295,5 @@ export function getRequestHistoryStore(): RequestHistoryStore {
   return store;
 }
 export function getRequestHistory(filters: HistoryFilters = {}) { return getRequestHistoryStore().getRequestHistory(filters); }
-export function getUsageSummary(filters: HistoryFilters = {}) { return getRequestHistoryStore().getUsageSummary(filters); }
+export function getUsageSummary(filters: HistoryFilters = {}, granularity: HistoryGranularity = 'hour') { return getRequestHistoryStore().getUsageSummary(filters, granularity); }
 export function getAccountStats(filters: HistoryFilters = {}) { return getRequestHistoryStore().getAccountStats(filters); }

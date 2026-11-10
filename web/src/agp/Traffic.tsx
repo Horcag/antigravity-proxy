@@ -1,79 +1,116 @@
-import {
-  localDateValue,
-  requestAccountLabel,
-  requestModelLabel,
-  statisticsQueryDates,
-  statisticsTraffic,
-  type StatisticsGranularity,
-} from './api';
 import { useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { Input } from '@/components/ui/Input';
 import { Modal } from '@/components/ui/Modal';
-import { ThroughputChart } from '@/features/dashboard/components/ThroughputChart';
+import { requestAccountLabel, requestModelLabel } from './api';
+import {
+  formatConsoleValue,
+  formatSamaraDateTime,
+  localDateTimeValue,
+  samaraDateTimeToIso,
+} from './time';
+import { formatMetric, historyParams, metricLabels, requestsHref } from './trafficNavigation';
 import type { Account, Project, RequestEntry, Statistics } from './types';
 import { Button, Card, DataTable, PageHeader, display, useResource } from './shared';
-function Dates({
-  from,
-  to,
-  setFrom,
-  setTo,
-}: {
-  from: string;
-  to: string;
-  setFrom: (s: string) => void;
-  setTo: (s: string) => void;
-}) {
-  return (
-    <>
-      <Input label="С даты" type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
-      <Input label="По дату" type="date" value={to} onChange={(e) => setTo(e.target.value)} />
-    </>
-  );
-}
+
 export function Requests() {
   const [params, setParams] = useSearchParams();
-  const [offset, setOffset] = useState(0);
   const [selected, setSelected] = useState<RequestEntry>();
   const [search, setSearch] = useState('');
   const accounts = useResource<Account[]>('/accounts');
   const projects = useResource<Project[]>('/projects');
-  const filter = params.toString();
-  const resource = useResource<{ items: RequestEntry[]; total: number }>(
-    `/requests?${filter}&limit=50&offset=${offset}`
-  );
+  const filters = historyParams(params);
+  const rawOffset = Number(params.get('offset') ?? 0);
+  const offset = Number.isSafeInteger(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+  const resource = useResource<{
+    items: RequestEntry[];
+    total: number;
+    matching_attempts?: number;
+  }>(`/requests?${filters}&limit=50&offset=${offset}`);
+  const summary = useResource<Statistics>(`/statistics?${filters}&granularity=hour`);
   function change(key: string, value: string) {
     const next = new URLSearchParams(params);
     if (value) next.set(key, value);
     else next.delete(key);
-    setOffset(0);
+    if (key === 'model' && value) next.delete('missingModel');
+    if (key === 'missingModel' && value === 'true') next.delete('model');
+    if (key === 'toExclusive') next.delete('to');
+    next.delete('offset');
     setParams(next);
   }
+  function page(value: number) {
+    const next = new URLSearchParams(params);
+    if (value) next.set('offset', String(value));
+    else next.delete('offset');
+    setParams(next);
+  }
+  function accountSelect(key: 'accountId' | 'finalAccountId', label: string) {
+    return (
+      <label className="agp-field">
+        {label}
+        <select
+          className="input"
+          value={params.get(key) ?? ''}
+          onChange={(e) => change(key, e.target.value)}
+        >
+          <option value="">Все аккаунты</option>
+          {(accounts.data ?? []).map((a) => (
+            <option key={a.id} value={a.id}>
+              {a.email || a.name || a.id}
+            </option>
+          ))}
+        </select>
+      </label>
+    );
+  }
+  function detail(value: number | null | undefined, row: RequestEntry, label: string) {
+    return value === null || value === undefined ? (
+      display(value)
+    ) : (
+      <button
+        type="button"
+        className="agp-number-link"
+        onClick={() => setSelected(row)}
+        aria-label={`${label}: ${formatMetric(value)}. Открыть запрос`}
+      >
+        {formatMetric(value)}
+      </button>
+    );
+  }
+  const metric = params.get('metric');
+  const metricValue = metric
+    ? summary.data?.[
+        metric === 'duration_ms'
+          ? 'avg_duration_ms'
+          : metric === 'ttft_ms'
+            ? 'avg_ttft_ms'
+            : (metric as 'input_tokens' | 'output_tokens' | 'cache_tokens')
+      ]
+    : undefined;
   return (
     <>
-      <PageHeader title="Журнал запросов" resource={resource} />
+      <PageHeader
+        title="Журнал запросов"
+        resource={{
+          ...resource,
+          refresh: async () => {
+            await Promise.all([resource.refresh(), summary.refresh()]);
+          },
+        }}
+      />
       <Card title="Фильтры">
+        <p className="agp-muted">
+          Время по Самаре (UTC+4). Конец интервала не включается: соседние интервалы не
+          пересекаются.
+        </p>
         <div className="agp-filters">
           <Input
             label="Поиск в загруженной странице"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
           />
-          <label className="agp-field">
-            Участие аккаунта
-            <select
-              className="input"
-              value={params.get('accountId') ?? ''}
-              onChange={(e) => change('accountId', e.target.value)}
-            >
-              <option value="">Все аккаунты</option>
-              {(accounts.data ?? []).map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.email || a.name || a.id}
-                </option>
-              ))}
-            </select>
-          </label>
+          {accountSelect('accountId', 'Участие аккаунта')}
+          {accountSelect('finalAccountId', 'Итоговый аккаунт (измерения)')}
           <label className="agp-field">
             Проект
             <select
@@ -95,7 +132,19 @@ export function Requests() {
             onChange={(e) => change('model', e.target.value)}
           />
           <label className="agp-field">
-            Результат
+            Наличие модели
+            <select
+              className="input"
+              value={params.get('missingModel') ?? ''}
+              onChange={(e) => change('missingModel', e.target.value)}
+            >
+              <option value="">Все</option>
+              <option value="true">Без записанной модели</option>
+              <option value="false">С записанной моделью</option>
+            </select>
+          </label>
+          <label className="agp-field">
+            Результат запроса
             <select
               className="input"
               value={params.get('status') ?? ''}
@@ -106,42 +155,131 @@ export function Requests() {
               <option value="failure">Ошибка</option>
             </select>
           </label>
-          <Dates
-            from={localDateValue(params.get('from'))}
-            to={localDateValue(params.get('to'))}
-            setFrom={(v) => change('from', v ? new Date(`${v}T00:00:00`).toISOString() : '')}
-            setTo={(v) => change('to', v ? new Date(`${v}T23:59:59.999`).toISOString() : '')}
+          <label className="agp-field">
+            Группа показателя
+            <select
+              className="input"
+              value={params.get('result') ?? ''}
+              onChange={(e) => change('result', e.target.value)}
+            >
+              <option value="">Все результаты</option>
+              <option value="success">Успешные запросы</option>
+              <option value="failure">Запросы с ошибкой</option>
+              <option value="none">Пустое пересечение фильтров</option>
+            </select>
+          </label>
+          <label className="agp-field">
+            Исход попытки
+            <select
+              className="input"
+              value={params.get('attemptOutcome') ?? ''}
+              onChange={(e) => change('attemptOutcome', e.target.value)}
+            >
+              <option value="">Все</option>
+              <option value="success">Успешная попытка</option>
+              <option value="failure">Ошибка попытки</option>
+              <option value="unknown">Исход неизвестен</option>
+            </select>
+          </label>
+          <label className="agp-field">
+            Измеренный показатель
+            <select
+              className="input"
+              value={metric ?? ''}
+              onChange={(e) => change('metric', e.target.value)}
+            >
+              <option value="">Все запросы</option>
+              {Object.entries(metricLabels).map(([key, label]) => (
+                <option key={key} value={key}>
+                  {label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <Input
+            label="С (Самара)"
+            type="datetime-local"
+            step="1"
+            value={localDateTimeValue(params.get('from'))}
+            onChange={(e) => change('from', samaraDateTimeToIso(e.target.value))}
+          />
+          <Input
+            label="До, не включая (Самара)"
+            type="datetime-local"
+            step="1"
+            value={localDateTimeValue(params.get('toExclusive') ?? params.get('to'))}
+            onChange={(e) => change('toExclusive', samaraDateTimeToIso(e.target.value))}
           />
           <Button
             variant="secondary"
             onClick={() => {
               setParams({});
               setSearch('');
-              setOffset(0);
             }}
           >
             Сбросить фильтры
           </Button>
         </div>
       </Card>
+      <Card title="Состав показателя">
+        <p>
+          <Link className="agp-number-link" to={requestsHref(filters)}>
+            {formatMetric(resource.data?.total)} запросов
+          </Link>
+          {metric ? (
+            <>
+              {' '}
+              · {metricLabels[metric]}: <strong>{formatMetric(metricValue)}</strong> · показаны
+              только запросы с измерением
+            </>
+          ) : null}
+        </p>
+        {params.get('attemptOutcome') && (
+          <p className="agp-muted">
+            Совпавших попыток: {formatMetric(resource.data?.matching_attempts)}. Один запрос может
+            содержать несколько попыток; итог запроса может быть успешным после ошибки аккаунта.
+            Попытки видны в деталях каждого запроса.
+          </p>
+        )}
+        {(params.get('from') || params.get('toExclusive') || params.get('to')) && (
+          <p className="agp-muted">
+            {params.get('from')
+              ? formatSamaraDateTime(params.get('from'))
+              : 'Начало сохранённой истории'}{' '}
+            —{' '}
+            {params.get('toExclusive') || params.get('to')
+              ? formatSamaraDateTime(params.get('toExclusive') ?? params.get('to'))
+              : 'Настоящее время'}
+          </p>
+        )}
+        {summary.error && (
+          <p className="error-box" role="alert">
+            {summary.error}
+          </p>
+        )}
+      </Card>
       <Card>
         <DataTable
           headers={[
-            'Время',
+            'Время (Самара)',
             'Проект / аккаунт',
             'Модель → фактическая',
             'Результат',
             'Время, мс',
+            'TTFT, мс',
+            'Входные токены',
+            'Выходные токены',
+            'Кэш',
             'Детали',
           ]}
           rows={(resource.data?.items ?? [])
             .filter((r) =>
-              `${r.request_id} ${r.project_name} ${r.account_id} ${r.requested_model} ${r.effective_model} ${r.route}`
+              `${r.request_id} ${r.project_name} ${requestAccountLabel(r, accounts.data ?? [])} ${r.requested_model} ${r.effective_model} ${r.route}`
                 .toLowerCase()
                 .includes(search.toLowerCase())
             )
             .map((r) => [
-              new Date(r.time).toLocaleString('ru'),
+              formatSamaraDateTime(r.time),
               <>
                 {r.project_name}
                 <small>{requestAccountLabel(r, accounts.data ?? [])}</small>
@@ -150,13 +288,20 @@ export function Requests() {
                 {requestModelLabel(r)}
                 <small>{r.route}</small>
               </>,
-              <span
-                className={`agp-badge ${r.status >= 400 || (r.grpc_status && r.grpc_status !== '0') ? 'agp-warning' : ''}`}
+              <button
+                type="button"
+                className={`agp-badge agp-number-link ${r.status >= 400 || (r.grpc_status && r.grpc_status !== '0') ? 'agp-warning' : ''}`}
+                onClick={() => setSelected(r)}
+                aria-label={`Результат ${r.status}. Открыть запрос`}
               >
                 {r.status}
                 {r.grpc_status ? ` / gRPC ${r.grpc_status}` : ''}
-              </span>,
-              r.duration_ms,
+              </button>,
+              detail(r.duration_ms, r, 'Время ответа'),
+              detail(r.ttft_ms, r, 'TTFT'),
+              detail(r.input_tokens, r, 'Входные токены'),
+              detail(r.output_tokens, r, 'Выходные токены'),
+              detail(r.cache_tokens, r, 'Кэш'),
               <Button variant="secondary" size="sm" onClick={() => setSelected(r)}>
                 Открыть
               </Button>,
@@ -166,18 +311,19 @@ export function Requests() {
           <Button
             variant="secondary"
             disabled={!offset || resource.loading}
-            onClick={() => setOffset(Math.max(0, offset - 50))}
+            onClick={() => page(Math.max(0, offset - 50))}
           >
             Назад
           </Button>
           <span>
             {resource.data?.total ? offset + 1 : 0}–
-            {Math.min(offset + 50, resource.data?.total ?? 0)} из {resource.data?.total ?? 0}
+            {Math.min(offset + 50, resource.data?.total ?? 0)} из{' '}
+            {formatMetric(resource.data?.total)}
           </span>
           <Button
             variant="secondary"
             disabled={resource.loading || offset + 50 >= (resource.data?.total ?? 0)}
-            onClick={() => setOffset(offset + 50)}
+            onClick={() => page(offset + 50)}
           >
             Далее
           </Button>
@@ -187,18 +333,21 @@ export function Requests() {
         open={!!selected}
         title="Метаданные запроса"
         onClose={() => setSelected(undefined)}
-        width={800}
+        width={900}
       >
         {selected && (
           <>
-            <p>Сохраняются только метаданные. Тела запросов, ответов и ключи отсутствуют.</p>
+            <p>
+              Время по Самаре (UTC+4). Сохраняются только метаданные. Тела запросов, ответов и ключи
+              отсутствуют.
+            </p>
             <dl>
               {Object.entries(selected)
                 .filter(([key]) => key !== 'attempts')
                 .map(([key, value]) => (
                   <div key={key}>
                     <dt>{key}</dt>
-                    <dd>{display(value)}</dd>
+                    <dd>{formatConsoleValue(key, value)}</dd>
                   </div>
                 ))}
             </dl>
@@ -206,143 +355,16 @@ export function Requests() {
             <DataTable
               headers={['Аккаунт', 'Модель', 'Исход', 'Категория', 'TTFT, мс']}
               rows={selected.attempts.map((a) => [
-                a.account_id,
+                requestAccountLabel({ ...selected, account_id: a.account_id }, accounts.data ?? []),
                 display(a.effective_model),
                 a.outcome,
                 display(a.error_category),
-                display(a.ttft_ms),
+                formatMetric(a.ttft_ms),
               ])}
             />
           </>
         )}
       </Modal>
-    </>
-  );
-}
-export function StatisticsPage({ overview = false }: { overview?: boolean }) {
-  const [from, setFrom] = useState('');
-  const [to, setTo] = useState('');
-  const [granularity, setGranularity] = useState<StatisticsGranularity>(overview ? 'hour' : 'day');
-  const resource = useResource<Statistics>(`/statistics?${statisticsQueryDates(from, to)}`);
-  const accounts = useResource<Account[]>('/accounts');
-  const projects = useResource<Project[]>('/projects');
-  const s = resource.data;
-  const traffic = statisticsTraffic(s, granularity);
-  return (
-    <>
-      <PageHeader title={overview ? 'Обзор' : 'Статистика'} resource={resource} />
-      <div className="agp-filters">
-        <Dates from={from} to={to} setFrom={setFrom} setTo={setTo} />
-        <label className="agp-field">
-          Группировка
-          <select
-            className="input"
-            value={granularity}
-            onChange={(e) => setGranularity(e.target.value as StatisticsGranularity)}
-          >
-            <option value="hour">По часам</option>
-            <option value="day">По дням</option>
-          </select>
-        </label>
-        <Button
-          variant="secondary"
-          onClick={() => {
-            setFrom('');
-            setTo('');
-          }}
-        >
-          Сбросить период
-        </Button>
-      </div>
-      <div className="agp-metrics">
-        {(overview
-          ? [
-              ['Аккаунты', accounts.data?.length],
-              ['Проекты', projects.data?.length],
-              ['Запросы', s?.total_requests],
-              ['Ошибки', s?.failed_requests],
-            ]
-          : [
-              ['Запросы', s?.total_requests],
-              ['Успех', s?.success_requests],
-              ['Ошибки', s?.failed_requests],
-              ['Среднее время, мс', s?.avg_duration_ms],
-            ]
-        ).map(([title, value]) => (
-          <Card key={String(title)} title={String(title)}>
-            <strong className="agp-metric">{display(value)}</strong>
-          </Card>
-        ))}
-      </div>
-      <Card title={granularity === 'hour' ? 'Запросы по часам (UTC)' : 'Запросы по дням (UTC)'}>
-        <p className="agp-muted">
-          Границы выбранных дат — по местному времени. Интервалы графика — в UTC.
-        </p>
-        <ThroughputChart key={granularity} traffic={traffic} />
-      </Card>
-      {s && (
-        <>
-          <Card title="Измеренные показатели">
-            <DataTable
-              headers={['Показатель', 'Значение']}
-              rows={[
-                ['Входные токены', display(s.input_tokens)],
-                ['Выходные токены', display(s.output_tokens)],
-                ['Кэшированные токены', display(s.cache_tokens)],
-                ['Среднее время, мс', display(s.avg_duration_ms)],
-                ['Средний TTFT, мс', display(s.avg_ttft_ms)],
-              ]}
-            />
-            <p className="agp-muted">
-              Неизвестно означает, что сервер не получил измерение. Хранение: до {s.retention_days}{' '}
-              дней / {s.max_entries} записей.
-            </p>
-          </Card>
-          <Card title="По аккаунтам">
-            <DataTable
-              headers={[
-                'Аккаунт',
-                'Запросы',
-                'Успешные попытки',
-                'Ошибки попыток',
-                'Среднее время, мс',
-                'Вход / выход токенов',
-              ]}
-              rows={(s.accounts ?? []).map((a) => [
-                <Link to={`/requests?accountId=${encodeURIComponent(a.account_id)}`}>
-                  {accounts.data?.find((account) => account.id === a.account_id)?.email ||
-                    a.account_id}
-                </Link>,
-                a.logical_requests,
-                a.success_attempts,
-                a.failed_attempts,
-                display(a.avg_duration_ms),
-                `${display(a.input_tokens)} / ${display(a.output_tokens)}`,
-              ])}
-            />
-          </Card>
-          <Card title="По моделям">
-            <DataTable
-              headers={[
-                'Модель',
-                'Запросы',
-                'Успех',
-                'Ошибки',
-                'Среднее время, мс',
-                'Вход / выход токенов',
-              ]}
-              rows={(s.by_model ?? []).map((m) => [
-                display(m.model),
-                m.total_requests,
-                m.total_requests - m.failed_requests,
-                m.failed_requests,
-                display(m.avg_duration_ms),
-                `${display(m.input_tokens)} / ${display(m.output_tokens)}`,
-              ])}
-            />
-          </Card>
-        </>
-      )}
     </>
   );
 }

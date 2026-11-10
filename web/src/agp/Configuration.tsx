@@ -3,6 +3,7 @@ import { Input } from '@/components/ui/Input';
 import { Modal } from '@/components/ui/Modal';
 import { consoleApi, mapping } from './api';
 import type { Aliases, Settings } from './types';
+import { formatSamaraDateTime } from './time';
 import {
   Button,
   Card,
@@ -45,7 +46,7 @@ export function Models() {
       matched.length ? (requestable ? 'Доступна сейчас' : 'Недоступна сейчас') : 'Неизвестно',
       matched.length
         ? matched
-            .map((a) => `${a.refresh_state}: ${a.last_successful_refresh_at ?? 'нет снимка'}`)
+            .map((a) => `${a.refresh_state}: ${formatSamaraDateTime(a.last_successful_refresh_at)}`)
             .join('; ')
         : 'Нет снимка квоты',
     ];

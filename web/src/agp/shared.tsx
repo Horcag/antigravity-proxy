@@ -11,6 +11,7 @@ import {
   TableCell,
 } from '@/components/ui/Table';
 import { consoleApi, display } from './api';
+import { formatSamaraTime } from './time';
 export { Card, Button, display };
 export function useResource<T>(path: string) {
   const requestVersion = useRef(0);
@@ -26,7 +27,7 @@ export function useResource<T>(path: string) {
       const result = await consoleApi<T>(path);
       if (version !== requestVersion.current) return;
       setData(result);
-      setUpdated(new Date().toLocaleTimeString('ru'));
+      setUpdated(formatSamaraTime(Date.now()));
     } catch (e) {
       if (version === requestVersion.current)
         setError(e instanceof Error ? e.message : 'Не удалось загрузить данные');

@@ -39,7 +39,7 @@ export interface RequestEntry {
   request_id: string;
   time: string;
   protocol: string;
-  request_kind?: 'inference' | 'service';
+  request_kind?: 'inference' | 'service' | 'unknown';
   authorization_source?: 'client' | 'pool' | 'unknown';
   route: string;
   model: string | null;
@@ -85,9 +85,22 @@ export interface AccountMetric {
   input_tokens?: number | null;
   output_tokens?: number | null;
 }
+export type StatisticsGranularity = 'minute' | 'five_minutes' | 'hour' | 'day';
+export interface StatisticsBucket {
+  start: string;
+  end: string;
+  total_requests: number;
+  failed_requests: number;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+}
 export interface Statistics extends Metric {
+  buckets: StatisticsBucket[];
+  granularity: StatisticsGranularity;
+  time_zone: string;
+  range: { from: string | null; toExclusive: string | null };
   accounts: AccountMetric[];
-  by_model: Array<Metric & { model: string }>;
+  by_model: Array<Metric & { model: string | null }>;
   by_hour: Array<{ hour: string; total_requests: number; failed_requests: number }>;
   by_day: Array<{ date: string; total_requests: number; failed_requests: number }>;
   retention_days: number;
