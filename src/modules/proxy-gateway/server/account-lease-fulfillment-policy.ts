@@ -66,6 +66,8 @@ export class AccountLeaseFulfillmentPolicy {
           expiry_timestamp: tokenData.expiry_timestamp,
           project_id: hydrationResult.projectId,
           oauth_client_key: tokenData.oauth_client_key,
+          scope: tokenData.scope,
+          is_gcp_tos: tokenData.is_gcp_tos,
           session_id: tokenData.session_id,
           upstream_proxy_url: tokenData.upstream_proxy_url,
         },

@@ -30,15 +30,25 @@ describe('NativeSpeechAuth', () => {
     await expect(new NativeSpeechAuth(leases as any).resolve()).rejects.toMatchObject({ code: 'account_unavailable' });
   });
 
-  it('uses the pinned hydrated token and advertised native model catalog', async () => {
+  it('uses the selected token without treating a consumer companion project as a billing project', async () => {
     vi.stubEnv('AG_PROXY_SPEECH_ACCOUNT_ID', 'pinned');
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ audioTranscriptionModelIds: ['speech-1'] }), { status: 200 })));
     const releaseReservation = vi.fn();
     const leases = { acquireAttemptLease: vi.fn().mockResolvedValue({ account: account(), releaseReservation }) };
     const result = await new NativeSpeechAuth(leases as any).resolve(undefined, 'speech-1');
-    expect(result).toMatchObject({ accountId: 'pinned', accessToken: 'access', projectId: 'project', models: ['speech-1'] });
+    expect(result).toMatchObject({ accountId: 'pinned', accessToken: 'access', models: ['speech-1'] });
+    expect(result.projectId).toBeUndefined();
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(leases.acquireAttemptLease).toHaveBeenCalledWith({ signal: undefined });
+    result.release();
+  });
+
+  it('retains an explicit GCP billing project for GCP authorization', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ audioTranscriptionModelIds: ['speech-1'] }), { status: 200 })));
+    const selected = account(); selected.token.is_gcp_tos = true;
+    const leases = { acquireAttemptLease: vi.fn().mockResolvedValue({ account: selected, releaseReservation: vi.fn() }) };
+    const result = await new NativeSpeechAuth(leases as any).resolve();
+    expect(result.projectId).toBe('project');
     result.release();
   });
 

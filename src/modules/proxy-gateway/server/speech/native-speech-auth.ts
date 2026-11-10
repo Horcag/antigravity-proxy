@@ -57,7 +57,8 @@ export class NativeSpeechAuth {
     return {
       accountId,
       accessToken: token,
-      projectId: account.token.project_id,
+      // CloudCode's companion project is not a consumer speech billing project.
+      projectId: account.token.is_gcp_tos ? account.token.project_id : undefined,
       upstreamProxyUrl: this.resolveProxyUrl(account),
       models,
       release: lease.releaseReservation,

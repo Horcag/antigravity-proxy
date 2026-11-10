@@ -183,6 +183,7 @@ export class AccountLeaseHydrationPolicy {
       tokenToRefresh.access_token = refreshedToken.access_token;
       tokenToRefresh.refresh_token = refreshedToken.refresh_token ?? tokenToRefresh.refresh_token;
       tokenToRefresh.id_token = refreshedToken.id_token ?? tokenToRefresh.id_token;
+      tokenToRefresh.scope = refreshedToken.scope ?? tokenToRefresh.scope;
       tokenToRefresh.expires_in = refreshedToken.expires_in;
       tokenToRefresh.expiry_timestamp = nowSeconds + refreshedToken.expires_in;
       tokenToRefresh.oauth_client_key = this.normalizeRefreshedOauthClientKey(
@@ -346,6 +347,7 @@ export class AccountLeaseHydrationPolicy {
           access_token: tokenData.access_token,
           refresh_token: tokenData.refresh_token,
           id_token: tokenData.id_token ?? persistedAccount.token.id_token,
+          scope: tokenData.scope ?? persistedAccount.token.scope,
           expires_in: tokenData.expires_in,
           expiry_timestamp: tokenData.expiry_timestamp,
           project_id: tokenData.project_id ?? persistedAccount.token.project_id,

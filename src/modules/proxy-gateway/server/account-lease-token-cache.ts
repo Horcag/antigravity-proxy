@@ -63,6 +63,8 @@ export class AccountLeaseTokenCache {
       refresh_token: account.token.refresh_token,
       id_token: account.token.id_token,
       oauth_client_key: normalizeClientKey(account.token.oauth_client_key),
+      scope: account.token.scope,
+      is_gcp_tos: account.token.is_gcp_tos,
       token_type: account.token.token_type || 'Bearer',
       expires_in: account.token.expires_in,
       expiry_timestamp: account.token.expiry_timestamp,
