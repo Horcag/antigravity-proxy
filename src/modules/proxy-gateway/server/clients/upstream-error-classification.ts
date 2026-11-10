@@ -1,13 +1,16 @@
-import type { AxiosError } from 'axios';
+import type { AxiosError, AxiosRequestConfig } from 'axios';
 import { Readable } from 'node:stream';
 import { isObjectLike, isString } from 'lodash-es';
 import { classifyUpstreamFailure } from '../upstream-failure';
-import type { UpstreamRequestError } from './upstream-error';
+import { throwIfUpstreamRequestCanceled, UpstreamRequestError } from './upstream-error';
 
-export async function readForbiddenErrorBody(error: AxiosError): Promise<void> {
+export async function readForbiddenErrorBody(error: AxiosError, signal?: AxiosRequestConfig['signal']): Promise<void> {
+  throwIfUpstreamRequestCanceled(error, signal);
   const response = error.response;
   if (response?.status !== 403 || !(response.data instanceof Readable)) return;
   const stream = response.data;
+  const onAbort = () => { stream.destroy(); };
+  signal?.addEventListener?.('abort', onAbort, { once: true });
   const chunks: Buffer[] = [];
   let bytes = 0;
   // Bound both the error payload and time spent inspecting a rejected stream.
@@ -22,9 +25,11 @@ export async function readForbiddenErrorBody(error: AxiosError): Promise<void> {
   } catch { /* Classify the available prefix without retaining the transport error. */ }
   finally {
     clearTimeout(timer);
+    signal?.removeEventListener?.('abort', onAbort);
     stream.destroy();
   }
   response.data = Buffer.concat(chunks);
+  throwIfUpstreamRequestCanceled(error, signal);
 }
 
 export function classifyAxiosFailure(
@@ -74,4 +79,33 @@ function toClassificationText(value: unknown): string {
   } catch {
     return '';
   }
+}
+
+export function toGeminiUpstreamRequestError(error: AxiosError): UpstreamRequestError {
+  const status = error.response?.status;
+  return new UpstreamRequestError({
+    status,
+    headers: { retryAfter: extractRetryAfterHeader(error.response?.headers) },
+    reason: classifyAxiosFailure(status, error.response?.data, error.message),
+  });
+}
+
+function extractRetryAfterHeader(headers: unknown): string | undefined {
+  if (!isObjectLike(headers)) {
+    return undefined;
+  }
+
+  const retryAfter = Object.entries(headers as Record<string, unknown>).find(
+    ([name]) => name.toLowerCase() === 'retry-after',
+  )?.[1];
+  if (isString(retryAfter)) {
+    return retryAfter.trim();
+  }
+  if (Array.isArray(retryAfter) && retryAfter.length > 0) {
+    const first = retryAfter[0];
+    if (isString(first)) {
+      return first.trim();
+    }
+  }
+  return undefined;
 }

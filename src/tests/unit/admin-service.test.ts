@@ -151,7 +151,7 @@ describe('AdminService', () => {
 
   it('imports token-bearing accounts and skips sanitized account exports', async () => {
     vi.spyOn(CloudAccountRepo, 'getAccountByEmail').mockResolvedValue(undefined);
-    const addAccount = vi.spyOn(CloudAccountRepo, 'addAccount').mockResolvedValue(undefined);
+    const addAccount = vi.spyOn(CloudAccountRepo, 'importAccount').mockImplementation(async account => account);
     const service = createService();
 
     const result = await service.importAccounts({
@@ -195,9 +195,10 @@ describe('AdminService', () => {
       return email.toLowerCase() === existing.email ? existing : undefined;
     });
     const service = createService();
-    const addAccount = vi.spyOn(CloudAccountRepo, 'addAccount').mockImplementation(async () => {
+    const addAccount = vi.spyOn(CloudAccountRepo, 'importAccount').mockImplementation(async (account) => {
       await Promise.resolve();
       expect((service as any).accountLeaseService.loadAccounts).not.toHaveBeenCalled();
+      return account;
     });
 
     await service.importAccounts({
@@ -269,7 +270,7 @@ describe('AdminService', () => {
       proxy_url: 'http://existing-proxy.example',
     });
     vi.spyOn(CloudAccountRepo, 'getAccountByEmail').mockResolvedValue(existing);
-    const addAccount = vi.spyOn(CloudAccountRepo, 'addAccount').mockResolvedValue(undefined);
+    const addAccount = vi.spyOn(CloudAccountRepo, 'importAccount').mockImplementation(async account => account);
     const service = createService();
 
     await service.importAccounts({

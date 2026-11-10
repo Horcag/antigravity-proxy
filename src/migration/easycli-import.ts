@@ -138,7 +138,12 @@ async function importValidatedPayload(input: unknown): Promise<EasyCliImportResu
   try {
     await ConfigManager.saveConfig({ proxy });
     phase = 'accounts';
-    for (const { account } of prepared) await CloudAccountRepo.addAccount(account);
+    for (const item of prepared) {
+      item.account = await CloudAccountRepo.importAccount(item.account);
+      item.status = item.account.status === 'expired'
+        ? /tos|forbidden|violation|suspend|banned/i.test(item.account.status_reason ?? '') || item.account.quota?.is_forbidden || item.account.quota?.isForbidden ? 'blocked' : 'disabled'
+        : 'active';
+    }
   } catch {
     let rollbackFailures = 0;
     // Writes may commit before throwing. Restore every prepared account, including

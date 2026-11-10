@@ -1,3 +1,4 @@
+import { needsAccountReview } from '../account-review';
 import Database from 'better-sqlite3';
 import { CloudAccount, CloudAccountSchema, CloudQuotaData } from '@/modules/cloud-account/types';
 import { decryptJson, encryptJson } from '@/shared/security/encryption';
@@ -99,7 +100,29 @@ export class CloudAccountRepo {
   }
 
   static async addAccount(account: CloudAccount): Promise<void> {
-    const validated = CloudAccountSchema.parse(account);
+    this.writeAccount(CloudAccountSchema.parse(account));
+  }
+
+  /** Guard ordinary ingestion; exact offline rollback continues to use addAccount. */
+  static async importAccount(account: CloudAccount): Promise<CloudAccount> {
+    const candidate = CloudAccountSchema.parse(account);
+    return this.getDatabase().transaction(() => {
+      const previous = this.getDatabase().prepare('SELECT * FROM accounts WHERE id = ?').get(candidate.id) as AccountRow | undefined;
+      if (previous) {
+        const current = this.toAccount(previous);
+        if (current.status === 'expired' || needsAccountReview(current)) {
+          candidate.status = current.status;
+          candidate.status_reason = current.status_reason;
+          candidate.quota = current.quota;
+          candidate.is_active = current.is_active;
+        }
+      }
+      this.writeAccount(candidate);
+      return this.toAccount(this.getDatabase().prepare('SELECT * FROM accounts WHERE id = ?').get(candidate.id) as AccountRow);
+    })();
+  }
+
+  private static writeAccount(validated: CloudAccount): void {
     this.getDatabase()
       .prepare(`
         INSERT INTO accounts (
@@ -141,6 +164,21 @@ export class CloudAccountRepo {
 
   static async removeAccount(accountId: string): Promise<void> {
     this.getDatabase().prepare('DELETE FROM accounts WHERE id = ?').run(accountId);
+  }
+
+  static async suspendAccount(accountId: string): Promise<void> {
+    const changed = this.getDatabase().prepare("UPDATE accounts SET status = 'expired', status_reason = 'tos_violation', is_active = 0 WHERE id = ?").run(accountId);
+    if (changed.changes !== 1) throw new Error('Account suspension did not update one existing account');
+  }
+
+  static async enableAccount(accountId: string, confirmReview: boolean): Promise<'enabled' | 'review_required' | 'missing'> {
+    return this.getDatabase().transaction(() => {
+      const row = this.getDatabase().prepare('SELECT * FROM accounts WHERE id = ?').get(accountId) as AccountRow | undefined;
+      if (!row) return 'missing' as const;
+      if (!confirmReview && needsAccountReview(this.toAccount(row))) return 'review_required' as const;
+      this.getDatabase().prepare("UPDATE accounts SET status = 'active', status_reason = NULL WHERE id = ?").run(accountId);
+      return 'enabled' as const;
+    })();
   }
 
   static async updateToken(accountId: string, token: CloudAccount['token']): Promise<void> {

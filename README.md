@@ -273,9 +273,12 @@ antigravity-proxy accounts preferred clear
 ```
 
 Headless deployments can set `AG_PROXY_UPSTREAM_VERSION` to the verified installed
-Antigravity client version, then restart the service. Google filters the available
-model catalog by client version; refreshing quotas with an outdated version can
-still return an older catalog. Keep this deployment setting aligned with the client
+Antigravity client version in exact `major.minor.patch` form, then restart the service.
+A nonblank setting pins that exact version, including versions older than the built-in
+fallback, and skips remote version discovery. Malformed pins fail resolution rather
+than silently selecting another version. Without a pin, existing discovery and fallback
+behavior applies. Google filters the available model catalog by client version;
+refreshing quotas with an outdated version can still return an older catalog. Keep this deployment setting aligned with the client
 used to validate upstream access. It does not create model aliases or bypass
 account capability checks.
 
@@ -328,7 +331,10 @@ uses an HttpOnly, SameSite cookie for up to seven days. The management key is no
 browser storage. Cookie-authenticated mutations require a same-origin CSRF token.
 
 Accounts support Google OAuth (automatic local callback with an explicit manual fallback),
-JSON import, reviewed enable/disable, removal and manual quota refresh. Project keys can
+JSON import, reviewed enable/disable, removal and manual quota refresh. Explicit ToS
+suspensions stop generation retries and fence the account while its inactive state is
+persisted. Imports preserve existing suspension/disabled state; reactivation requires
+explicit review. Project keys can
 be created, disabled and rotated without changing existing application addresses. The panel
 edits only supported scheduling, timeout and model-alias settings; arbitrary environment or
 provider-proxy editing is unavailable.

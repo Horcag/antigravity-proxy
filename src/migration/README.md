@@ -19,3 +19,11 @@ power loss or system crash. Restore the retained destination backup before retry
 an interrupted import or an import reporting partial migration. Configuration recovery
 uses ConfigManager, so formatting and materialized defaults may differ from the original
 file while its effective settings are restored.
+
+Import refreshes credentials and profile metadata while preserving existing expired or
+review-required status, reason, quota restrictions and active selection. Source `active`
+metadata cannot silently reactivate a locally suspended account. Enable it through the
+console's explicit review flow after resolving the upstream restriction. Import result
+counts describe the persisted account states. Exact snapshot compensation uses the
+separate low-level write path so an interrupted blocked-state import can still restore
+an originally active account.

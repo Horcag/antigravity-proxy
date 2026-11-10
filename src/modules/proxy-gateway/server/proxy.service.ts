@@ -62,7 +62,7 @@ import {
 import { preflightNativeGeminiRequest } from './native-gemini-request';
 import { extractCanonicalUserTurnText } from './cloudcode-failover-gateway';
 import { getUpstreamDiagnosticContext, logUpstreamTerminalDiagnostic } from './cloudcode-diagnostics';
-import { UPSTREAM_STREAM_STATUS_CODES } from './upstream-stream-status';
+import { UPSTREAM_STREAM_STATUS_CODES, resolveUpstreamStreamFailureReason } from './upstream-stream-status';
 
 interface StreamIdleTimer {
   reset: () => void;
@@ -1365,7 +1365,7 @@ export class ProxyService {
                 streamHealth,
               );
             } catch (streamError) {
-              if ((streamError instanceof Error && streamError.name === 'AbortError') || this.retryPolicy.shouldFailoverImmediately(streamError)) {
+              if ((streamError instanceof Error && streamError.name === 'AbortError') || (streamError instanceof UpstreamRequestError && streamError.reason === 'tos_violation') || this.retryPolicy.shouldFailoverImmediately(streamError)) {
                 throw streamError;
               }
               this.logger.warn(
@@ -1461,6 +1461,8 @@ export class ProxyService {
       extraHeaders,
       accountId, signal,
     ));
+    const directError = this.getUpstreamStreamError(direct.result);
+    if (directError?.reason === 'tos_violation') throw directError;
     if (this.hasUsableGeminiCandidate(direct.result)) {
       return direct;
     }
@@ -1515,7 +1517,7 @@ export class ProxyService {
       return new UpstreamRequestError({
         status,
         headers: { retryAfter: this.extractUpstreamStreamRetryAfter(errorRecord, record) },
-        reason: this.resolveUpstreamFailureReason(status),
+        reason: resolveUpstreamStreamFailureReason(status, record),
       });
     }
 
@@ -1537,21 +1539,6 @@ export class ProxyService {
       return Number(normalized);
     }
     return UPSTREAM_STREAM_STATUS_CODES[normalized];
-  }
-
-  private resolveUpstreamFailureReason(
-    status: number | undefined,
-  ): UpstreamRequestError['reason'] {
-    if (status === HttpStatus.UNAUTHORIZED || status === HttpStatus.FORBIDDEN) {
-      return 'authentication';
-    }
-    if (status === HttpStatus.NOT_FOUND) {
-      return 'model_not_found';
-    }
-    if (status === HttpStatus.TOO_MANY_REQUESTS) {
-      return 'rate_limited';
-    }
-    return 'upstream_error';
   }
 
   private extractUpstreamStreamRetryAfter(
@@ -2567,7 +2554,7 @@ export class ProxyService {
           logUpstreamTerminalDiagnostic(getUpstreamDiagnosticContext(upstreamStream), 'failure');
           this.logger.error('OpenAI-compatible stream error: operation=openai_stream reason=upstream_error');
         }
-        streamHealth?.recordFailure(safeError);
+        streamHealth?.recordFailure(error instanceof UpstreamRequestError ? error : safeError);
         subscriber.error(safeError);
       };
 

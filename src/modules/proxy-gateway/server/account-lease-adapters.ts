@@ -29,6 +29,7 @@ export interface AccountLeaseAccountStore {
     lastUsed: number,
     isCurrent: () => boolean,
   ): boolean;
+  suspendAccount?(accountId: string): Promise<void> | void;
   updateStatus?(
     accountId: string,
     status: CloudAccount['status'],
@@ -51,6 +52,7 @@ export interface AccountLeaseUpstream {
 }
 
 export const cloudAccountStoreAdapter: AccountLeaseAccountStore = {
+  suspendAccount: (accountId) => CloudAccountRepo.suspendAccount(accountId),
   getAccounts: () => CloudAccountRepo.getAccounts(),
   getAccount: (accountId) => CloudAccountRepo.getAccount(accountId),
   updateToken: (accountId, token) => CloudAccountRepo.updateToken(accountId, token),

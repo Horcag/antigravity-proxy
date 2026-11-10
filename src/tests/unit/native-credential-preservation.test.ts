@@ -46,6 +46,15 @@ describe('native credential-only forwarding', () => {
     expect(result.headers['x-goog-session-id']).toBe('native-session');
   });
 
+  it('normalizes mixed-case Connection nominations while retaining native session and array values', () => {
+    const result = composeAttemptRequest({ rawBody: Buffer.from(json), reqHeaders: {...headers,
+      Connection: ['keep-alive, X-Private'], connection: 'x-another-hop', 'X-Private': 'private-hop', 'X-Another-Hop': 'second-hop', 'Proxy-Authorization': 'proxy-secret'},
+      targetHost: 'daily-cloudcode-pa.googleapis.com', method: 'POST', urlPath: path });
+    for (const name of ['connection','x-private','x-another-hop','proxy-authorization']) expect(result.headers[name]).toBeUndefined();
+    expect(result.headers['x-goog-session-id']).toBe('native-session');
+    expect(result.headers['x-native-metadata']).toEqual(['first','second']); expect(result.payloadToSend.equals(Buffer.from(json))).toBe(true);
+  });
+
   it.each([
     ['transient same-account retry', 503, 'UNAVAILABLE', 'Service unavailable', false],
     ['quota account switch', 429, 'RESOURCE_EXHAUSTED', 'Quota exhausted', true],

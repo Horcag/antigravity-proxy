@@ -41,6 +41,7 @@ interface AccountLeaseQuotaRefreshPolicyOptions {
     reason: RateLimitReason,
     model?: string,
   ) => boolean;
+  suspendAccount: (accountId: string) => Promise<void>;
   logger: AccountLeaseQuotaRefreshLogger;
 }
 
@@ -254,6 +255,7 @@ export class AccountLeaseQuotaRefreshPolicy {
       return false;
     }
 
+    let currentToken = tokenData;
     try {
       const hydrated = await this.options.hydrateTokenIfNeeded(
         accountId,
@@ -264,6 +266,7 @@ export class AccountLeaseQuotaRefreshPolicy {
         return null;
       }
       const latestToken = this.options.getTokenCache().get(accountId) ?? tokenData;
+      currentToken = latestToken;
       const latestQuota = await this.options.upstream.fetchQuota(
         latestToken.access_token,
         latestToken.upstream_proxy_url,
@@ -277,12 +280,8 @@ export class AccountLeaseQuotaRefreshPolicy {
       this.accountFailureCooldownUntil.delete(accountId);
       return true;
     } catch (error) {
-      if (error instanceof Error && (error.message === 'TOS_VIOLATION' || error.message.includes('TOS_VIOLATION'))) {
-        this.options.logger.warn(`Account ${accountId} marked expired due to TOS_VIOLATION`, error);
-        void this.options.accountStore.updateStatus?.(accountId, 'expired', 'tos_violation');
-        this.options.getTokenCache().delete(accountId);
-        return false;
-      }
+      const suspended = await this.suspendAfterQuotaFailure(error, accountId, currentToken, generation);
+      if (suspended !== undefined) return suspended;
       if (isQuotaAuthError(error)) {
         try {
           const refreshedAfterAuthFailure = await this.options.hydrateTokenAfterAuthFailure(
@@ -294,6 +293,7 @@ export class AccountLeaseQuotaRefreshPolicy {
             return null;
           }
           const latestToken = this.options.getTokenCache().get(accountId) ?? tokenData;
+          currentToken = latestToken;
           const latestQuota = await this.options.upstream.fetchQuota(
             latestToken.access_token,
             latestToken.upstream_proxy_url,
@@ -306,7 +306,9 @@ export class AccountLeaseQuotaRefreshPolicy {
           }
           this.accountFailureCooldownUntil.delete(accountId);
           return true;
-        } catch {
+        } catch (retryError) {
+          const suspended = await this.suspendAfterQuotaFailure(retryError, accountId, currentToken, generation);
+          if (suspended !== undefined) return suspended;
           this.accountFailureCooldownUntil.set(
             accountId,
             nowMs + QUOTA_REFRESH_FAILURE_COOLDOWN_MS,
@@ -323,6 +325,14 @@ export class AccountLeaseQuotaRefreshPolicy {
       );
       return false;
     }
+  }
+
+  private async suspendAfterQuotaFailure(error: unknown, accountId: string, tokenData: AccountLeaseTokenData, generation: number): Promise<false | null | undefined> {
+    if (!(error instanceof Error) || !error.message.includes('TOS_VIOLATION')) return undefined;
+    if (!this.canApplyQuotaRefresh(accountId, tokenData, generation)) return null;
+    try { await this.options.suspendAccount(accountId); }
+    catch { this.options.logger.warn('Account suspension persistence failed; account remains fenced'); }
+    return false;
   }
 
   private applyQuotaRefresh(

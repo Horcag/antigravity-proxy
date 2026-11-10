@@ -59,15 +59,15 @@ describe('EasyCLI migration compensation on real temporary storage', () => {
     { write: 2, afterCommit: false }, { write: 2, afterCommit: true },
   ])('restores config and all account snapshots when upsert $write fails (afterCommit=$afterCommit)', async ({ write, afterCommit }) => {
     const original = await seedOriginalState();
-    const addAccount = CloudAccountRepo.addAccount.bind(CloudAccountRepo);
+    const importAccount = CloudAccountRepo.importAccount.bind(CloudAccountRepo);
     let calls = 0;
-    vi.spyOn(CloudAccountRepo, 'addAccount').mockImplementation(async (value) => {
+    vi.spyOn(CloudAccountRepo, 'importAccount').mockImplementation(async (value) => {
       calls += 1;
       if (calls === write) {
-        if (afterCommit) await addAccount(value);
+        if (afterCommit) await importAccount(value);
         throw new Error('sensitive injected DB failure access-secret');
       }
-      await addAccount(value);
+      return importAccount(value);
     });
     await expect(importEasyCliPayload(rollbackPayload)).rejects.toThrow('EasyCLI migration failed; previous state restored');
     expect(await CloudAccountRepo.getAccounts()).toEqual(original.accounts);
@@ -93,14 +93,14 @@ describe('EasyCLI migration compensation on real temporary storage', () => {
 
   it('reports a redacted partial migration when an account rollback fails and continues other restorations', async () => {
     const original = await seedOriginalState();
-    const addAccount = CloudAccountRepo.addAccount.bind(CloudAccountRepo);
+    const importAccount = CloudAccountRepo.importAccount.bind(CloudAccountRepo);
     let calls = 0;
-    vi.spyOn(CloudAccountRepo, 'addAccount').mockImplementation(async (value) => {
-      calls += 1;
-      if (calls === 3) throw new Error('sensitive rollback failure refresh-secret');
-      await addAccount(value);
-      if (calls === 2) throw new Error('sensitive commit failure access-secret');
+    vi.spyOn(CloudAccountRepo, 'importAccount').mockImplementation(async (value) => {
+      const saved = await importAccount(value);
+      if (++calls === 2) throw new Error('sensitive commit failure access-secret');
+      return saved;
     });
+    vi.spyOn(CloudAccountRepo, 'addAccount').mockRejectedValueOnce(new Error('sensitive rollback failure refresh-secret'));
     await expect(importEasyCliPayload(rollbackPayload)).rejects.toThrow(
       'EasyCLI partial migration; restore destination backup before retry (phase=accounts, rollbackFailures=1)',
     );
@@ -109,6 +109,21 @@ describe('EasyCLI migration compensation on real temporary storage', () => {
     expect(remaining).toHaveLength(1);
     expect(remaining[0].id).toBe('original-account');
     expect(remaining[0].token.access_token).toBe('access-secret');
+  });
+
+  it('restores an originally active account after a blocked import commits and a later write fails', async () => {
+    await importEasyCliPayload(payload);
+    const original = {accounts: await CloudAccountRepo.getAccounts(), config: ConfigManager.loadConfig()};
+    const ingest = CloudAccountRepo.importAccount.bind(CloudAccountRepo); let calls = 0;
+    vi.spyOn(CloudAccountRepo, 'importAccount').mockImplementation(async value => {
+      if (++calls === 2) {
+        expect((await CloudAccountRepo.getAccount(original.accounts[0].id))?.status).toBe('expired');
+        throw new Error('fixture later failure');
+      }
+      return ingest(value);
+    });
+    await expect(importEasyCliPayload({...payload, accounts:[{...account,migration_status:'blocked'},{...account,email:'second@example.com'}]})).rejects.toThrow('previous state restored');
+    expect(await CloudAccountRepo.getAccounts()).toEqual(original.accounts); expect(ConfigManager.loadConfig()).toEqual(original.config);
   });
 
   it('reports a redacted partial migration when config rollback fails', async () => {
@@ -120,7 +135,7 @@ describe('EasyCLI migration compensation on real temporary storage', () => {
       if (saves === 2) throw new Error('sensitive config rollback project-secret');
       await saveConfig(value);
     });
-    vi.spyOn(CloudAccountRepo, 'addAccount').mockRejectedValueOnce(new Error('sensitive DB error refresh-secret'));
+    vi.spyOn(CloudAccountRepo, 'importAccount').mockRejectedValueOnce(new Error('sensitive DB error refresh-secret'));
     await expect(importEasyCliPayload(rollbackPayload)).rejects.toThrow(
       'EasyCLI partial migration; restore destination backup before retry (phase=accounts, rollbackFailures=1)',
     );
@@ -153,7 +168,7 @@ describe('offline EasyCLI migration', { timeout: 20_000 }, () => {
     }
   });
 
-  it('upserts by case-insensitive email and clears only forbidden flags on active accounts', async () => {
+  it('upserts credentials by case-insensitive email without reactivating existing ToS restrictions', async () => {
     await importEasyCliPayload(payload);
     const existing = (await CloudAccountRepo.getAccounts())[0]!;
     await CloudAccountRepo.addAccount({
@@ -163,9 +178,9 @@ describe('offline EasyCLI migration', { timeout: 20_000 }, () => {
     const result = await importEasyCliPayload({ ...payload, accounts: [{ ...account, email: 'USER@example.com' }] });
     expect(result).toMatchObject({ accountsUpdated: 1, accountsImported: 0, projectsExisting: 1 });
     const updated = (await CloudAccountRepo.getAccounts())[0]!;
-    expect(updated).toMatchObject({ id: existing.id, created_at: existing.created_at, last_used: 456, status: 'active' });
-    expect(updated.status_reason).toBeUndefined();
-    expect(updated.quota).toEqual({ models: { gemini: { percentage: 77, resetTime: 'later' } }, is_forbidden: false, isForbidden: false });
+    expect(updated).toMatchObject({ id: existing.id, created_at: existing.created_at, last_used: 456, status: 'expired', status_reason: 'TOS_VIOLATION' });
+    expect(result).toMatchObject({ accountsActive: 0, accountsBlocked: 1 });
+    expect(updated.quota).toEqual({ models: { gemini: { percentage: 77, resetTime: 'later' } }, is_forbidden: true, isForbidden: true });
   });
 
   it('applies explicit blocked and disabled statuses and skips Codex credentials', async () => {
