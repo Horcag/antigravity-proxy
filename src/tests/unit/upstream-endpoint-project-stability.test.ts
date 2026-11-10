@@ -226,105 +226,33 @@ describe('Upstream Endpoint and Project Header Stability', () => {
     });
   });
 
-  describe('3. Exactly One Project-Context Downgrade', () => {
-    it('retries exactly once without project context when 403 received, and preserves final 403 if retry also fails', async () => {
+  describe('3. Native project context without quota-project preflight', () => {
+    it.each([false, true])('preserves project and stops on ordinary 403 (stream=%s)', async (stream) => {
       const client = new GeminiClient();
-      const postSpy = vi.spyOn(axios, 'post');
-
-      // Both attempts return 403
-      postSpy.mockRejectedValue(createAxiosError(403, 'Permission denied'));
-
-      const requestBody = createInternalRequest({ project: 'project-1' });
-
-      await expect(
-        client.generateInternal(requestBody, 'token-1', undefined, undefined, 'acc-1'),
-      ).rejects.toThrow(UpstreamRequestError);
-
-      // Attempt 1 with header, Attempt 2 without header, then stop (exactly 2 calls)
-      expect(postSpy).toHaveBeenCalledTimes(2);
-      expect((postSpy.mock.calls[0][2] as any)?.headers?.['x-goog-user-project']).toBe('project-1');
-      expect((postSpy.mock.calls[1][2] as any)?.headers?.['x-goog-user-project']).toBeUndefined();
-      expect(JSON.parse(postSpy.mock.calls[0][1] as string).project).toBe('project-1');
-      expect(JSON.parse(postSpy.mock.calls[1][1] as string).project).toBeUndefined();
+      const post = vi.spyOn(axios, 'post').mockRejectedValue(createAxiosError(403, 'Permission denied'));
+      const body = createInternalRequest({ project: 'project-1' });
+      await expect(stream ? client.streamGenerateInternal(body, 'token') : client.generateInternal(body, 'token'))
+        .rejects.toMatchObject({ status: 403 });
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(post.mock.calls[0][2]?.headers).not.toHaveProperty('x-goog-user-project');
+      expect(post.mock.calls[0][1]).toBe(JSON.stringify(body));
+      expect(body.project).toBe('project-1');
     });
 
-    it('retries without project context and succeeds on 200', async () => {
+    it.each([false, true])('sends known JSON bytes without consulting the legacy cache (stream=%s)', async (stream) => {
       const client = new GeminiClient();
-      const postSpy = vi.spyOn(axios, 'post');
-
-      postSpy.mockRejectedValueOnce(createAxiosError(403, 'The caller does not have permission for project project-1'));
-      postSpy.mockResolvedValueOnce({
-        status: 200,
-        data: { candidates: [{ content: { role: 'model', parts: [{ text: 'fallback succeeded' }] } }] },
-        headers: {},
-      } as any);
-
-      const requestBody = createInternalRequest({ project: 'project-1' });
-
-      const res = await client.generateInternal(requestBody, 'token-1', undefined, undefined, 'acc-1');
-      expect(res).toBeDefined();
-      expect(postSpy).toHaveBeenCalledTimes(2);
-      expect((postSpy.mock.calls[0][2] as any)?.headers?.['x-goog-user-project']).toBe('project-1');
-      expect((postSpy.mock.calls[1][2] as any)?.headers?.['x-goog-user-project']).toBeUndefined();
-      expect(JSON.parse(postSpy.mock.calls[1][1] as string).project).toBeUndefined();
-    });
-
-    it('uses the same two-call projectless bound for streaming failures', async () => {
-      const client = new GeminiClient();
-      const postSpy = vi.spyOn(axios, 'post').mockRejectedValue(createAxiosError(403, 'Permission denied'));
-
-      await expect(
-        client.streamGenerateInternal(createInternalRequest({ project: 'project-1' }), 'token-1', undefined, undefined, 'acc-1'),
-      ).rejects.toThrow(UpstreamRequestError);
-
-      expect(postSpy).toHaveBeenCalledTimes(2);
-      expect((postSpy.mock.calls[0][2] as any)?.headers?.['x-goog-user-project']).toBe('project-1');
-      expect((postSpy.mock.calls[1][2] as any)?.headers?.['x-goog-user-project']).toBeUndefined();
-      let projectlessBody = '';
-      for await (const chunk of postSpy.mock.calls[1][1] as NodeJS.ReadableStream) {
-        projectlessBody += String(chunk);
-      }
-      expect(JSON.parse(projectlessBody).project).toBeUndefined();
+      client.userProjectCapabilityCache.recordNegativeCapability('acc', 'project-1');
+      const post = vi.spyOn(axios, 'post').mockResolvedValue({ status: 200, data: {}, headers: {} });
+      const body = createInternalRequest({ project: 'project-1' });
+      if (stream) await client.streamGenerateInternal(body, 'token', undefined, undefined, 'acc');
+      else await client.generateInternal(body, 'token', undefined, undefined, 'acc');
+      expect(post).toHaveBeenCalledTimes(1);
+      expect(post.mock.calls[0][1]).toBe(JSON.stringify(body));
+      expect(post.mock.calls[0][2]?.headers).not.toHaveProperty('x-goog-user-project');
     });
   });
 
-  describe('4. Negative Capability Cache: Reuse, Isolation, and TTL', () => {
-    it('reuses cached negative capability to avoid repeated 403 preflight requests', async () => {
-      const client = new GeminiClient();
-      client.userProjectCapabilityCache.clearAll();
-      const postSpy = vi.spyOn(axios, 'post');
-
-      // Request 1: first call with header returns 403, retry without header returns 200
-      postSpy.mockRejectedValueOnce(createAxiosError(403, 'Permission denied'));
-      postSpy.mockResolvedValueOnce({
-        status: 200,
-        data: { candidates: [{ content: { role: 'model', parts: [{ text: 'req 1 ok' }] } }] },
-        headers: {},
-      } as any);
-
-      // Request 2: should send directly without project header (no 403)
-      postSpy.mockResolvedValueOnce({
-        status: 200,
-        data: { candidates: [{ content: { role: 'model', parts: [{ text: 'req 2 ok' }] } }] },
-        headers: {},
-      } as any);
-
-      const requestBody = createInternalRequest({ project: 'proj-1' });
-
-      // Request 1
-      const res1 = await client.generateInternal(requestBody, 'token-1', undefined, undefined, 'acc-1');
-      expect(res1).toBeDefined();
-      expect(postSpy).toHaveBeenCalledTimes(2);
-      expect((postSpy.mock.calls[0][2] as any)?.headers?.['x-goog-user-project']).toBe('proj-1');
-      expect((postSpy.mock.calls[1][2] as any)?.headers?.['x-goog-user-project']).toBeUndefined();
-
-      // Request 2: directly without project header, only 1 call
-      const res2 = await client.generateInternal(requestBody, 'token-1', undefined, undefined, 'acc-1');
-      expect(res2).toBeDefined();
-      expect(postSpy).toHaveBeenCalledTimes(3);
-      expect((postSpy.mock.calls[2][2] as any)?.headers?.['x-goog-user-project']).toBeUndefined();
-    });
-
+  describe('4. Legacy capability cache public API', () => {
     it('isolates cache by (accountId, projectId) scope and never keys by token', () => {
       const cache = new UserProjectCapabilityCache();
       cache.clearAll();
@@ -366,37 +294,15 @@ describe('Upstream Endpoint and Project Header Stability', () => {
       }
     });
 
-    it('revalidates after TTL expiry, and success clears negative state', async () => {
-      const client = new GeminiClient();
-      client.userProjectCapabilityCache.clearAll();
-      const postSpy = vi.spyOn(axios, 'post');
-
-      // Record negative capability with short 25ms TTL
-      client.userProjectCapabilityCache.recordNegativeCapability('acc-1', 'proj-1', 25);
-      expect(client.userProjectCapabilityCache.hasNegativeCapability('acc-1', 'proj-1')).toBe(true);
-
-      // Wait for TTL to expire
-      await new Promise((resolve) => setTimeout(resolve, 35));
-      expect(client.userProjectCapabilityCache.hasNegativeCapability('acc-1', 'proj-1')).toBe(false);
-
-      // Revalidation probe succeeds
-      postSpy.mockResolvedValueOnce({
-        status: 200,
-        data: { candidates: [{ content: { role: 'model', parts: [{ text: 'probed ok' }] } }] },
-        headers: {},
-      } as any);
-
-      const requestBody = createInternalRequest({ project: 'proj-1' });
-
-      const res = await client.generateInternal(requestBody, 'token-1', undefined, undefined, 'acc-1');
-      expect(res).toBeDefined();
-
-      // Probe included header
-      expect(postSpy).toHaveBeenCalledTimes(1);
-      expect((postSpy.mock.calls[0][2] as any)?.headers?.['x-goog-user-project']).toBe('proj-1');
-
-      // Success cleared negative capability
-      expect(client.userProjectCapabilityCache.hasNegativeCapability('acc-1', 'proj-1')).toBe(false);
+    it('expires legacy negative entries without generation probes', () => {
+      vi.useFakeTimers();
+      try {
+        const cache = new UserProjectCapabilityCache();
+        cache.recordNegativeCapability('acc-1', 'proj-1', 25);
+        expect(cache.hasNegativeCapability('acc-1', 'proj-1')).toBe(true);
+        vi.advanceTimersByTime(26);
+        expect(cache.hasNegativeCapability('acc-1', 'proj-1')).toBe(false);
+      } finally { vi.useRealTimers(); }
     });
   });
 

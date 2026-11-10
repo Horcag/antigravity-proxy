@@ -283,7 +283,8 @@ export class ProxyRetryPolicy {
     return (
       error instanceof UpstreamRequestError &&
       error.reason !== 'tos_violation' &&
-      (error.status === 401 || error.status === 403 || error.status === 429)
+      (error.reason === 'transport' || (error.status !== undefined &&
+        [401, 403, 408, 429, 499, 500, 502, 503, 504].includes(error.status)))
     );
   } markUpstreamSuccess(
     accountId: string,
@@ -364,7 +365,7 @@ export class ProxyRetryPolicy {
       this.stopMigrationRenewal(retryState);
       this.releaseReservation(retryState);
     }
-    if (error instanceof Error && error.name === 'AbortError') {
+    if (retryState?.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) {
       if (retryState) this.abortAffinityPlacement(retryState);
       return false;
     }
@@ -417,14 +418,8 @@ export class ProxyRetryPolicy {
         this.accountLeaseService.markAsForbidden(accountId);
         return true;
       }
-      const retryable =
-        status === 408 ||
-        status === 429 ||
-        status === 500 ||
-        status === 502 ||
-        status === 503 ||
-        status === 504 ||
-        error.reason === 'transport';
+      const retryable = error.reason === 'transport' ||
+        (status !== undefined && [408, 429, 499, 500, 502, 503, 504].includes(status));
       if (retryable) {
         await this.accountLeaseService.markFromUpstreamError({
           accountIdOrEmail: accountId,

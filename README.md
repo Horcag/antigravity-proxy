@@ -294,6 +294,26 @@ curl http://127.0.0.1:8045/v1/chat/completions \
   -d '{"model":"gemini-2.5-flash","messages":[{"role":"user","content":"ping"}]}'
 ```
 
+Compatibility generation keeps the selected credential's `project` in the CloudCode JSON body
+and does not synthesize an `x-goog-user-project` quota header. Streaming uploads use serialized
+JSON with a known content length. Native CONNECT forwarding retains its original request bytes
+and headers while substituting credentials.
+
+When a streaming endpoint has not returned response headers after four seconds, the proxy starts
+one backup endpoint request using the same credential, model and body. The original continues;
+the first successful response wins, and the losing request is cancelled. Fast requests make one
+upstream call, and a single configured endpoint is never duplicated. This bounds simultaneous
+upstream work to two calls per attempt but can consume additional upstream quota on slow starts.
+Permanent request/authentication errors stop the race; explicit ToS restrictions remain terminal.
+After a response wins, streams are never combined or replayed. Client cancellation stops all
+remaining work. This reduces slow-start failures; it does not bound model inference time or
+override a client's first-answer deadline.
+
+Transient failures before streaming starts, including upstream HTTP 499, follow the account retry
+policy directly instead of first attempting a complete non-stream response on the failed account.
+A journal status of 499 with `client_cancelled` means the downstream client closed its connection;
+retrying after that closure cannot deliver an answer to it.
+
 ## Tailscale Binding
 
 Default bind is loopback. To expose on a Tailscale address, set the bind host explicitly and keep
