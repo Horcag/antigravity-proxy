@@ -9,6 +9,7 @@ export interface CloudTokenData {
   email?: string;
   project_id?: string;
   oauth_client_key?: string;
+  scope?: string;
   session_id?: string;
   id_token?: string;
   upstream_proxy_url?: string;
@@ -81,6 +82,7 @@ export const CloudTokenDataSchema = z.object({
   email: z.string().optional(),
   project_id: z.string().optional(),
   oauth_client_key: z.string().optional(),
+  scope: z.string().optional(),
   session_id: z.string().optional(),
   id_token: z.string().optional(),
   upstream_proxy_url: z.string().optional(),

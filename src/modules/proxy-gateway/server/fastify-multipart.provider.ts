@@ -11,13 +11,14 @@ import { BaseExceptionFilter, HttpAdapterHost } from '@nestjs/core';
 import multipart from '@fastify/multipart';
 import { FastifyInstance } from 'fastify';
 
-const MEDIA_ENDPOINTS = new Set(['/v1/audio/transcriptions', '/v1/images/edits']);
+const MEDIA_ENDPOINTS = new Set(['/v1/audio/transcriptions', '/v1/audio/native/transcriptions', '/v1/images/edits']);
 const JSON_MEDIA_ENDPOINTS = new Set([
   '/v1/chat/completions',
   '/v1/messages',
   '/v1/responses',
   '/v1/images/edits',
   '/v1/audio/transcriptions',
+  '/v1/audio/native/transcriptions',
 ]);
 export const MAX_JSON_MEDIA_BODY_BYTES = 64 * 1024 * 1024;
 const MULTIPART_ERROR_CODES = new Set([
@@ -260,6 +261,14 @@ function getExceptionMessage(error: HttpException): string {
 export class FastifyMultipartProvider implements OnModuleInit {
   constructor(@Inject(HttpAdapterHost) private readonly httpAdapterHost: HttpAdapterHost) {
     const fastify = this.httpAdapterHost.httpAdapter.getInstance<FastifyInstance>();
+
+    fastify.addContentTypeParser('audio/pcm', (request, payload, done) => {
+      if (normalizePathname(request.url) !== '/v1/audio/native/transcriptions/stream') {
+        const error = Object.assign(new Error('PCM streaming is only supported on the native speech stream route.'), { statusCode: 415 });
+        done(error); return;
+      }
+      done(null, payload);
+    });
 
     // Nest maps controller routes after constructing providers, so this hook can set Fastify's
     // per-route parser limit before the OpenAI-compatible routes are registered.

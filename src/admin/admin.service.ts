@@ -413,6 +413,7 @@ export class AdminService {
         email: userInfo.email,
         oauth_client_key: tokenResponse.oauth_client_key,
         id_token: tokenResponse.id_token,
+        scope: tokenResponse.scope,
         upstream_proxy_url: request.proxy_url,
       },
       quota: existing?.status === 'expired' ? existing.quota : quota,

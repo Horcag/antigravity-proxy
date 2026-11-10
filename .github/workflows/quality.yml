@@ -22,6 +22,12 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Install audio decoder for native speech integration tests
+        timeout-minutes: 4
+        run: |
+          sudo apt-get update -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg
+
       - name: Install dependencies
         run: npm ci
 

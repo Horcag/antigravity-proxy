@@ -6,6 +6,9 @@ import { AccountLeaseService } from './account-lease.service';
 import { GeminiClient } from './clients/gemini.client';
 import { GeminiController } from './gemini.controller';
 import { ProxyGuard } from './proxy.guard';
+import { NativeSpeechController } from './speech/native-speech.controller';
+import { NativeSpeechService } from './speech/native-speech.service';
+import { NativeSpeechAuth } from './speech/native-speech-auth';
 import {
   FastifyMultipartProvider,
   MultipartOpenAIExceptionFilter,
@@ -13,12 +16,14 @@ import {
 
 @Module({
   imports: [],
-  controllers: [ProxyController, GeminiController],
+  controllers: [ProxyController, GeminiController, NativeSpeechController],
   providers: [
     ProxyService,
     AccountLeaseService,
     GeminiClient,
     ProxyGuard,
+    NativeSpeechService,
+    NativeSpeechAuth,
     FastifyMultipartProvider,
     {
       provide: APP_FILTER,

@@ -8,6 +8,8 @@ export interface AccountLeaseTokenData {
   refresh_token: string;
   id_token?: string;
   oauth_client_key?: string;
+  scope?: string;
+  is_gcp_tos?: boolean;
   token_type: string;
   expires_in: number;
   expiry_timestamp: number;
