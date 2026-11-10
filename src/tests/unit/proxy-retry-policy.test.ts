@@ -389,19 +389,14 @@ describe('ProxyRetryPolicy', () => {
     expect(accountLeaseService.markFromUpstreamError).not.toHaveBeenCalled();
   });
 
-  it('switches accounts immediately for structured quota failures', () => {
+  it.each([
+    ...[401, 403, 408, 429, 499, 500, 502, 503, 504].map((status) => ({ status })), { reason: 'transport' as const },
+  ])('switches accounts instead of replaying a failed stream as nonstream: %j', (failure) => {
     const { policy } = createPolicy();
-
-    expect(
-      policy.shouldFailoverImmediately(
-        new UpstreamRequestError({ status: 429, reason: 'quota_exhausted' }),
-      ),
-    ).toBe(true);
-    expect(
-      policy.shouldFailoverImmediately(
-        new UpstreamRequestError({ status: 500 }),
-      ),
-    ).toBe(false);
+    expect(policy.shouldFailoverImmediately(new UpstreamRequestError(failure))).toBe(true);
+    expect(policy.shouldFailoverImmediately(new UpstreamRequestError({ status: 400 }))).toBe(false);
+    for (const status of [501, 507, 520]) expect(policy.shouldFailoverImmediately(new UpstreamRequestError({ status }))).toBe(false);
+    expect(policy.shouldFailoverImmediately(new UpstreamRequestError({ status: 403, reason: 'tos_violation' }))).toBe(false);
   });
 
   it('does not dispatch a migration candidate when ownership is denied', async () => {
@@ -467,7 +462,7 @@ describe('ProxyRetryPolicy', () => {
     expect(releaseReservation).toHaveBeenCalledOnce();
   });
 
-  it.each([401, 403, 429, 500, 503])(
+  it.each([401, 403, 408, 429, 499, 500, 502, 503, 504])(
     'keeps retry eligibility for upstream status %i',
     async (status) => {
       const { policy, accountLeaseService } = createPolicy();

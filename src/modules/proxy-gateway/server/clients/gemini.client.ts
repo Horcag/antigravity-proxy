@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import { classifyAxiosFailure, readForbiddenErrorBody, toGeminiUpstreamRequestError } from './upstream-error-classification';
+import { Readable } from 'node:stream';
+import { readForbiddenErrorBody, toGeminiUpstreamRequestError } from './upstream-error-classification';
 import { UserProjectCapabilityCache } from './user-project-capability-cache';
+import { hedgedStreamRequest } from './hedged-stream-request';
 import { Injectable, Logger } from '@nestjs/common';
 import axios, { AxiosProxyConfig, AxiosRequestConfig, AxiosResponse } from 'axios';
 import { isObjectLike } from 'lodash-es';
-import { Readable } from 'node:stream';
 import { GeminiRequest, GeminiResponse } from '../interfaces/request-interfaces';
 import { GeminiInternalRequest } from '../../antigravity/types';
 import { getServerConfig } from '../../../../server/server-config';
@@ -29,11 +30,11 @@ export function unwrapInternalGeminiResponse<T>(payload: T | { response: T }): T
 }
 
 export { UserProjectCapabilityCache, DEFAULT_PROJECT_CAPABILITY_TTL_MS, type NegativeProjectCapabilitySnapshot } from './user-project-capability-cache';
-const PROJECT_HEADER_ATTEMPT_COUNT = 2;
 
 @Injectable()
 export class GeminiClient {
   private readonly logger = new Logger(GeminiClient.name);
+  // Retained for callers that inspect the legacy cache; generation does not consult it.
   public readonly userProjectCapabilityCache = new UserProjectCapabilityCache();
   private preferredInternalBaseUrl?: string;
   private lastConfiguredBaseUrlsKey = '';
@@ -189,15 +190,6 @@ export class GeminiClient {
     this.lastConfiguredBaseUrlsKey = '';
   }
 
-  private resolveAccountKey(
-    accountKeyOrOptions?: string | { accountKey?: string; accountId?: string },
-  ): string {
-    if (typeof accountKeyOrOptions === 'string') {
-      return accountKeyOrOptions.trim();
-    }
-    return (accountKeyOrOptions?.accountKey ?? accountKeyOrOptions?.accountId ?? '').trim();
-  }
-
   private getInternalBaseUrls(): string[] {
     const fromEnv =
       process.env.PROXY_INTERNAL_BASE_URLS ?? process.env.ANTIGRAVITY_INTERNAL_BASE_URLS;
@@ -251,143 +243,78 @@ export class GeminiClient {
   ): Promise<AxiosResponse<T>> {
     const diagnostics: UpstreamDiagnosticContext = { requestId: randomUUID() };
     logUpstreamTerminalDiagnostic(diagnostics, 'start');
-    const safeProject = body.project?.trim();
-    const safeAccount = this.resolveAccountKey(accountKeyOrOptions);
-    const hasKnownNegativeCapability = Boolean(
-      safeProject &&
-        this.userProjectCapabilityCache.hasNegativeCapability(safeAccount, safeProject),
-    );
-    let hasTriggeredProjectHeaderDowngrade = hasKnownNegativeCapability;
-
+    // Project is native body metadata; do not synthesize quota-project headers or strip it.
+    void accountKeyOrOptions;
     const baseUrls = this.getOrderedInternalBaseUrls();
     const timeout = this.getInternalTimeoutMs();
     const requestUserAgent = await resolveRequestUserAgent();
     const axiosProxy = this.resolveUpstreamAxiosProxy(upstreamProxyUrl);
-    let lastError: unknown = null;
-
-    for (
-      let projectHeaderAttempt = 0;
-      projectHeaderAttempt < PROJECT_HEADER_ATTEMPT_COUNT;
-      projectHeaderAttempt++
-    ) {
-      let shouldRetryWithoutProjectHeader = false;
-      const projectHeaders = hasTriggeredProjectHeaderDowngrade
-        ? {}
-        : this.createProjectHeaders(body);
-      const requestBody = hasTriggeredProjectHeaderDowngrade
-        ? this.createProjectlessRequestBody(body)
-        : body;
-
-      for (let index = 0; index < baseUrls.length; index++) {
-        const baseUrl = baseUrls[index];
-        const url = `${baseUrl}${path}`;
-
-        try {
-          const response = await axios.post<T>(url, this.createInternalRequestBody(path, requestBody), {
-            headers: {
-              Authorization: `Bearer ${accessToken}`,
-              'Content-Type': 'application/json',
-              'User-Agent': requestUserAgent,
-              ...projectHeaders,
-              ...(extraHeaders ?? {}),
-            },
-            timeout,
-            proxy: axiosProxy,
-            ...config,
-            signal: signal ?? config.signal,
-          });
-
-          diagnostics.httpStatus = response.status;
-          registerUpstreamDiagnosticContext(response.data, diagnostics);
-          logUpstreamTerminalDiagnostic(diagnostics, 'http_response');
-          this.preferredInternalBaseUrl = baseUrl;
-          if (Boolean(projectHeaders['x-goog-user-project']) && safeProject) {
-            this.userProjectCapabilityCache.clearNegativeCapability(safeAccount, safeProject);
-          }
-          return response;
-        } catch (error) {
-          throwIfUpstreamRequestCanceled(error, signal ?? config.signal);
-          diagnostics.httpStatus = axios.isAxiosError(error) ? error.response?.status : undefined;
-          logUpstreamTerminalDiagnostic(diagnostics, 'failure');
-          if (axios.isAxiosError(error)) await readForbiddenErrorBody(error, signal ?? config.signal);
-          throwIfUpstreamRequestCanceled(error, signal ?? config.signal);
-          lastError = error;
-
-          if (this.shouldRetryWithoutProjectHeader(error, projectHeaders)) {
-            this.logger.warn(
-              `[${operation}] project_context_rejected status=403 action=retry_without_project`,
-            );
-            if (safeProject) {
-              this.userProjectCapabilityCache.recordNegativeCapability(safeAccount, safeProject);
-            }
-            hasTriggeredProjectHeaderDowngrade = true;
-            shouldRetryWithoutProjectHeader = true;
-            break;
-          }
-
-          const hasNextEndpoint = index < baseUrls.length - 1;
-
-          if (!hasNextEndpoint || !this.shouldFailoverToNextEndpoint(error)) {
-            await this.throwUpstreamRequestError(error, operation, signal ?? config.signal);
-          }
-
-          this.logger.warn(
-            `[${operation}] upstream_endpoint_retry attempt=${index + 2} total=${baseUrls.length}`,
-          );
-        }
-      }
-
-      if (shouldRetryWithoutProjectHeader) {
-        continue;
-      }
-
-      return await this.throwUpstreamRequestError(lastError, operation, signal ?? config.signal);
-    }
-
-    return await this.throwUpstreamRequestError(lastError, operation, signal ?? config.signal);
-  }
-
-  private createInternalRequestBody(path: string, body: GeminiInternalRequest): string | Readable {
-    const bodyText = JSON.stringify(body);
-    if (path.startsWith(':streamGenerateContent')) {
-      return Readable.from([bodyText]);
-    }
-
-    return bodyText;
-  }
-
-  private createProjectlessRequestBody(body: GeminiInternalRequest): GeminiInternalRequest {
-    const projectlessBody = { ...body };
-    delete projectlessBody.project;
-    return projectlessBody;
-  }
-
-  private createProjectHeaders(body: GeminiInternalRequest): Record<string, string> {
-    const project = body.project?.trim();
-    if (!project) {
-      return {};
-    }
-
-    return {
-      'x-goog-user-project': project,
-    };
-  }
-
-  private shouldRetryWithoutProjectHeader(
-    error: unknown,
-    projectHeaders: Record<string, string>,
-  ): boolean {
-    return (
-      axios.isAxiosError(error) &&
-      error.response?.status === 403 &&
-      classifyAxiosFailure(403, error.response.data, error.message) !== 'tos_violation' &&
-      Boolean(projectHeaders['x-goog-user-project'])
+    const requestBody = JSON.stringify(body);
+    const requestSignal = signal ?? config.signal;
+    const request = (index: number, attemptSignal = requestSignal) => axios.post<T>(
+      `${baseUrls[index]}${path}`, requestBody, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'User-Agent': requestUserAgent,
+          ...(extraHeaders ?? {}),
+        },
+        timeout,
+        proxy: axiosProxy,
+        ...config,
+        signal: attemptSignal,
+      },
     );
+    const accept = (response: AxiosResponse<T>, index: number) => {
+      diagnostics.httpStatus = response.status;
+      registerUpstreamDiagnosticContext(response.data, diagnostics);
+      logUpstreamTerminalDiagnostic(diagnostics, 'http_response');
+      this.preferredInternalBaseUrl = baseUrls[index];
+      return response;
+    };
+    const fail = async (error: unknown): Promise<never> => {
+      throwIfUpstreamRequestCanceled(error, requestSignal);
+      diagnostics.httpStatus = axios.isAxiosError(error) ? error.response?.status : undefined;
+      logUpstreamTerminalDiagnostic(diagnostics, 'failure');
+      return this.throwUpstreamRequestError(error, operation, requestSignal);
+    };
+
+    if (config.responseType === 'stream') {
+      try {
+        const { response, index } = await hedgedStreamRequest({
+          request,
+          endpointCount: baseUrls.length,
+          shouldRetry: (error) => this.shouldFailoverToNextEndpoint(error),
+          signal: requestSignal,
+        });
+        return accept(response, index);
+      } catch (error) {
+        return fail(error);
+      }
+    }
+
+    for (let index = 0; index < baseUrls.length; index++) {
+      try {
+        return accept(await request(index), index);
+      } catch (error) {
+        throwIfUpstreamRequestCanceled(error, requestSignal);
+        if (index === baseUrls.length - 1 || !this.shouldFailoverToNextEndpoint(error)) {
+          return fail(error);
+        }
+        diagnostics.httpStatus = axios.isAxiosError(error) ? error.response?.status : undefined;
+        logUpstreamTerminalDiagnostic(diagnostics, 'failure');
+        this.logger.warn(
+          `[${operation}] upstream_endpoint_retry attempt=${index + 2} total=${baseUrls.length}`,
+        );
+      }
+    }
+    return fail(undefined);
   }
 
   private async throwUpstreamRequestError(error: unknown, operation: string, signal?: AxiosRequestConfig['signal']): Promise<never> {
     if (axios.isAxiosError(error)) {
       await readForbiddenErrorBody(error, signal);
+      if (error.response?.data instanceof Readable) error.response.data.destroy();
       throwIfUpstreamRequestCanceled(error, signal);
       const upstreamError = toGeminiUpstreamRequestError(error);
       this.logUpstreamFailure(operation, upstreamError);

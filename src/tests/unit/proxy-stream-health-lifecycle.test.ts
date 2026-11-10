@@ -708,8 +708,8 @@ describe('ProxyService stream health lifecycle', () => {
   });
 });
 
-describe('GeminiClient project-header downgrade logging', () => {
-  it('does not include account or project identifiers in the downgrade warning', async () => {
+describe('GeminiClient native project error logging', () => {
+  it('does not retry project context or include private identifiers in warnings', async () => {
     const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     const post = vi.spyOn(axios, 'post');
     const request = {
@@ -727,13 +727,13 @@ describe('GeminiClient project-header downgrade logging', () => {
       headers: {},
     } as any);
 
-    await new GeminiClient().generateInternal(request, 'access-token', undefined, undefined, 'account-secret');
-
+    await expect(new GeminiClient().generateInternal(request, 'access-token', undefined, undefined, 'account-secret')).rejects.toMatchObject({ status: 403 });
+    expect(post).toHaveBeenCalledTimes(1);
     const downgradeWarning = warn.mock.calls
       .map(([message]) => String(message))
       .find((message) => message.includes('project_context_rejected'));
-    expect(downgradeWarning).toBeDefined();
-    expect(downgradeWarning).not.toContain('account-secret');
-    expect(downgradeWarning).not.toContain('project-secret');
+    expect(downgradeWarning).toBeUndefined();
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('account-secret');
+    expect(JSON.stringify(warn.mock.calls)).not.toContain('project-secret');
   });
 });

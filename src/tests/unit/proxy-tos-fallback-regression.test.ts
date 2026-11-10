@@ -72,26 +72,25 @@ describe('ProxyService precise ToS fallback protection', () => {
     expect(leases.getNextToken).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps the normal transient stream-to-nonstream fallback', async () => {
+  it('rotates accounts on transient failure without replaying nonstream', async () => {
     const client = new GeminiClient();
-    const stream = vi.spyOn(client, 'streamGenerateInternal').mockRejectedValue(new UpstreamRequestError({ status: 503 }));
+    const stream = vi.spyOn(client, 'streamGenerateInternal').mockRejectedValueOnce(new UpstreamRequestError({ status: 503 })).mockResolvedValueOnce(Readable.from([Buffer.from(`data: ${JSON.stringify(candidate)}\n\n`)]));
     const direct = vi.spyOn(client, 'generateInternal').mockResolvedValue(candidate);
     const { service, leases } = setup(client);
     await consume(await service.handleChatCompletions(chat));
-    expect(stream).toHaveBeenCalledTimes(1);
-    expect(direct).toHaveBeenCalledTimes(1);
+    expect(stream).toHaveBeenCalledTimes(2);
+    expect(direct).not.toHaveBeenCalled();
+    expect(leases.getNextToken).toHaveBeenCalledTimes(2);
     expect(leases.markAsForbidden).not.toHaveBeenCalled();
   });
 
-  it('keeps ordinary project-context 403 downgrade without penalizing the account', async () => {
-    const post = vi.spyOn(axios, 'post').mockRejectedValueOnce(rejected({ error: { code: 403, message: 'Permission to use this quota project denied' } }))
-      .mockResolvedValueOnce({ status: 200, data: Readable.from([Buffer.from(`data: ${JSON.stringify(candidate)}\n\n`)]), headers: {} });
-    const { service, leases } = setup();
-    await consume(await service.handleChatCompletions(chat));
-    expect(post).toHaveBeenCalledTimes(2);
-    expect(post.mock.calls[0][2]?.headers).toHaveProperty('x-goog-user-project');
-    expect(post.mock.calls[1][2]?.headers).not.toHaveProperty('x-goog-user-project');
-    expect(leases.markAsForbidden).not.toHaveBeenCalled();
+  it('does not invent a projectless retry after ordinary project-context rejection', async () => {
+    const post = vi.spyOn(axios, 'post').mockRejectedValue(rejected({ error: { code: 403, message: 'Permission to use this quota project denied' } }));
+    const body = { project: 'native-project', model: 'gemini-3-flash', request: { contents: [] } } as never;
+    await expect(new GeminiClient().streamGenerateInternal(body, 'fixture')).rejects.toMatchObject({ status: 403, reason: 'authentication' });
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0][2]?.headers).not.toHaveProperty('x-goog-user-project');
+    expect(JSON.parse(post.mock.calls[0][1] as string).project).toBe('native-project');
   });
 
   it('returns cancellation during rejected 403 body inspection without fallback or penalty', async () => {

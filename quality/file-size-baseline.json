@@ -17,10 +17,8 @@
     "src/modules/proxy-gateway/server/account-lease-model-policy.ts": 638,
     "src/modules/proxy-gateway/server/account-lease-selection-policy.ts": 960,
     "src/modules/proxy-gateway/server/account-lease.service.ts": 1014,
-    "src/modules/proxy-gateway/server/clients/gemini.client.ts": 446,
     "src/modules/proxy-gateway/server/cloudcode-failover-gateway.ts": 1536,
     "src/modules/proxy-gateway/server/native-gemini-request.ts": 506,
-    "src/modules/proxy-gateway/server/proxy-retry-policy.ts": 499,
     "src/modules/proxy-gateway/server/proxy.controller.ts": 3416,
     "src/modules/proxy-gateway/server/proxy.service.ts": 3659,
     "src/modules/proxy-gateway/server/rate-limit-tracker.ts": 690,
@@ -35,6 +33,6 @@
     "src/tests/unit/proxy-service-account-failover.test.ts": 510,
     "src/tests/unit/proxy-stream-health-lifecycle.test.ts": 739,
     "src/tests/unit/systemd-release-tooling.test.ts": 1737,
-    "src/tests/unit/upstream-endpoint-project-stability.test.ts": 602
+    "src/tests/unit/upstream-endpoint-project-stability.test.ts": 508
   }
 }
