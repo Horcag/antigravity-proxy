@@ -6,10 +6,17 @@ const filtersSchema = z.object({
   limit: z.coerce.number().int().min(1).max(500).optional(),
   offset: z.coerce.number().int().min(0).max(1_000_000).optional(),
   accountId: z.string().max(200).optional(), projectId: z.string().max(200).optional(), model: z.string().max(200).optional(),
+  finalAccountId: z.string().max(200).optional(),
+  attemptOutcome: z.enum(['success', 'failure', 'unknown']).optional(),
+  metric: z.enum(['input_tokens', 'output_tokens', 'cache_tokens', 'ttft_ms', 'duration_ms']).optional(),
+  missingModel: z.enum(['true', 'false']).transform((value) => value === 'true').optional(),
+  result: z.enum(['success', 'failure', 'none']).optional(),
   status: z.union([z.enum(['success', 'error', 'failure']), z.string().regex(/^[1-5][0-9]{2}$/)]).optional(),
   from: z.string().refine((v) => Number.isFinite(Date.parse(v))).optional(),
   to: z.string().refine((v) => Number.isFinite(Date.parse(v))).optional(),
+  toExclusive: z.string().refine((v) => Number.isFinite(Date.parse(v))).optional(),
 }).strict();
+const statisticsSchema = filtersSchema.extend({ granularity: z.enum(['minute', 'five_minutes', 'hour', 'day']).default('hour') });
 function filters(query: unknown) {
   const parsed = filtersSchema.safeParse(query);
   if (!parsed.success) throw new BadRequestException('Invalid request history filters');
@@ -19,7 +26,12 @@ function filters(query: unknown) {
 @UseGuards(ConsoleGuard)
 export class ConsoleObservationController {
   @Get('requests') requests(@Query() query: unknown) { return getRequestHistory(filters(query)); }
-  @Get('statistics') statistics(@Query() query: unknown) { return { ...getUsageSummary(filters(query)), accounts: getAccountStats(filters(query)) }; }
+  @Get('statistics') statistics(@Query() query: unknown) {
+    const parsed = statisticsSchema.safeParse(query);
+    if (!parsed.success) throw new BadRequestException('Invalid request history filters');
+    const { granularity, ...selected } = parsed.data;
+    return { ...getUsageSummary(selected, granularity), accounts: getAccountStats(selected) };
+  }
   @Get('account-stats') accountStats(@Query() query: unknown) { return getAccountStats(filters(query)); }
   @Get('metadata') metadata() {
     return { backend: 'antigravity-proxy', api_version: 1,

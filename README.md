@@ -338,7 +338,12 @@ Request metadata is retained locally in `request-history.db` for seven days, cap
 outcomes, including failed attempts before a successful account failover. Prompts, response
 bodies and credentials are never recorded. Token/cache/TTFT fields are unknown when the
 upstream protocol did not provide trustworthy measurements; unknown does not mean zero.
-Overview and statistics offer hourly or daily UTC buckets over the same selected date range.
+Overview and statistics offer minute, five-minute, hourly or daily buckets aligned to
+Europe/Samara (UTC+4), including empty intervals. The overview defaults to five minutes.
+Chart points, errors, totals and measured account/model statistics open their contributing
+requests with the selected period and filters; exclusive interval ends prevent boundary
+double-counting. Request filters are editable to the second in Samara time, and separate
+attempt counts explain retries within one logical request.
 The request journal labels native service operations separately from inference and distinguishes
 client authorization from managed pool accounts. Older opaque `other` records retain an explicit
 missing-operation label; their original operation cannot be reconstructed.

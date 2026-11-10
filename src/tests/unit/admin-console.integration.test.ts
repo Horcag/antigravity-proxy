@@ -131,6 +131,20 @@ describe('console session and real temporary store management', () => {
     expect(summary).toMatchObject({total_requests: 1, input_tokens: null, token_metrics_available: false});
     expect((await fastify.inject({ url: '/admin/console/account-stats', headers: auth })).json()[0]).toMatchObject({account_id: 'account-one', success_attempts: 1});
     expect((await fastify.inject({ url: '/admin/console/requests?limit=NaN', headers: auth })).statusCode).toBe(400);
+    expect((await fastify.inject({ url: '/admin/console/statistics?granularity=five_minutes', headers: auth })).json()).toMatchObject({ granularity: 'five_minutes', time_zone: 'Europe/Samara', total_requests: 1 });
+    for (const query of ['granularity=week', 'metric=bad', 'missingModel=1', 'attemptOutcome=bad', 'toExclusive=bad', 'result=bad']) {
+      expect((await fastify.inject({ url: `/admin/console/statistics?${query}`, headers: auth })).statusCode).toBe(400);
+    }
+    expect((await fastify.inject({ url: '/admin/console/requests?granularity=minute', headers: auth })).statusCode).toBe(400);
+    expect((await fastify.inject({ url: '/admin/console/statistics?status=failure&result=success', headers: auth })).json().total_requests).toBe(0);
+    const time = getRequestHistoryStore().getRequestHistory().items[0].time;
+    for (const route of ['requests', 'statistics', 'account-stats']) {
+      const response = await fastify.inject({ url: `/admin/console/${route}?toExclusive=${encodeURIComponent(time)}`, headers: auth });
+      expect(response.statusCode).toBe(200);
+      if (route === 'account-stats') expect(response.json()).toEqual([]);
+      else expect(response.json()[route === 'requests' ? 'total' : 'total_requests']).toBe(0);
+    }
+    expect((await fastify.inject({ url: '/admin/console/requests?metric=input_tokens&missingModel=true&attemptOutcome=success&finalAccountId=account-one', headers: auth })).json().total).toBe(0);
   });
   it('provides real model discovery and rejects expired or mismatching OAuth state before upstream calls', async () => {
     const auth = await login();

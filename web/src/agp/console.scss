@@ -260,3 +260,33 @@ dd {
     transition: none !important;
   }
 }
+
+.agp-number-link {
+  color: inherit;
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+  text-decoration: underline;
+  text-decoration-color: var(--border-color);
+  text-underline-offset: 4px;
+  &:hover {
+    color: var(--primary-color, #2563eb);
+    text-decoration-color: currentColor;
+  }
+  &:focus-visible {
+    outline: 2px solid var(--primary-color, #2563eb);
+    outline-offset: 4px;
+  }
+}
+button.agp-number-link {
+  font: inherit;
+  border: 0;
+  background: transparent;
+  padding: 2px;
+}
+button.agp-number-link.agp-badge {
+  padding: 4px 9px;
+  background: var(--success-badge-bg);
+}
+button.agp-number-link.agp-warning {
+  background: var(--failure-badge-bg);
+}

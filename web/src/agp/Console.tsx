@@ -18,7 +18,8 @@ import { api, setCsrf } from './api';
 import { Accounts } from './Accounts';
 import { Projects } from './Projects';
 import { Models, SettingsPage } from './Configuration';
-import { Requests, StatisticsPage } from './Traffic';
+import { Requests } from './Traffic';
+import { StatisticsPage } from './Statistics';
 import license from '../../LICENSE?raw';
 import './console.scss';
 const nav: SidebarNavGroup[] = [

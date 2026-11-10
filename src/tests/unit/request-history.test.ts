@@ -56,6 +56,71 @@ describe('persistent request history', () => {
     expect(store.getUsageSummary({ projectId: 'missing' }).by_hour).toEqual([]);
   });
 
+  it('fills Samara day, five-minute and minute intervals with exact exclusive drill boundaries', () => {
+    const store = new RequestHistoryStore(':memory:', { now: () => Date.parse('2026-11-10T00:00:00Z') }); stores.push(store);
+    for (const [time, status, input_tokens] of [
+      ['2026-11-09T19:59:59.999Z', 200, 2], ['2026-11-09T20:00:00.000Z', 502, 3],
+      ['2026-11-09T20:05:00.000Z', 200, 5], ['2026-11-09T20:07:00.000Z', 200, 0],
+    ] as const) store.record({ ...input, time, status, input_tokens, output_tokens: 1, project_id: 'one' });
+    store.record({ ...input, time: '2026-11-09T20:02:00Z', project_id: 'other', status: 503 });
+    const filters = { projectId: 'one', from: '2026-11-09T19:55:00Z', toExclusive: '2026-11-09T20:10:00Z' };
+    const days = store.getUsageSummary(filters, 'day');
+    expect(days.time_zone).toBe('Europe/Samara');
+    expect(days.range).toEqual({ from: '2026-11-09T19:55:00.000Z', toExclusive: '2026-11-09T20:10:00.000Z' });
+    expect(days.buckets).toEqual([
+      { start: '2026-11-09T19:55:00.000Z', end: '2026-11-09T20:00:00.000Z', total_requests: 1, failed_requests: 0, input_tokens: 2, output_tokens: 1 },
+      { start: '2026-11-09T20:00:00.000Z', end: '2026-11-09T20:10:00.000Z', total_requests: 3, failed_requests: 1, input_tokens: 8, output_tokens: 3 },
+    ]);
+    const minutes = store.getUsageSummary(filters, 'minute');
+    expect(minutes.buckets).toHaveLength(15);
+    expect(minutes.buckets.find((b) => b.start === '2026-11-09T20:01:00.000Z')).toMatchObject({ total_requests: 0, failed_requests: 0, input_tokens: null });
+    const five = store.getUsageSummary(filters, 'five_minutes');
+    expect(five.buckets.map((b) => b.total_requests)).toEqual([1, 1, 2]);
+    for (const summary of [days, minutes, five]) {
+      expect(summary.buckets.reduce((sum, bucket) => sum + bucket.total_requests, 0)).toBe(summary.total_requests);
+      expect(summary.buckets.reduce((sum, bucket) => sum + bucket.failed_requests, 0)).toBe(summary.failed_requests);
+      for (const bucket of summary.buckets) expect(store.getRequestHistory({ projectId: 'one', from: bucket.start, toExclusive: bucket.end }).total).toBe(bucket.total_requests);
+    }
+    expect(store.getUsageSummary({ ...filters, projectId: 'missing' }, 'five_minutes').buckets.map((b) => b.total_requests)).toEqual([0, 0, 0]);
+    expect(store.getUsageSummary({ projectId: 'missing' }, 'minute').buckets).toEqual([]);
+    expect(store.getUsageSummary({ from: '2000-01-01', toExclusive: '2100-01-01' }, 'minute').buckets.length).toBeLessThanOrEqual(10_082);
+  });
+
+  it('drills observed measurements, missing models, final accounts and outcomes on the same attempt', () => {
+    const store = new RequestHistoryStore(':memory:'); stores.push(store);
+    store.record({ ...input, model: undefined, account_id: 'B', input_tokens: 0, ttft_ms: 0,
+      attempts: [{ account_id: 'A', outcome: 'failure' }, { account_id: 'B', outcome: 'success' }] });
+    store.record({ ...input, account_id: 'A', output_tokens: 4, cache_tokens: 0,
+      attempts: [{ account_id: 'A', outcome: 'unknown' }] });
+    expect(store.getRequestHistory({ accountId: 'A', attemptOutcome: 'success' }).total).toBe(0);
+    expect(store.getRequestHistory({ accountId: 'A', attemptOutcome: 'failure' }).total).toBe(1);
+    expect(store.getAccountStats({ accountId: 'A', attemptOutcome: 'failure' })).toMatchObject([{ failed_attempts: 1, total_attempts: 1 }]);
+    expect(store.getRequestHistory({ accountId: 'A', attemptOutcome: 'unknown' }).total).toBe(1);
+    expect(store.getRequestHistory({ finalAccountId: 'A', metric: 'input_tokens' }).total).toBe(0);
+    expect(store.getRequestHistory({ finalAccountId: 'B', metric: 'input_tokens', missingModel: true }).total).toBe(1);
+    expect(store.getRequestHistory({ missingModel: false }).total).toBe(1);
+    for (const metric of ['input_tokens', 'output_tokens', 'cache_tokens', 'ttft_ms'] as const) expect(store.getRequestHistory({ metric }).total).toBe(1);
+    expect(store.getRequestHistory({ metric: 'duration_ms' }).total).toBe(2);
+    expect(store.getUsageSummary({ metric: 'input_tokens' }).input_tokens).toBe(0);
+    store.record({ ...input, attempts: [{ account_id: 'A', outcome: 'failure' }, { account_id: 'A', outcome: 'failure' }] });
+    expect(store.getRequestHistory({ accountId: 'A', attemptOutcome: 'failure', limit: 1 })).toMatchObject({ total: 2, matching_attempts: 3, items: [expect.any(Object)] });
+    expect(store.getRequestHistory({ accountId: 'B', attemptOutcome: 'failure' })).toMatchObject({ total: 0, matching_attempts: 0 });
+    expect(store.getRequestHistory().matching_attempts).toBeUndefined();
+  });
+
+  it('intersects logical results with existing outcome and numeric HTTP status filters', () => {
+    const store = new RequestHistoryStore(':memory:'); stores.push(store);
+    store.record({ ...input, status: 200 });
+    store.record({ ...input, status: 200, grpc_status: '13' });
+    store.record({ ...input, status: 502 });
+    expect(store.getUsageSummary({ status: 'failure', result: 'success' }).total_requests).toBe(0);
+    expect(store.getRequestHistory({ result: 'none' }).total).toBe(0);
+    expect(store.getRequestHistory({ status: 'failure', result: 'success' }).total).toBe(0);
+    expect(store.getRequestHistory({ status: 200, result: 'failure' })).toMatchObject({ total: 1, items: [{ status: 200, grpc_status: '13' }] });
+    expect(store.getUsageSummary({ status: 200, result: 'failure' })).toMatchObject({ total_requests: 1, failed_requests: 1, success_requests: 0 });
+    expect(store.getRequestHistory({ status: 200, result: 'success' })).toMatchObject({ total: 1, items: [{ status: 200, grpc_status: null }] });
+  });
+
   it('retains safe service operations and distinguishes pool, client and historical attribution', () => {
     const store = new RequestHistoryStore(':memory:'); stores.push(store);
     for (const row of [
@@ -113,6 +178,19 @@ describe('persistent request history', () => {
       expect.objectContaining({ account_id: 'B', success_attempts: 1, final_requests: 1, input_tokens: 12, output_tokens: 4 }),
     ]);
     expect(store.getAccountStats({ accountId: 'A', projectId: 'other-project' })).toEqual([]);
+  });
+
+  it('counts final accounts without observed attempts in account request totals and retains unknown timing', () => {
+    const store = new RequestHistoryStore(':memory:'); stores.push(store);
+    for (let index = 0; index < 2; index++) store.record({ ...input, account_id: 'A', input_tokens: 2, attempts: [{ account_id: 'A', outcome: 'success' }] });
+    store.record({ ...input, account_id: 'A', input_tokens: 3 });
+    store.record({ ...input, account_id: 'final-only', status: 502 });
+    expect(store.getAccountStats({ accountId: 'A' })).toMatchObject([{ account_id: 'A', total_attempts: 2, logical_requests: 3, final_requests: 3, input_tokens: 7 }]);
+    const finalOnly = store.getAccountStats().find((row) => row.account_id === 'final-only');
+    expect(finalOnly).toMatchObject({ total_attempts: 0, success_attempts: 0, failed_attempts: 0, unknown_attempts: 0,
+      logical_requests: 1, final_requests: 1, failed_requests: 1, avg_ttft_ms: null });
+    for (const row of store.getAccountStats()) expect(store.getRequestHistory({ accountId: row.account_id }).total).toBe(row.logical_requests);
+    expect(store.getAccountStats({ accountId: 'final-only', attemptOutcome: 'failure' })).toEqual([]);
   });
 
   it('stores only allowlisted metadata without prompt, credentials, URLs or raw errors', () => {
