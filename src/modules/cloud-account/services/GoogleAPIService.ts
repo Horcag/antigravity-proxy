@@ -446,7 +446,7 @@ export class GoogleAPIService {
     );
   }
 
-  private static getFetchOptions(proxyUrl?: string) {
+  static getFetchOptions(proxyUrl?: string) {
     const proxyTraceEnabled = process.env.DEBUG_PROXY_TRACE === '1';
 
     if (proxyUrl && proxyUrl.length > 0) {

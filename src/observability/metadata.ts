@@ -11,6 +11,7 @@ export function safeLabel(value: unknown, fallback = 'unknown', privateValues: s
 export function normalizedRoute(value: unknown): string {
   const path = typeof value === 'string' ? value.split('?')[0] : '';
   if (path === '/') return '/';
+  if (['/v1/audio/native/models', '/v1/audio/native/transcriptions', '/v1/audio/native/transcriptions/stream'].includes(path)) return path;
   if (/^\/v1internal:(?:streamGenerateContent|generateContent|countTokens|predict|streamRawPredict|recordTrajectoryAnalytics|writeTrajectoryAcls|recordCodeAssistMetrics|recordClientEvent|recordSmartchoicesFeedback)$/.test(path)) return path;
   const operation = /^\/v1internal:([A-Za-z][A-Za-z0-9]{0,63})$/.exec(path)?.[1];
   // Keep bounded RPC method names, never queries, resource IDs or arbitrary paths.

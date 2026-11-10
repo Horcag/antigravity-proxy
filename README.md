@@ -238,6 +238,9 @@ curl http://127.0.0.1:8045/v1/models \
   -H "Authorization: Bearer $AG_PROXY_API_KEY"
 ```
 
+Native speech transcription supports batch uploads and live PCM streaming. See the
+[native speech API guide](docs/native-speech-api.md) for usage and current limitations.
+
 Admin requests use `AG_PROXY_ADMIN_API_KEY`:
 
 ```bash
