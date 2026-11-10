@@ -31,7 +31,7 @@ function MetricLink({
   large?: boolean;
 }) {
   return value === null || value === undefined ? (
-    <span title="Нет измерения">Неизвестно</span>
+    <span title="В выбранной группе нет запросов с этим измерением">Нет измерений</span>
   ) : (
     <Link
       className={`agp-number-link ${large ? 'agp-metric' : ''}`}

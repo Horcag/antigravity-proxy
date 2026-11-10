@@ -39,7 +39,7 @@ export interface RequestEntry {
   request_id: string;
   time: string;
   protocol: string;
-  request_kind?: 'inference' | 'service' | 'unknown';
+  request_kind?: 'inference' | 'service' | 'probe' | 'unknown';
   authorization_source?: 'client' | 'pool' | 'unknown';
   route: string;
   model: string | null;

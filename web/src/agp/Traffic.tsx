@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { Input } from '@/components/ui/Input';
 import { Modal } from '@/components/ui/Modal';
-import { requestAccountLabel, requestModelLabel } from './api';
+import { missingMeasurement, requestAccountLabel, requestModelLabel } from './api';
 import {
   formatConsoleValue,
   formatSamaraDateTime,
@@ -63,9 +63,17 @@ export function Requests() {
       </label>
     );
   }
-  function detail(value: number | null | undefined, row: RequestEntry, label: string) {
+  function detail(
+    value: number | null | undefined,
+    row: RequestEntry,
+    label: string,
+    metric: string
+  ) {
+    const missing = missingMeasurement(row, metric);
     return value === null || value === undefined ? (
-      display(value)
+      <span className="agp-muted" title={missing.reason}>
+        {missing.label}
+      </span>
     ) : (
       <button
         type="button"
@@ -259,6 +267,10 @@ export function Requests() {
         )}
       </Card>
       <Card>
+        <p className="agp-muted">
+          «—» — показатель не применяется к служебному обращению. «Не передано» — нет измерения в
+          ответе. «Не сохранено» — измерения нет в записи. Наведите на значение для пояснения.
+        </p>
         <DataTable
           headers={[
             'Время (Самара)',
@@ -297,11 +309,11 @@ export function Requests() {
                 {r.status}
                 {r.grpc_status ? ` / gRPC ${r.grpc_status}` : ''}
               </button>,
-              detail(r.duration_ms, r, 'Время ответа'),
-              detail(r.ttft_ms, r, 'TTFT'),
-              detail(r.input_tokens, r, 'Входные токены'),
-              detail(r.output_tokens, r, 'Выходные токены'),
-              detail(r.cache_tokens, r, 'Кэш'),
+              detail(r.duration_ms, r, 'Время ответа', 'duration_ms'),
+              detail(r.ttft_ms, r, 'TTFT', 'ttft_ms'),
+              detail(r.input_tokens, r, 'Входные токены', 'input_tokens'),
+              detail(r.output_tokens, r, 'Выходные токены', 'output_tokens'),
+              detail(r.cache_tokens, r, 'Кэш', 'cache_tokens'),
               <Button variant="secondary" size="sm" onClick={() => setSelected(r)}>
                 Открыть
               </Button>,

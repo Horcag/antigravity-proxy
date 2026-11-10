@@ -135,8 +135,8 @@ describe('persistent request history', () => {
     expect(rows.find(r => r.route === 'other')).toMatchObject({ request_kind: 'unknown', authorization_source: 'unknown' });
     expect(rows.find(r => r.route === '/v1internal:generateContent')).toMatchObject({ request_kind: 'inference', requested_model: 'gemini-pro', effective_model: 'gemini-pro', account_id: 'B' });
     expect(JSON.stringify(rows)).not.toContain('private');
-    store.record({ ...input, route: '/v1internal:privateUnknownOperation' });
-    expect(store.getRequestHistory().items[0].route).toBe('other');
+    store.record({ ...input, route: '/v1internal:newClientRpc' });
+    expect(store.getRequestHistory().items[0].route).toBe('/v1internal:newClientRpc');
   });
 
   it('prunes by age and count, cascades attempt records, and filters safely', () => {

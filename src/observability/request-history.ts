@@ -51,7 +51,7 @@ export interface HistoryFilters {
   toExclusive?: string | number;
 }
 export interface HistoryEntry {
-  request_kind: 'inference' | 'service' | 'unknown';
+  request_kind: 'inference' | 'service' | 'probe' | 'unknown';
   authorization_source: 'client' | 'pool' | 'unknown';
   request_id: string;
   id: string;

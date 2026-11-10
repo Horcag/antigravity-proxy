@@ -1,4 +1,4 @@
-import { createRelayCompletionPromise } from './native-relay-completion';
+import { createRelayCompletionPromise, createNativeRelayEnd } from './native-relay-completion';
 import { observeAttemptStart, observeAccountOutcome, observeUpstreamStreamFailure } from '../../../observability/request-context';
 import http from 'node:http';
 import http2 from 'node:http2';
@@ -878,13 +878,7 @@ export class CloudCodeFailoverGateway {
             break;
           }
         }
-        const onStreamEnd = () => {
-          try {
-            if (bodyStream.trailers && typeof (res as any).addTrailers === 'function' && !res.writableEnded) (res as any).addTrailers(bodyStream.trailers);
-            if (!res.writableEnded) endDownstream();
-          } catch (err) { rejectAndTerminateDownstream(err); }
-        };
-        bodyStream.once('end', onStreamEnd);
+        const { responseUsage, onStreamEnd } = createNativeRelayEnd(res, bodyStream, headers, endDownstream, rejectAndTerminateDownstream, clearLogicalDeadline);
         let downstreamClosed = false;
         res.once('close', () => {
           downstreamClosed = true;
@@ -920,6 +914,7 @@ export class CloudCodeFailoverGateway {
           releaseUpstreamReservation,
         );
         if (firstChunk && firstChunk.length > 0) {
+          responseUsage.write(firstChunk);
           const drained = writeDownstreamChunk(firstChunk);
           if (downstreamFailed || (res as any).destroyed) return;
           if (!drained && !res.writableEnded) {
@@ -956,6 +951,7 @@ export class CloudCodeFailoverGateway {
           onStreamEnd();
         } else {
           bodyStream.on('data', (chunk: Buffer) => {
+            responseUsage.write(chunk);
             const drained = writeDownstreamChunk(chunk);
             if (downstreamFailed || (res as any).destroyed) bodyStream.destroy();
             else if (!drained) { bodyStream.pause(); res.once('drain', () => bodyStream.resume()); }
