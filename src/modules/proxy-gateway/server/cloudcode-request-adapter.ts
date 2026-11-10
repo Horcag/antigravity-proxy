@@ -197,9 +197,11 @@ export function composeAttemptRequest(options: ComposeAttemptOptions): {
     'connection', 'proxy-connection', 'proxy-authorization', 'proxy-authenticate',
     'transfer-encoding', 'te', 'trailer', 'keep-alive', 'upgrade',
   ]);
-  const connection = reqHeaders['connection'];
-  for (const value of Array.isArray(connection) ? connection : [connection || '']) {
-    for (const name of value.split(',')) hopByHop.add(name.trim().toLowerCase());
+  for (const [key, value] of Object.entries(reqHeaders)) {
+    if (key.toLowerCase() !== 'connection') continue;
+    for (const field of Array.isArray(value) ? value : [value || '']) {
+      for (const name of field.split(',')) hopByHop.add(name.trim().toLowerCase());
+    }
   }
   for (const [key, value] of Object.entries(reqHeaders)) {
     const lower = key.toLowerCase();

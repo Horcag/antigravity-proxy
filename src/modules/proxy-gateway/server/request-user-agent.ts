@@ -104,7 +104,10 @@ export function resolveLocalInstalledVersion(): string | null {
   if (!configuredVersion) {
     return null;
   }
-  return extractHighestSemver(configuredVersion);
+  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(configuredVersion)) {
+    throw new Error('AG_PROXY_UPSTREAM_VERSION must be an exact major.minor.patch version');
+  }
+  return configuredVersion;
 }
 
 async function fetchTextPayload(url: string): Promise<string | null> {
@@ -164,14 +167,17 @@ async function resolveRemoteVersion(): Promise<{
 }
 
 async function resolveDefaultUserAgentResolution(): Promise<UserAgentResolution> {
+  const localVersion = resolveLocalInstalledVersion();
+  if (localVersion) {
+    return {
+      source: 'local',
+      version: localVersion,
+      userAgent: buildUserAgent(localVersion),
+    };
+  }
+
   let bestVersion = FALLBACK_VERSION;
   let bestSource: UserAgentSource = 'fallback';
-
-  const localVersion = resolveLocalInstalledVersion();
-  if (localVersion && compareSemverVersions(localVersion, bestVersion) > 0) {
-    bestVersion = localVersion;
-    bestSource = 'local';
-  }
 
   const remoteVersion = await resolveRemoteVersion();
   if (remoteVersion && compareSemverVersions(remoteVersion.version, bestVersion) > 0) {

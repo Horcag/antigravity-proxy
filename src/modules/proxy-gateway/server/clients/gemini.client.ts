@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { classifyAxiosFailure, readForbiddenErrorBody } from './upstream-error-classification';
+import { classifyAxiosFailure, readForbiddenErrorBody, toGeminiUpstreamRequestError } from './upstream-error-classification';
 import { UserProjectCapabilityCache } from './user-project-capability-cache';
 import { Injectable, Logger } from '@nestjs/common';
-import axios, { AxiosError, AxiosProxyConfig, AxiosRequestConfig, AxiosResponse } from 'axios';
-import { isObjectLike, isString } from 'lodash-es';
+import axios, { AxiosProxyConfig, AxiosRequestConfig, AxiosResponse } from 'axios';
+import { isObjectLike } from 'lodash-es';
 import { Readable } from 'node:stream';
 import { GeminiRequest, GeminiResponse } from '../interfaces/request-interfaces';
 import { GeminiInternalRequest } from '../../antigravity/types';
@@ -67,8 +67,9 @@ export class GeminiClient {
     } catch (error) {
       throwIfUpstreamRequestCanceled(error, signal);
       if (axios.isAxiosError(error)) {
-        await readForbiddenErrorBody(error);
-        const upstreamError = this.toUpstreamRequestError(error);
+        await readForbiddenErrorBody(error, signal);
+        throwIfUpstreamRequestCanceled(error, signal);
+        const upstreamError = toGeminiUpstreamRequestError(error);
         this.logUpstreamFailure('stream_generate', upstreamError);
         throw upstreamError;
       }
@@ -98,8 +99,9 @@ export class GeminiClient {
     } catch (error) {
       throwIfUpstreamRequestCanceled(error, signal);
       if (axios.isAxiosError(error)) {
-        await readForbiddenErrorBody(error);
-        const upstreamError = this.toUpstreamRequestError(error);
+        await readForbiddenErrorBody(error, signal);
+        throwIfUpstreamRequestCanceled(error, signal);
+        const upstreamError = toGeminiUpstreamRequestError(error);
         this.logUpstreamFailure('generate', upstreamError);
         throw upstreamError;
       }
@@ -307,7 +309,8 @@ export class GeminiClient {
           throwIfUpstreamRequestCanceled(error, signal ?? config.signal);
           diagnostics.httpStatus = axios.isAxiosError(error) ? error.response?.status : undefined;
           logUpstreamTerminalDiagnostic(diagnostics, 'failure');
-          if (axios.isAxiosError(error)) await readForbiddenErrorBody(error);
+          if (axios.isAxiosError(error)) await readForbiddenErrorBody(error, signal ?? config.signal);
+          throwIfUpstreamRequestCanceled(error, signal ?? config.signal);
           lastError = error;
 
           if (this.shouldRetryWithoutProjectHeader(error, projectHeaders)) {
@@ -325,7 +328,7 @@ export class GeminiClient {
           const hasNextEndpoint = index < baseUrls.length - 1;
 
           if (!hasNextEndpoint || !this.shouldFailoverToNextEndpoint(error)) {
-            await this.throwUpstreamRequestError(error, operation);
+            await this.throwUpstreamRequestError(error, operation, signal ?? config.signal);
           }
 
           this.logger.warn(
@@ -338,10 +341,10 @@ export class GeminiClient {
         continue;
       }
 
-      return await this.throwUpstreamRequestError(lastError, operation);
+      return await this.throwUpstreamRequestError(lastError, operation, signal ?? config.signal);
     }
 
-    return await this.throwUpstreamRequestError(lastError, operation);
+    return await this.throwUpstreamRequestError(lastError, operation, signal ?? config.signal);
   }
 
   private createInternalRequestBody(path: string, body: GeminiInternalRequest): string | Readable {
@@ -382,23 +385,15 @@ export class GeminiClient {
     );
   }
 
-  private async throwUpstreamRequestError(error: unknown, operation: string): Promise<never> {
+  private async throwUpstreamRequestError(error: unknown, operation: string, signal?: AxiosRequestConfig['signal']): Promise<never> {
     if (axios.isAxiosError(error)) {
-      await readForbiddenErrorBody(error);
-      const upstreamError = this.toUpstreamRequestError(error);
+      await readForbiddenErrorBody(error, signal);
+      throwIfUpstreamRequestCanceled(error, signal);
+      const upstreamError = toGeminiUpstreamRequestError(error);
       this.logUpstreamFailure(operation, upstreamError);
       throw upstreamError;
     }
     this.throwAsCleanError(error);
-  }
-
-  private toUpstreamRequestError(error: AxiosError): UpstreamRequestError {
-    const status = error.response?.status;
-    return new UpstreamRequestError({
-      status,
-      headers: { retryAfter: this.extractRetryAfterHeader(error.response?.headers) },
-      reason: classifyAxiosFailure(status, error.response?.data, error.message),
-    });
   }
 
   private logUpstreamFailure(operation: string, error: UpstreamRequestError): void {
@@ -445,25 +440,6 @@ export class GeminiClient {
     }
   }
 
-  private extractRetryAfterHeader(headers: unknown): string | undefined {
-    if (!isObjectLike(headers)) {
-      return undefined;
-    }
-
-    const retryAfter = Object.entries(headers as Record<string, unknown>).find(
-      ([name]) => name.toLowerCase() === 'retry-after',
-    )?.[1];
-    if (isString(retryAfter)) {
-      return retryAfter.trim();
-    }
-    if (Array.isArray(retryAfter) && retryAfter.length > 0) {
-      const first = retryAfter[0];
-      if (isString(first)) {
-        return first.trim();
-      }
-    }
-    return undefined;
-  }
   private throwAsCleanError(_error: unknown): never {
     throw new UpstreamRequestError({ reason: 'transport' });
   }

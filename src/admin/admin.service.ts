@@ -311,8 +311,8 @@ export class AdminService {
         proxy_url: proxyUrl,
       });
 
-      await CloudAccountRepo.addAccount(fullAccount);
-      imported.push(toSanitizedAccount(fullAccount));
+      const persisted = await CloudAccountRepo.importAccount(fullAccount);
+      imported.push(toSanitizedAccount(persisted));
     }
 
     await this.accountLeaseService.loadAccounts();
@@ -424,8 +424,8 @@ export class AdminService {
       proxy_url: request.proxy_url,
     });
 
-    await CloudAccountRepo.addAccount(account);
+    const persisted = await CloudAccountRepo.importAccount(account);
     await this.accountLeaseService.reloadAllAccounts();
-    return toSanitizedAccount(account);
+    return toSanitizedAccount(persisted);
   }
 }

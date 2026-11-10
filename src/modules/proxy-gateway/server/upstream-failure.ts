@@ -111,6 +111,7 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
     errorText = safeDecodeGrpcMessage(rawGm);
   }
 
+  let errorMessage = errorText;
   let rpcStatus: string | undefined;
   let errorInfoReason: string | undefined;
   let errorInfoDomain: string | undefined;
@@ -123,6 +124,7 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
       const parsed = JSON.parse(trimmed);
       isValidJson = true;
       if (parsed?.error && typeof parsed.error === 'object') {
+        if (typeof parsed.error.message === 'string') errorMessage = parsed.error.message;
         if (typeof parsed.error.status === 'string') rpcStatus = parsed.error.status;
         if (typeof parsed.error.code === 'number' && statusCode < 400) statusCode = parsed.error.code;
         if (Array.isArray(parsed.error.details)) {
@@ -142,8 +144,23 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
 
   const lowerText = errorText.toLowerCase();
 
-  // 1. gRPC status header / trailers
   const grpcHeader = headers['grpc-status'];
+  // Явный запрет аккаунта имеет приоритет над project/quota details.
+  const isTosViolation =
+    errorInfoReason === 'TOS_VIOLATION' ||
+    ((statusCode === 403 || rpcStatus === 'PERMISSION_DENIED' || String(grpcHeader) === '7') && (
+      lowerText.includes('tos_violation') ||
+      errorMessage.trim().toLowerCase() === 'violation of terms of service' ||
+      lowerText.includes('service has been disabled in this account for violation of terms of service')
+    ));
+  if (isTosViolation) {
+    statusCode = 403;
+    const rpc = rpcStatus || 'PERMISSION_DENIED';
+    return makeEvidence('permission-denied', 'google.tos.violation', source, statusCode, rpc,
+      buildSafeErrorMessage('permission-denied', 'google.tos.violation', rpc, statusCode, 'TOS_VIOLATION'), errorText, false, 'explicit');
+  }
+
+  // 1. gRPC status header / trailers
   if (grpcHeader !== undefined && String(grpcHeader) !== '0') {
     const code = String(grpcHeader);
     if (code === '3') {
@@ -303,20 +320,6 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
     const rpc = rpcStatus || 'UNAUTHENTICATED';
     return makeEvidence('authentication', 'google.auth.invalid-credentials', source, statusCode, rpc,
       buildSafeErrorMessage('authentication', 'google.auth.invalid-credentials', rpc, statusCode, errorInfoReason), errorText, false);
-  }
-
-  // 8. Terms of Service Violation / Account Disabled
-  const isTosViolation =
-    errorInfoReason === 'TOS_VIOLATION' ||
-    ((statusCode === 403 || rpcStatus === 'PERMISSION_DENIED') && (
-      lowerText.includes('tos_violation') ||
-      lowerText.includes('violation of terms of service') ||
-      lowerText.includes('service has been disabled in this account for violation')
-    ));
-  if (isTosViolation) {
-    const rpc = rpcStatus || 'PERMISSION_DENIED';
-    return makeEvidence('permission-denied', 'google.tos.violation', source, statusCode, rpc,
-      buildSafeErrorMessage('permission-denied', 'google.tos.violation', rpc, statusCode, 'TOS_VIOLATION'), errorText, false, 'explicit');
   }
 
   // 9. Location / Precondition / Permission Denied

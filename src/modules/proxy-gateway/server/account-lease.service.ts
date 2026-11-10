@@ -1,3 +1,4 @@
+import { AccountLeaseSuspensionPolicy, type SuspensionReview } from './account-lease-suspension-policy';
 import { runReleaseBackground } from '../../../server/release-admission';
 import { randomInt } from 'node:crypto';
 import { Inject, Injectable, Logger, OnModuleDestroy, OnModuleInit, Optional } from '@nestjs/common';
@@ -136,6 +137,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   private readonly accountReservations = new Map<string, Set<string>>();
   private readonly accountBreakerGenerations = new Map<string, number>();
   private readonly performancePolicy = new AccountPerformancePolicy();
+  private readonly suspensionPolicy: AccountLeaseSuspensionPolicy;
   constructor(
     @Optional()
     @Inject(ACCOUNT_LEASE_ACCOUNT_STORE)
@@ -145,6 +147,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     private readonly upstream: AccountLeaseUpstream = googleAccountLeaseUpstreamAdapter,
   ) {
     this.quotaRefreshPolicy = new AccountLeaseQuotaRefreshPolicy({
+      suspendAccount: (accountId) => this.suspensionPolicy.suspend(accountId),
       accountStore: this.accountStore,
       upstream: this.upstream,
       getTokenCache: () => this.tokens,
@@ -190,6 +193,14 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         this.quotaRefreshPolicy.setPreciseLockoutFromCachedQuota(accountId, reason, model),
       logger: this.logger,
     });
+    this.suspensionPolicy = new AccountLeaseSuspensionPolicy({
+      accountStore: this.accountStore, tokenCache: this.tokenCache, refreshPolicy: this.quotaRefreshPolicy,
+      getTokens: () => this.tokens, setTokens: (tokens) => { this.tokens = tokens; },
+      onCacheChange: () => {
+        this.selectionPolicy.clearSessionBindingsForUnavailableAccounts(new Set(this.tokens.keys()));
+        this.performancePolicy.resetAccounts(new Set(this.tokens.keys()));
+      },
+    });
   }
   private get accountCooldowns(): Map<string, number> {
     return this.limitPolicy.getAccountCooldowns();
@@ -210,21 +221,10 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     await this.quotaRefreshPolicy.shutdown();
     await ProductionOwnerGate.releaseExclusiveOwnership();
   }
-  async loadAccounts(): Promise<number> {
-    const generation = this.quotaRefreshPolicy.beginSnapshotReload();
-    try {
-      const snapshot = await this.tokenCache.loadAccounts(this.tokens);
-      if (!snapshot || !this.quotaRefreshPolicy.canInstallSnapshot(generation)) {
-        return 0;
-      }
-      this.tokens = snapshot.tokens;
-      this.selectionPolicy.clearSessionBindingsForUnavailableAccounts(new Set(this.tokens.keys()));
-      this.performancePolicy.resetAccounts(new Set(this.tokens.keys()));
-      return snapshot.count;
-    } finally {
-      this.quotaRefreshPolicy.finishSnapshotReload(generation);
-    }
-  }
+  loadAccounts(): Promise<number> { return this.suspensionPolicy.loadAccounts(); }
+  waitForAccountSuspension(accountId: string): Promise<SuspensionReview> { return this.suspensionPolicy.waitForPending(accountId); }
+  isAccountSuspensionFenced(accountId: string): boolean { return this.suspensionPolicy.isFenced(accountId); }
+  clearAccountSuspensionAfterReview(accountId: string, revision: SuspensionReview): void { this.suspensionPolicy.clearAfterReview(accountId, revision); }
   async reloadAllAccounts(): Promise<number> {
     const count = await this.loadAccounts();
     this.clearAllRateLimits();
@@ -425,7 +425,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     this.limitPolicy.markAsForbidden(accountIdOrEmail);
     if (reason === 'tos_violation') {
       const id = this.resolveAccountId(accountIdOrEmail);
-      if (id) { void this.accountStore.updateStatus?.(id, 'expired', 'tos_violation'); this.tokens.delete(id); }
+      if (id) void this.suspensionPolicy.suspend(id).catch(() => this.logger.error('Account suspension persistence failed; account remains fenced'));
     }
   }
   public getBreakerGeneration(accountId: string): number {

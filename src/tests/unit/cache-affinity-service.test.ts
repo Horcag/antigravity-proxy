@@ -88,10 +88,11 @@ describe('AccountLeaseService cache affinity fences', () => {
       vi.spyOn(CloudAccountRepo, 'getAccounts').mockImplementation(async () => accounts);
       vi.spyOn(CloudAccountRepo, 'getAccountByEmail').mockImplementation(async (email) =>
         accounts.find((account) => account.email === email));
-      vi.spyOn(CloudAccountRepo, 'addAccount').mockImplementation(async (account) => {
+      vi.spyOn(CloudAccountRepo, 'importAccount').mockImplementation(async (account) => {
         const index = accounts.findIndex((existing) => existing.id === account.id);
         if (index === -1) accounts.push(account);
         else accounts[index] = account;
+        return account;
       });
       await service.loadAccounts();
       service.bindSession('session:import', 'acc-1');

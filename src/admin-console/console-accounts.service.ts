@@ -2,12 +2,11 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import { z } from 'zod';
 import { AdminService } from '@/admin/admin.service';
 import { CloudAccountRepo } from '@/modules/cloud-account/persistence/cloudHandler';
-import { CloudAccountExportSchema, type CloudAccount } from '@/modules/cloud-account/types';
+import { CloudAccountExportSchema } from '@/modules/cloud-account/types';
+import { needsAccountReview } from '@/modules/cloud-account/account-review';
+export { needsAccountReview } from '@/modules/cloud-account/account-review';
 import { AccountLeaseService } from '@/modules/proxy-gateway/server/account-lease.service';
 
-export function needsAccountReview(account: Pick<CloudAccount, 'status_reason' | 'quota'>): boolean {
-  return Boolean(account.quota?.is_forbidden || account.quota?.isForbidden || (account.status_reason !== 'operator_disabled' && /tos|terms|banned|disabled|forbidden|violation|suspend|3501/i.test(account.status_reason ?? '')));
-}
 const cpaAccount = z.object({
   type: z.literal('antigravity').optional(), provider: z.literal('google').optional(),
   email: z.string().trim().min(1), name: z.string().optional(),
@@ -34,8 +33,20 @@ export class ConsoleAccountsService {
     if (!result.data.disabled && needsAccountReview(account) && result.data.confirmReview !== true) {
       throw new ConflictException('Account requires explicit review confirmation before enabling');
     }
-    await CloudAccountRepo.updateStatus(id, result.data.disabled ? 'expired' : 'active',
-      result.data.disabled ? account.status_reason ?? 'operator_disabled' : undefined);
+    if (result.data.disabled) {
+      await CloudAccountRepo.updateStatus(id, 'expired', account.status_reason ?? 'operator_disabled');
+    } else {
+      const revision = await this.leases.waitForAccountSuspension?.(id);
+      if (this.leases.isAccountSuspensionFenced?.(id) && result.data.confirmReview !== true) {
+        throw new ConflictException('Account requires explicit review confirmation before enabling');
+      }
+      // Check snapshot currency immediately before the synchronous SQLite activation.
+      if (revision && !revision.isCurrent()) throw new ConflictException('Account was suspended again; review the current state before enabling');
+      const enabled = await CloudAccountRepo.enableAccount(id, result.data.confirmReview === true);
+      if (enabled === 'missing') throw new NotFoundException('Account not found');
+      if (enabled === 'review_required') throw new ConflictException('Account requires explicit review confirmation before enabling');
+      if (result.data.confirmReview === true && revision !== undefined) this.leases.clearAccountSuspensionAfterReview?.(id, revision);
+    }
     await this.leases.reloadAllAccounts();
     return (await this.list()).find((a) => a.id === id);
   }
