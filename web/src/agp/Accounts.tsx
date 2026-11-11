@@ -30,6 +30,7 @@ export function Accounts() {
   const [payload, setPayload] = useState('');
   const [oauth, setOauth] = useState<{ url: string; state: string; instructions: string }>();
   const [code, setCode] = useState('');
+  const [oauthCopied, setOauthCopied] = useState(false);
   const [oauthStatus, setOauthStatus] = useState('');
   const refreshAccounts = resource.refresh;
   useEffect(() => {
@@ -79,6 +80,7 @@ export function Accounts() {
     setPayload('');
     setCode('');
     setOauth(undefined);
+    setOauthCopied(false);
   }
   return (
     <>
@@ -330,21 +332,50 @@ export function Accounts() {
                 consoleApi<{ url: string; state: string; instructions: string }>('/oauth/start')
               )
               .then((v) => {
-                if (v) setOauth(v);
+                if (v) {
+                  setCode('');
+                  setOauthCopied(false);
+                  setOauthStatus('Откройте ссылку в профиле браузера с нужным Google-аккаунтом.');
+                  setOauth(v);
+                }
               })
           }
         >
-          Начать Google OAuth
+          {oauth ? 'Получить новую ссылку' : 'Получить ссылку для входа Google'}
         </Button>
         {oauth && (
           <div className="agp-stack">
-            <a href={oauth.url} target="_blank" rel="noreferrer">
-              Открыть авторизацию Google
-            </a>
-            <p>{oauth.instructions}</p>
+            <Input
+              label="Ссылка для входа Google"
+              value={oauth.url}
+              readOnly
+              onFocus={(e) => e.currentTarget.select()}
+            />
+            <Button
+              variant="secondary"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(oauth.url);
+                  setOauthCopied(true);
+                } catch {
+                  mutation.setError('Не удалось скопировать. Выделите ссылку в поле и скопируйте вручную.');
+                }
+              }}
+            >
+              {oauthCopied ? 'Ссылка скопирована' : 'Копировать ссылку'}
+            </Button>
+            <p>
+              Скопируйте ссылку и откройте её в профиле браузера с нужным Google-аккаунтом.
+              Выполните вход и разрешите доступ. Ссылка действует 10 минут; оставьте это окно открытым.
+            </p>
+            <p>
+              После входа аккаунт добавится автоматически. Если этого не произошло, скопируйте
+              полный адрес страницы, на которую вернул Google (даже если она не открылась),
+              и вставьте ниже. Если показан код авторизации, можно вставить только код.
+            </p>
             <p role="status">{oauthStatus}</p>
             <Input
-              label="Код или полный URL обратного вызова"
+              label="Код или полный адрес после входа Google"
               value={code}
               onChange={(e) => setCode(e.target.value)}
               autoComplete="off"
@@ -354,7 +385,7 @@ export function Accounts() {
               disabled={!code.trim()}
               onClick={() =>
                 void mutation
-                  .run(() => consoleApi('/oauth/exchange', 'POST', { state: oauth.state, code }))
+                  .run(() => consoleApi('/oauth/exchange', 'POST', { state: oauth.state, code: code.trim() }))
                   .then((v) => {
                     if (v !== undefined) closeAdd();
                   })

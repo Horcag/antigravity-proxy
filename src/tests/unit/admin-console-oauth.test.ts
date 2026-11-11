@@ -59,6 +59,24 @@ describe('console OAuth callback lifecycle', () => {
       expect(exchangeOAuthCode).toHaveBeenCalledWith({ code: 'secret' });
     } finally { await new Promise<void>((resolve) => reservation.listener.close(() => resolve())); }
   });
+  it('completes a copied link with a bare code while keeping other profile attempts separate', async () => {
+    const reservation = await reservePort();
+    await new Promise<void>((resolve) => reservation.listener.close(() => resolve()));
+    const { service, exchangeOAuthCode } = fixture(reservation.port); services.push(service);
+    const first = await service.start('session-a');
+    const second = await service.start('session-a');
+    expect(new URL(first.url).searchParams.get('state')).toBe(first.state);
+    expect(first.state).not.toBe(second.state);
+    expect(first.instructions).not.toContain('popup');
+    await service.exchange({ state: first.state, code: 'profile-a-code' }, 'session-a');
+    expect(exchangeOAuthCode).toHaveBeenCalledWith({ code: 'profile-a-code' });
+    expect(service.status(first.state, 'session-a').status).toBe('completed');
+    expect(service.status(second.state, 'session-a').status).toBe('pending');
+    const callback = await fetch(`http://127.0.0.1:${reservation.port}/oauth-callback?state=${second.state}&code=profile-b-code`);
+    expect(callback.status).toBe(200);
+    expect(exchangeOAuthCode).toHaveBeenCalledTimes(2);
+    expect(exchangeOAuthCode).toHaveBeenLastCalledWith({ code: 'profile-b-code' });
+  });
   it('rejects release-gated and closing callbacks without consuming their code', async () => {
     const reservation = await reservePort();
     await new Promise<void>((resolve) => reservation.listener.close(() => resolve()));

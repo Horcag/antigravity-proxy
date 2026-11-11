@@ -361,8 +361,11 @@ generic 403, revoked OAuth, rate limits and network failures do not establish an
 The last result, time, model and comparison with the preceding result survive restart.
 Successful checks preserve disabled/review state; enabling an account remains a separate action.
 
-Accounts support Google OAuth (automatic local callback with an explicit manual fallback),
-JSON import, reviewed enable/disable, removal and manual quota refresh. Explicit ToS
+Accounts support Google OAuth through a copyable sign-in link: open it in the browser profile
+with the desired Google account. The console detects the local callback automatically;
+if it cannot, paste the full return address (even if the page fails to load) or authorization code.
+Links expire after ten minutes. Accounts also support JSON import,
+reviewed enable/disable, removal and manual quota refresh. Explicit ToS
 suspensions stop generation retries and fence the account while its inactive state is
 persisted. Imports preserve existing suspension/disabled state; reactivation requires
 explicit review. Project keys can
