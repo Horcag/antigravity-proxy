@@ -1,3 +1,14 @@
+export interface AccessCheck {
+  account_id: string;
+  outcome: 'working' | 'banned' | 'inconclusive';
+  checked_at: string;
+  reason: string;
+  message: string;
+  comparison: 'restored' | 'same' | 'changed' | 'first';
+  previous_reason?: string;
+  previous_checked_at?: string;
+  evidence: { stage: string; model?: string; http_status?: number; rule_id?: string };
+}
 export interface Account {
   id: string;
   name: string;
@@ -7,6 +18,7 @@ export interface Account {
   status_reason?: string;
   disabled: boolean;
   review_required: boolean;
+  access_check?: AccessCheck | null;
   quota?: {
     models: Record<string, { percentage: number; resetTime: string }>;
     last_successful_refresh_at?: number;

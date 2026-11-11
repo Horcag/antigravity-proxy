@@ -14,6 +14,8 @@ export class ConsoleController {
     private readonly admin: AdminService, private readonly leases: AccountLeaseService,
     private readonly oauth: ConsoleOAuthService, private readonly sessions: ConsoleSessionService) {}
   @Get('accounts') listAccounts() { return this.accounts.list(); }
+  @Post('accounts/check-access') checkAllAccess() { return this.accounts.checkAllAccess(); }
+  @Post('accounts/:id/check-access') checkAccess(@Param('id') id: string) { return this.accounts.checkAccess(id); }
   @Post('accounts/import') importAccounts(@Body() body: unknown) { return this.accounts.import(body); }
   @Patch('accounts/:id') setDisabled(@Param('id') id: string, @Body() body: unknown) { return this.accounts.setDisabled(id, body); }
   @Delete('accounts/:id') removeAccount(@Param('id') id: string) { return this.admin.removeAccount(id); }

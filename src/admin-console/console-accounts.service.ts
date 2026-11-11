@@ -1,3 +1,4 @@
+import { AccountAccessCheckService } from './account-access-check.service';
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { z } from 'zod';
 import { AdminService } from '@/admin/admin.service';
@@ -16,13 +17,16 @@ const cpaAccount = z.object({
 });
 @Injectable()
 export class ConsoleAccountsService {
+  private readonly accessChecks = new AccountAccessCheckService();
+  checkAccess(id: string) { return this.accessChecks.check(id); }
+  checkAllAccess() { return this.accessChecks.checkAll(); }
   constructor(private readonly admin: AdminService, private readonly leases: AccountLeaseService) {}
   async list() {
     return (await this.admin.listAccounts()).map((account) => ({
       id: account.id, name: account.name ?? account.email, email: account.email, provider: account.provider,
       status: account.status, status_reason: account.status_reason, disabled: account.status === 'expired',
       review_required: needsAccountReview(account), quota: account.quota, created_at: account.created_at,
-      last_used: account.last_used,
+      last_used: account.last_used, access_check: CloudAccountRepo.getAccessCheck(account.id),
     }));
   }
   async setDisabled(id: string, body: unknown) {

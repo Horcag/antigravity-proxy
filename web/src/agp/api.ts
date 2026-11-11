@@ -12,11 +12,11 @@ let csrfToken = '';
 export function setCsrf(token: string) {
   csrfToken = token;
 }
-export async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
+export async function api<T>(path: string, method = 'GET', body?: unknown, timeoutMs = 30000): Promise<T> {
   if (!path.startsWith('/admin/') || path.includes('://') || path.includes('..'))
     throw new Error('Недопустимый адрес API');
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 30000);
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(path, {
       method,
@@ -46,8 +46,8 @@ export async function api<T>(path: string, method = 'GET', body?: unknown): Prom
     window.clearTimeout(timeout);
   }
 }
-export const consoleApi = <T>(path: string, method = 'GET', body?: unknown) =>
-  api<T>(`/admin/console${path}`, method, body);
+export const consoleApi = <T>(path: string, method = 'GET', body?: unknown, timeoutMs?: number) =>
+  api<T>(`/admin/console${path}`, method, body, timeoutMs);
 export const display = (value: unknown): string =>
   value === null || value === undefined
     ? 'Неизвестно'

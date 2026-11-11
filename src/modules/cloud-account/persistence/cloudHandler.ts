@@ -1,3 +1,4 @@
+import { accountAccessCheckIdentity, type AccountAccessCheck } from '../access-check';
 import { needsAccountReview } from '../account-review';
 import Database from 'better-sqlite3';
 import { CloudAccount, CloudAccountSchema, CloudQuotaData } from '@/modules/cloud-account/types';
@@ -56,6 +57,9 @@ export class CloudAccountRepo {
         proxy_url TEXT
       );
     `);
+    database.exec(`CREATE TABLE IF NOT EXISTS account_access_checks (
+      account_id TEXT PRIMARY KEY, result_json TEXT NOT NULL
+    )`);
     this.database = database;
     return database;
   }
@@ -163,7 +167,29 @@ export class CloudAccountRepo {
   }
 
   static async removeAccount(accountId: string): Promise<void> {
-    this.getDatabase().prepare('DELETE FROM accounts WHERE id = ?').run(accountId);
+    this.getDatabase().transaction(() => {
+      this.getDatabase().prepare('DELETE FROM account_access_checks WHERE account_id = ?').run(accountId);
+      this.getDatabase().prepare('DELETE FROM accounts WHERE id = ?').run(accountId);
+    })();
+  }
+
+  static getAccessCheck(accountId: string): AccountAccessCheck | null {
+    const row = this.getDatabase().prepare('SELECT result_json FROM account_access_checks WHERE account_id = ?').get(accountId) as { result_json: string } | undefined;
+    return row ? JSON.parse(row.result_json) as AccountAccessCheck : null;
+  }
+
+  static getAccessCheckIdentity(accountId: string): string | undefined {
+    const row = this.getDatabase().prepare('SELECT * FROM accounts WHERE id = ?').get(accountId) as AccountRow | undefined;
+    return row ? accountAccessCheckIdentity(this.toAccount(row)) : undefined;
+  }
+
+  static saveAccessCheck(result: AccountAccessCheck, expectedIdentity?: string): boolean {
+    if (expectedIdentity !== undefined && this.getAccessCheckIdentity(result.account_id) !== expectedIdentity) return false;
+    this.getDatabase().prepare(`INSERT INTO account_access_checks (account_id, result_json)
+      SELECT id, ? FROM accounts WHERE id = ?
+      ON CONFLICT(account_id) DO UPDATE SET result_json = excluded.result_json`)
+      .run(JSON.stringify(result), result.account_id);
+    return true;
   }
 
   static async suspendAccount(accountId: string): Promise<void> {

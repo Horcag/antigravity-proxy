@@ -25,6 +25,8 @@ Direct imports: SidebarNavigation and sidebarNavigationModel; Card, Button, Inpu
 Semantic headings, labeled inputs, table header scopes, live loading/error/success regions, keyboard focus, skip link, upstream modal focus trapping and Escape dismissal. Four metric columns reduce to two; sidebar becomes a menu on narrow screens; tables scroll within upstream wrappers. Reduced motion preference disables animation.
 
 ## Interaction states
+
+Accounts expose an explicit per-account generation access check and a sequential check of all accounts, including disabled ones. A persisted timestamped result distinguishes successful generation, an explicit Google terms-of-service restriction, and inconclusive errors (OAuth, permissions, quotas, transport or malformed responses). Comparison with the preceding check identifies an unchanged reason, changed result or restored access. Probe model and safe diagnostic evidence remain visible. Checks consume a small amount of quota and never automatically enable accounts or clear review flags. Batch progress can stop after the current account.
 Session check on initial load preserves valid remembered sessions. Remember defaults to seven days. Login names `AG_PROXY_ADMIN_API_KEY` as the server-side password source. Every page has loading, server/offline error, empty and refreshed states. Mutations show pending/error/success; credentials clear after import/OAuth or closing the modal. Google flow uses server state-bound callback polling with manual code/URL fallback. Project secrets appear once after creation/rotation, support clipboard copy and clear on close.
 
 ## Data contracts and content voice
