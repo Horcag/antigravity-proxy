@@ -5,6 +5,8 @@ import { Modal } from '@/components/ui/Modal';
 import { consoleApi } from './api';
 import type { Account } from './types';
 import { formatConsoleValue, formatSamaraDateTime } from './time';
+import { AccessCheckProgress, AccessCheckStatus } from './AccountAccessCheck';
+import { useAccessChecks } from './useAccessChecks';
 import {
   Button,
   Card,
@@ -21,6 +23,7 @@ export function Accounts() {
     accounts?: Array<{ account_id: string; success_attempts: number; failed_attempts: number }>;
   }>('/statistics');
   const mutation = useMutation(resource.refresh);
+  const checks = useAccessChecks(resource.refresh);
   const [selected, setSelected] = useState<Account>();
   const [add, setAdd] = useState(false);
   const [confirm, setConfirm] = useState<{ account: Account; action: 'remove' | 'enable' }>();
@@ -89,6 +92,14 @@ export function Accounts() {
         }}
       >
         <Button
+          loading={checks.busy}
+          disabled={mutation.busy || resource.loading || !resource.data?.length}
+          variant="secondary"
+          onClick={() => void checks.run(resource.data ?? [])}
+        >
+          Проверить доступ всех
+        </Button>
+        <Button
           loading={mutation.busy}
           variant="secondary"
           onClick={() => void mutation.run(() => consoleApi('/accounts/refresh-quota', 'POST'))}
@@ -99,6 +110,7 @@ export function Accounts() {
       </PageHeader>
       <ErrorMessage error={mutation.error} />
       <p role="status">{mutation.success || oauthStatus}</p>
+      <AccessCheckProgress checks={checks} />
       <Input
         label="Поиск по ID, имени или почте"
         value={search}
@@ -106,13 +118,16 @@ export function Accounts() {
       />
       <Card>
         <DataTable
-          headers={['Аккаунт', 'Статус', 'Квота', 'Успешные / неудачные попытки', 'Действия']}
+          headers={['Аккаунт', 'Статус', 'Проверка доступа', 'Квота', 'Успешные / неудачные попытки', 'Действия']}
           rows={(resource.data ?? [])
             .filter((a) =>
               `${a.id} ${a.name} ${a.email}`.toLowerCase().includes(search.toLowerCase())
             )
             .map((a) => {
               const s = stats.data?.accounts?.find((s) => s.account_id === a.id);
+              const localCheck = checks.results[a.id];
+              const accessCheck = a.access_check && (!localCheck || a.access_check.checked_at >= localCheck.checked_at)
+                ? a.access_check : localCheck;
               return [
                 <>
                   <strong>{a.name || a.email}</strong>
@@ -128,6 +143,7 @@ export function Accounts() {
                   </span>
                   <small>{a.status_reason}</small>
                 </>,
+                <AccessCheckStatus result={accessCheck} />,
                 a.quota ? (
                   <>
                     <span>{a.quota.subscription_tier ?? 'Квота по моделям'}</span>
@@ -178,6 +194,15 @@ export function Accounts() {
                   )}
                 </>,
                 <div className="agp-actions">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    loading={checks.current === a.id}
+                    disabled={checks.busy || mutation.busy}
+                    onClick={() => void checks.run([a])}
+                  >
+                    Проверить доступ
+                  </Button>
                   <Button size="sm" variant="secondary" onClick={() => setSelected(a)}>
                     Подробнее
                   </Button>

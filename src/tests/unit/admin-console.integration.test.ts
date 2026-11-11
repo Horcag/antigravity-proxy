@@ -91,6 +91,28 @@ describe('console session and real temporary store management', () => {
     expect(rotated.json().api_key).not.toBe(project.api_key);
     expect((await fastify.inject({ method: 'PATCH', url: `/admin/console/projects/${project.id}`, headers: auth, payload: { enabled: false } })).json().enabled).toBe(false);
   });
+  it('exposes authenticated account and batch access checks with persisted sanitized results', async () => {
+    const auth = await login();
+    const imported = await fastify.inject({ method: 'POST', url: '/admin/console/accounts/import', headers: auth,
+      payload: { email: 'access-check@example.test', refresh_token: 'private-refresh', access_token: 'private-access', expiry: new Date(Date.now() + 3600000).toISOString(), disabled: true } });
+    const id = imported.json().accounts[0].id;
+    const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ response: { candidates: [{ content: { parts: [{ text: 'OK' }] } }] } }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const options = vi.spyOn(GoogleAPIService, 'getFetchOptions').mockReturnValue({});
+    try {
+      expect((await fastify.inject({ method: 'POST', url: `/admin/console/accounts/${id}/check-access`, headers })).statusCode).toBe(401);
+      const single = await fastify.inject({ method: 'POST', url: `/admin/console/accounts/${id}/check-access`, headers: auth });
+      expect(single.statusCode).toBe(201);
+      expect(single.json()).toMatchObject({ account_id: id, outcome: 'working' });
+      const batch = await fastify.inject({ method: 'POST', url: '/admin/console/accounts/check-access', headers: auth });
+      expect(batch.statusCode).toBe(201);
+      expect(batch.json().results).toHaveLength(1);
+      const list = await fastify.inject({ url: '/admin/console/accounts', headers: auth });
+      expect(list.json()[0]).toMatchObject({ disabled: true, access_check: { outcome: 'working', comparison: 'same' } });
+      expect(list.body).not.toMatch(/private-access|private-refresh/);
+      expect((await fastify.inject({ method: 'POST', url: '/admin/console/accounts/missing/check-access', headers: auth })).statusCode).toBe(404);
+    } finally { options.mockRestore(); vi.unstubAllGlobals(); }
+  });
   it('validates complete import, protects known TOS records, and persists disable/enable with real reload', async () => {
     const auth = await login();
     const cpa = { type: 'antigravity', email: 'fixture@example.test', refresh_token: 'secret-refresh', access_token: 'secret-access' };

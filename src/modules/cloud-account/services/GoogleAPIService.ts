@@ -611,20 +611,20 @@ export class GoogleAPIService {
     throw new Error('Token exchange failed: configured clients rejected');
   }
 
-  /**
-   * Refreshes an access token using a refresh token.
-   */
   static async refreshAccessToken(
     refreshToken: string,
     proxyUrl?: string,
     preferredClientKey?: string,
+    options?: { signal?: AbortSignal; reportInvalidGrant?: boolean },
   ): Promise<TokenResponse> {
     const candidates = OAuthClientRegistryService.getCandidateClients(preferredClientKey);
     if (candidates.length === 0) {
       throw new Error('No OAuth clients configured');
     }
 
+    let invalidGrant = false;
     for (const client of candidates) {
+      options?.signal?.throwIfAborted();
       const params = new URLSearchParams({
         client_id: client.client_id,
         client_secret: client.client_secret,
@@ -633,28 +633,25 @@ export class GoogleAPIService {
       });
 
       logger.info('[GoogleAPIService] OAuth request: operation=token_refresh');
-      const request = createDisposableRequestSignal(REQUEST_TIMEOUT_MS);
+      const request = createDisposableRequestSignal(REQUEST_TIMEOUT_MS, options?.signal);
       const response = await fetch(URLS.TOKEN, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: params,
-        signal: request.signal,
+        // Keep the caller deadline attached while reading the OAuth response body.
+        signal: options?.signal ?? request.signal,
         ...this.getFetchOptions(proxyUrl),
       })
         .catch((error: unknown) => {
           logger.error('[GoogleAPIService] OAuth request failed: operation=token_refresh');
           if (error instanceof Error && error.name === 'AbortError') {
-            throw new Error(
-              'Token refresh timed out. Please check your network connection and try again.',
-            );
+            throw new Error('Token refresh timed out. Please check your network connection and try again.');
           }
           throw toSafeRequestError(error);
         })
         .finally(() => request.dispose());
 
-      logger.info(
-        `[GoogleAPIService] OAuth response: operation=token_refresh status=${response.status}`,
-      );
+      logger.info(`[GoogleAPIService] OAuth response: operation=token_refresh status=${response.status}`);
 
       if (response.ok) {
         const tokenResponse = (await response.json()) as TokenResponse;
@@ -663,17 +660,20 @@ export class GoogleAPIService {
       }
 
       const text = await response.text();
+      // Keep a matching client's revocation evidence across later client mismatches.
+      try {
+        invalidGrant ||= (!preferredClientKey || client.key === preferredClientKey) && (JSON.parse(text) as { error?: unknown }).error === 'invalid_grant';
+      } catch { /* Keep the rejection generic for a non-JSON OAuth response. */ }
       const failure = toSafeHttpError(response.status);
       if (isClientMismatchError(response.status, text)) {
-        logger.warn(
-          `[GoogleAPIService] OAuth client rejected: operation=token_refresh status=${response.status} action=retry_next_client`,
-        );
+        logger.warn(`[GoogleAPIService] OAuth client rejected: operation=token_refresh status=${response.status} action=retry_next_client`);
         continue;
       }
 
       throw new Error(`Token refresh failed: ${failure.message}`);
     }
 
+    if (invalidGrant && options?.reportInvalidGrant) throw new Error('OAUTH_INVALID_GRANT');
     throw new Error('Token refresh failed: configured clients rejected');
   }
 

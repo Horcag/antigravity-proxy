@@ -353,6 +353,14 @@ The browser signs in with the existing `AG_PROXY_ADMIN_API_KEY`; remembering the
 uses an HttpOnly, SameSite cookie for up to seven days. The management key is not kept in
 browser storage. Cookie-authenticated mutations require a same-origin CSRF token.
 
+On Accounts, **Проверить доступ** runs a small generation request with that exact account,
+including disabled accounts. **Проверить доступ всех** checks accounts sequentially and can
+stop after the current account. Checks consume a small amount of model quota. A successful
+generation, an explicit Google ToS restriction, and an inconclusive result are distinct;
+generic 403, revoked OAuth, rate limits and network failures do not establish an account ban.
+The last result, time, model and comparison with the preceding result survive restart.
+Successful checks preserve disabled/review state; enabling an account remains a separate action.
+
 Accounts support Google OAuth (automatic local callback with an explicit manual fallback),
 JSON import, reviewed enable/disable, removal and manual quota refresh. Explicit ToS
 suspensions stop generation retries and fence the account while its inactive state is
