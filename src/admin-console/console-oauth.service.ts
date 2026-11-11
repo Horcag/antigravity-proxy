@@ -100,7 +100,7 @@ export class ConsoleOAuthService implements OnModuleDestroy {
     const manualFallback = await this.bind(redirect);
     return { url: url.toString(), state, expires_in: 600, mode: manualFallback ? 'manual_callback' : 'automatic_callback',
       redirect_uri: redirect.toString(), manualFallback,
-      instructions: manualFallback ? 'After Google sign-in, paste the full redirected callback URL including code and state.' : 'Complete Google sign-in in the popup. This console will detect the added account automatically.' };
+      instructions: manualFallback ? 'Откройте ссылку в нужном профиле браузера. После входа Google вставьте полный адрес возврата или код авторизации.' : 'Откройте ссылку в нужном профиле браузера. После входа Google аккаунт добавится автоматически; при необходимости вставьте полный адрес возврата или код авторизации.' };
   }
   status(state: string, owner: string) {
     this.prune();
