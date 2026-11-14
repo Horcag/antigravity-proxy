@@ -300,6 +300,9 @@ export class ConnectIngressService {
     logger.info(`[ConnectIngress] CONNECT destination: ${destination} (intercepted=${isTarget})`);
     // 2. If destination is Google CloudCode, terminate TLS and failover
     if (isTarget) {
+      // HTTP CONNECT sockets allow half-open connections by default. TLS wrapping
+      // must close the writable side after peer EOF, including before a handshake.
+      clientSocket.allowHalfOpen = false;
       if (typeof clientSocket.setTimeout === 'function') {
         clientSocket.setTimeout(0);
         clientSocket.removeListener('timeout', onTimeout);
