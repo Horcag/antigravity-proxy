@@ -2,6 +2,7 @@ export interface AccessCheck {
   account_id: string;
   outcome: 'working' | 'banned' | 'inconclusive';
   checked_at: string;
+  duration_ms?: number;
   reason: string;
   message: string;
   comparison: 'restored' | 'same' | 'changed' | 'first';
