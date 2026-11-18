@@ -272,4 +272,72 @@ describe('AccountLeaseService cache affinity fences', () => {
     expect(service.getInFlightWork('acc-2')).toBe(0);
     expect((service as any).affinityCoordinator.getStateForTesting()).toEqual({ owners: 0, waiters: 0 });
   });
+
+  it('coordinates concurrent non-migrating session requests behind an active migration owner', async () => {
+    const sessionKey = 'session:migrating-follower-wait';
+    service.bindSession(sessionKey, 'acc-1');
+    const auth = createMigrationAuthorization(
+      'upstream-transient', sessionKey, service.getSessionBinding(sessionKey), 'req-owner',
+    );
+    const ownerLease = await service.acquireAttemptLease({
+      sessionKey, deferSessionBinding: true, excludeAccountIds: ['acc-1'],
+      migrationAuthorization: auth!, requestId: 'req-owner',
+    });
+    expect(ownerLease?.account.id).toBe('acc-2');
+
+    const migration = service.startSessionMigration(
+      sessionKey, ownerLease!.generation, 'acc-2', 'req-owner', ownerLease!.tableIncarnation,
+    );
+    expect(migration).not.toBeNull();
+
+    // Concurrent request in the same session arrives without migrationAuthorization while state==='migrating'
+    const concurrentPromise = service.acquireAttemptLease({
+      sessionKey, deferSessionBinding: true, requestId: 'req-concurrent',
+    });
+    await Promise.resolve();
+    expect((service as any).affinityCoordinator.getStateForTesting()).toEqual({ owners: 1, waiters: 1 });
+
+    expect(service.confirmOrBindSession(
+      sessionKey, 'acc-2', migration!.generation, 'req-owner', undefined, migration!.tableIncarnation,
+    )).toEqual({ kind: 'confirmed' });
+    ownerLease!.completeAffinityPlacement?.('committed');
+
+    const concurrentLease = await concurrentPromise;
+    expect(concurrentLease?.account.id).toBe('acc-2');
+    expect(concurrentLease?.generation).toBe(migration!.generation);
+    ownerLease!.releaseReservation();
+    concurrentLease!.releaseReservation();
+  });
+
+  it('preserves hint:prefix cache affinity across a 6-minute idle gap (1h default TTL)', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-11-18T08:00:00Z'));
+      service.recordCacheHint('hint:prefix:deadbeef01234567', 'acc-2');
+      vi.advanceTimersByTime(6 * 60 * 1000);
+      expect((service as any).selectionPolicy.getCacheHint('hint:prefix:deadbeef01234567')).toBe('acc-2');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('uses the requested model resetTime instead of an earlier unrelated model resetTime', () => {
+    const tokens = (service as any).tokens as Map<string, any>;
+    tokens.get('acc-1').model_reset_times = {
+      'gemini-4-hydrogen-medium': '2026-11-18T10:00:00Z',
+      'gemini-4-argon-high': '2026-11-25T04:00:00Z',
+    };
+    const applied = (service as any).quotaRefreshPolicy.setPreciseLockoutFromCachedQuota(
+      'acc-1', RateLimitReason.QuotaExhausted, 'gemini-4-argon-high',
+    );
+    expect(applied).toBe(true);
+    const lockouts = (service as any).rateLimitTracker.peekActiveLockouts(new Date('2026-11-18T08:00:00Z').getTime());
+    expect(lockouts).toEqual([
+      expect.objectContaining({
+        accountId: 'acc-1',
+        modelId: 'gemini-4-argon-high',
+        unavailableUntil: new Date('2026-11-25T04:00:00Z').getTime(),
+      }),
+    ]);
+  });
 });

@@ -104,7 +104,8 @@ export class AccountLeaseQuotaRefreshPolicy {
       return false;
     }
 
-    const resetTime = findEarliestQuotaResetTime(tokenData.model_reset_times);
+    const modelResetTime = model ? tokenData.model_reset_times[model] : undefined;
+    const resetTime = modelResetTime || findEarliestQuotaResetTime(tokenData.model_reset_times);
     if (!resetTime) {
       return false;
     }

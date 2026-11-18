@@ -754,7 +754,7 @@ export class CloudCodeFailoverGateway {
             bodyStream.once('error', onError);
             req.once?.('close', onClientClose);
             res.once?.('close', onClientClose);
-            const firstChunkTimeoutMs = Math.min(20000, Math.max(2000, deadlineAt - Date.now()));
+            const firstChunkTimeoutMs = Math.min(60000, Math.max(2000, deadlineAt - Date.now()));
             firstChunkTimer = setTimeout(() => {
               if (!settled) { settled = true; cleanup(); reject(new Error(`Upstream first chunk timeout after ${firstChunkTimeoutMs}ms`)); }
             }, firstChunkTimeoutMs);
@@ -872,7 +872,7 @@ export class CloudCodeFailoverGateway {
                 }
               }
             }
-            activeCompleteAffinityPlacement?.('committed'); activeCompleteAffinityPlacement = undefined; upstreamResponseSelected = true;
+            activeCompleteAffinityPlacement?.('committed'); activeCompleteAffinityPlacement = undefined; activeAbortMigration = undefined; upstreamResponseSelected = true;
             receiptOwner.expectDownstreamCommit('validated_response'); activeStopCandidateRenewal?.();
             writeDownstreamHeaders('validated_response', statusCode, headers);
             break;
@@ -1416,7 +1416,7 @@ export class CloudCodeFailoverGateway {
       // When alternative accounts are available in the pool, fail fast on hanging upstream (20s)
       // to allow attempting other accounts before logical request deadline (120s) expires.
       // If no alternatives, allow slightly longer (35s) but still bounded.
-      const defaultAttemptTimeoutMs = hasAlternativeAccounts ? 20000 : 35000;
+      const defaultAttemptTimeoutMs = hasAlternativeAccounts ? 60000 : 90000;
       const attemptTimeoutMs = Math.min(defaultAttemptTimeoutMs, remainingDeadlineMs);
       const options: https.RequestOptions = {
         hostname: upstreamHost,

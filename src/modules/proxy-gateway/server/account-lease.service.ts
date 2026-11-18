@@ -478,7 +478,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
       const stickyForWait = sessionKey ? this.getSessionBinding(sessionKey) : null;
       const needsPlacementCoordination = Boolean(
         sessionKey && isVerifiedSessionKey(sessionKey) && !options?.skipAffinityCoordination &&
-        (!stickyForWait || options?.migrationAuthorization),
+        (!stickyForWait || stickyForWait.state === 'migrating' || options?.migrationAuthorization),
       );
       if (needsPlacementCoordination) {
         const placement = await this.affinityCoordinator.acquire(sessionKey, { signal: options?.signal, ownerTimeoutMs: options?.affinityOwnerTimeoutMs });
@@ -779,7 +779,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     return this.selectionPolicy.getSessionBinding(sessionKey);
   }
   public recordCacheHint(hintKey: string, accountId: string, ttlMs?: number): void {
-    this.selectionPolicy.recordCacheHint(hintKey, accountId, ttlMs);
+    this.selectionPolicy.recordCacheHint(hintKey, accountId, ttlMs ?? this.stickySessionTtlMs);
   }
   public startSessionMigration(
     sessionKey: string | undefined,
