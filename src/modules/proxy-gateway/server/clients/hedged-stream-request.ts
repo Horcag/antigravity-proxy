@@ -84,15 +84,18 @@ export function hedgedStreamRequest<T extends { data: unknown }>(options: {
           reject(error);
           return;
         }
-        destroy(failedData);
         if (controllers.length < Math.min(2, options.endpointCount)) {
+          destroy(failedData);
           clearTimeout(timer);
           start();
         } else if (pending === 0) {
           settled = true;
+          // Keep the final rejected response readable for upstream error classification (e.g. 429).
           stopPeers();
           detach();
           reject(error);
+        } else {
+          destroy(failedData);
         }
       });
     };

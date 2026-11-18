@@ -241,4 +241,27 @@ describe('stream hedge over real local HTTP sockets', () => {
     await vi.waitFor(() => expect(sockets.size).toBe(0));
   });
 
+  it('GeminiClient reads streamed 429 quota_exhausted body after all endpoints exhaust', async () => {
+    const sockets = new Set<Socket>();
+    const server = createServer((_req, res) => {
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end('{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"Resource has been exhausted (e.g. check quota).","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"QUOTA_EXHAUSTED"}]}}');
+    });
+    server.on('connection', (socket) => { sockets.add(socket); socket.once('close', () => sockets.delete(socket)); });
+    const base = await listen(server);
+    const old = process.env.PROXY_INTERNAL_BASE_URLS;
+    process.env.PROXY_INTERNAL_BASE_URLS = `${base}/preferred,${base}/backup`;
+    const body = { project: 'native-project', requestId: 'native-request', model: 'gemini-3.8-flash-high', request: { contents: [] } } as never;
+    try {
+      await expect(new GeminiClient().streamGenerateInternal(body, 'fixture'))
+        .rejects.toMatchObject({ status: 429, reason: 'quota_exhausted' });
+    } finally {
+      if (old === undefined) delete process.env.PROXY_INTERNAL_BASE_URLS;
+      else process.env.PROXY_INTERNAL_BASE_URLS = old;
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    await vi.waitFor(() => expect(sockets.size).toBe(0));
+  });
+
 });

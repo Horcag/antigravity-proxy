@@ -5,6 +5,7 @@ import { getMaxOutputTokens, getThinkingBudget } from './ModelSpecs';
 import { cleanJsonSchema, normalizeObjectJsonSchema } from './JsonSchemaUtils';
 import { SignatureContext, SignatureStore } from './SignatureStore';
 import { detectsNetworkingTool, isBuiltinServerSearchTool } from './server-search-tools';
+import { sanitizeUpstreamBlockedSystemText } from './system-instruction-sanitizer';
 import { logger } from '@/shared/logging/logger';
 import {
   ClaudeRequest,
@@ -531,22 +532,10 @@ function buildSystemInstruction(
 
   const parts: { text: string }[] = [];
 
-  let hasIdentityDirective = false;
-
-  if (system) {
-    if (isString(system)) {
-      if (system.includes(identityMarker)) {
-        hasIdentityDirective = true;
-      }
-    } else if (Array.isArray(system)) {
-      for (const block of system) {
-        if (block.type === 'text' && block.text.includes(identityMarker)) {
-          hasIdentityDirective = true;
-          break;
-        }
-      }
-    }
-  }
+  const hasIdentityDirective = isString(system)
+    ? system.includes(identityMarker)
+    : Array.isArray(system) &&
+      system.some((block) => block.type === 'text' && block.text.includes(identityMarker));
 
   if (!hasIdentityDirective) {
     parts.push({ text: assistantIdentityDirective });
@@ -554,10 +543,12 @@ function buildSystemInstruction(
 
   if (system) {
     if (isString(system)) {
-      parts.push({ text: system });
+      parts.push({ text: sanitizeUpstreamBlockedSystemText(system) });
     } else if (Array.isArray(system)) {
       for (const block of system) {
-        if (block.type === 'text') parts.push({ text: block.text });
+        if (block.type === 'text') {
+          parts.push({ text: sanitizeUpstreamBlockedSystemText(block.text) });
+        }
       }
     }
   }

@@ -2,6 +2,7 @@ import { BadRequestException } from '@nestjs/common';
 import { isEmpty, isEqual, isPlainObject, isString } from 'lodash-es';
 
 import type { GeminiInternalRequest, GeminiToolDeclaration } from '../antigravity/types';
+import { sanitizeSystemPartText } from '../antigravity/system-instruction-sanitizer';
 
 type NativeGeminiRequest = GeminiInternalRequest['request'];
 type UnknownRecord = Record<string, unknown>;
@@ -214,25 +215,21 @@ function normalizeSystemInstruction(value: unknown): NativeGeminiRequest['system
     return undefined;
   }
   const instruction = toRecord(value);
-  if (
-    !instruction ||
-    !Object.hasOwn(instruction, 'parts') ||
-    !Array.isArray(instruction.parts) ||
-    instruction.parts.length === 0
-  ) {
+  const parts = instruction && Object.hasOwn(instruction, 'parts') ? instruction.parts : undefined;
+  if (!instruction || !Array.isArray(parts) || parts.length === 0) {
     throw new BadRequestException('systemInstruction must contain a non-empty parts array');
   }
 
   return {
     ...instruction,
-    parts: instruction.parts.map((part, index) => {
+    parts: parts.map((part, index) => {
       const partRecord = toRecord(part);
       const location = `systemInstruction.parts[${index}]`;
       if (!partRecord || !Object.hasOwn(partRecord, 'text')) {
         throw new BadRequestException(`${location}.text must be a non-empty string`);
       }
       requireNonEmptyString(partRecord.text, `${location}.text`);
-      return normalizePart(part, location);
+      return sanitizeSystemPartText(normalizePart(part, location));
     }),
   };
 }
