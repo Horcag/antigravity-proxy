@@ -2,6 +2,8 @@ import { isEmpty, isNumber, isString } from 'lodash-es';
 import type { CloudQuotaData } from '@/modules/cloud-account/types';
 
 const THIRD_PARTY_QUOTA_GROUP_PATTERN = /claude|gpt|3p/i;
+const ARGON_QUOTA_GROUP_PATTERN = /argon/i;
+const GEMINI_QUOTA_GROUP_PATTERN = /gemini/i;
 
 export interface AccountLeaseQuotaSnapshot {
   modelQuotas: Record<string, number>;
@@ -18,25 +20,49 @@ function normalizeModelId(modelId: string | null | undefined): string | undefine
   return normalized !== '' ? normalized : undefined;
 }
 
-function isThirdPartyModel(modelName: string): boolean {
-  const normalizedModelName = modelName.toLowerCase();
-  return normalizedModelName.includes('claude') || normalizedModelName.includes('gpt');
+type QuotaPoolKind = 'third_party' | 'argon' | 'gemini';
+
+function classifyModelQuotaPool(modelName: string): QuotaPoolKind | null {
+  const normalized = modelName.toLowerCase();
+  if (normalized.includes('claude') || normalized.includes('gpt')) {
+    return 'third_party';
+  }
+  if (normalized.includes('argon')) {
+    return 'argon';
+  }
+  if (normalized.startsWith('gemini') && !normalized.includes('image') && !normalized.endsWith('-sonar')) {
+    return 'gemini';
+  }
+  return null;
 }
 
-function extractThirdPartyQuotaFloor(
+function classifyQuotaBucketPool(groupText: string, bucketText: string): QuotaPoolKind | null {
+  if (THIRD_PARTY_QUOTA_GROUP_PATTERN.test(groupText) || THIRD_PARTY_QUOTA_GROUP_PATTERN.test(bucketText)) {
+    return 'third_party';
+  }
+  if (ARGON_QUOTA_GROUP_PATTERN.test(groupText) || ARGON_QUOTA_GROUP_PATTERN.test(bucketText)) {
+    return 'argon';
+  }
+  if (GEMINI_QUOTA_GROUP_PATTERN.test(groupText) || GEMINI_QUOTA_GROUP_PATTERN.test(bucketText)) {
+    return 'gemini';
+  }
+  return null;
+}
+
+function extractQuotaPoolFloors(
   quota: CloudQuotaData | undefined,
-): { percentage: number; resetTime: string } | null {
-  let lowest: { percentage: number; resetTime: string } | null = null;
+): Partial<Record<QuotaPoolKind, { percentage: number; resetTime: string }>> {
+  const floors: Partial<Record<QuotaPoolKind, { percentage: number; resetTime: string }>> = {};
 
   for (const group of quota?.quota_groups ?? []) {
     const groupText = [group.display_name, group.description].filter(Boolean).join(' ');
-    const groupMatches = THIRD_PARTY_QUOTA_GROUP_PATTERN.test(groupText);
 
     for (const bucket of group.buckets) {
       const bucketText = [bucket.bucket_id, bucket.window, bucket.display_name, bucket.description]
         .filter(Boolean)
         .join(' ');
-      if (!groupMatches && !THIRD_PARTY_QUOTA_GROUP_PATTERN.test(bucketText)) {
+      const pool = classifyQuotaBucketPool(groupText, bucketText);
+      if (!pool) {
         continue;
       }
 
@@ -45,12 +71,13 @@ function extractThirdPartyQuotaFloor(
         continue;
       }
 
+      const current = floors[pool];
       if (
-        !lowest ||
-        percentage < lowest.percentage ||
-        (percentage === lowest.percentage && bucket.reset_time < lowest.resetTime)
+        !current ||
+        percentage < current.percentage ||
+        (percentage === current.percentage && bucket.reset_time < current.resetTime)
       ) {
-        lowest = {
+        floors[pool] = {
           percentage,
           resetTime: bucket.reset_time,
         };
@@ -58,7 +85,7 @@ function extractThirdPartyQuotaFloor(
     }
   }
 
-  return lowest;
+  return floors;
 }
 
 export function buildAccountLeaseQuotaSnapshot(
@@ -89,18 +116,18 @@ export function buildAccountLeaseQuotaSnapshot(
     }
   }
 
-  const thirdPartyQuotaFloor = extractThirdPartyQuotaFloor(quota);
-  if (thirdPartyQuotaFloor) {
-    for (const modelName of Object.keys(modelQuotas)) {
-      if (!isThirdPartyModel(modelName)) {
-        continue;
-      }
+  const poolFloors = extractQuotaPoolFloors(quota);
+  for (const modelName of Object.keys(modelQuotas)) {
+    const pool = classifyModelQuotaPool(modelName);
+    const floor = pool ? poolFloors[pool] : undefined;
+    if (!floor) {
+      continue;
+    }
 
-      if (thirdPartyQuotaFloor.percentage < modelQuotas[modelName]) {
-        modelQuotas[modelName] = thirdPartyQuotaFloor.percentage;
-        if (!isEmpty(thirdPartyQuotaFloor.resetTime)) {
-          modelResetTimes[modelName] = thirdPartyQuotaFloor.resetTime;
-        }
+    if (floor.percentage < modelQuotas[modelName]) {
+      modelQuotas[modelName] = floor.percentage;
+      if (!isEmpty(floor.resetTime)) {
+        modelResetTimes[modelName] = floor.resetTime;
       }
     }
   }

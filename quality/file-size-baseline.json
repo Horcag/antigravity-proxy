@@ -14,7 +14,7 @@
     "src/modules/proxy-gateway/antigravity/ClaudeRequestMapper.ts": 949,
     "src/modules/proxy-gateway/antigravity/ClaudeStreamingMapper.ts": 518,
     "src/modules/proxy-gateway/antigravity/OpenAIResponsesStreamingMapper.ts": 518,
-    "src/modules/proxy-gateway/server/account-lease-model-policy.ts": 638,
+    "src/modules/proxy-gateway/server/account-lease-model-policy.ts": 635,
     "src/modules/proxy-gateway/server/account-lease-selection-policy.ts": 960,
     "src/modules/proxy-gateway/server/account-lease.service.ts": 1014,
     "src/modules/proxy-gateway/server/cloudcode-failover-gateway.ts": 1536,

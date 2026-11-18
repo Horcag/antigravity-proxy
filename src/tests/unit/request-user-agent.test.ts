@@ -97,4 +97,122 @@ describe('request User-Agent version resolution', () => {
     expect(await resolver.resolveRequestUserAgent()).toBe(resolver.buildUserAgent('1.2.3'));
     expect(get).not.toHaveBeenCalled();
   });
+
+  it('formats hub User-Agent required for Argon, Hydrogen, and quota group discovery', async () => {
+    const resolver = await loadResolver();
+    expect(resolver.FALLBACK_VERSION).toBe('2.32.2');
+    expect(resolver.buildUserAgent('2.32.2')).toMatch(
+      /^antigravity\/hub\/2\.32\.2 \(aidev_client; os_type=(linux|windows|darwin); arch=(amd64|arm64|[a-z0-9]+)\)$/,
+    );
+  });
+});
+
+describe('Argon / Hydrogen routing isolation and quota group floors', () => {
+  it('routes Argon and Hydrogen only to capable accounts and ignores gemini-4-hydrogen-sonar for chat tiers', async () => {
+    const { AccountLeaseModelPolicy } = await import('../../modules/proxy-gateway/server/account-lease-model-policy');
+    const { isNonChatCatalogModelId } = await import('../../modules/proxy-gateway/antigravity/ModelMapping');
+
+    expect(isNonChatCatalogModelId('gemini-4-hydrogen-sonar')).toBe(true);
+
+    const tokenCache = new Map<string, any>([
+      [
+        'pro-account',
+        {
+          account_id: 'pro-account',
+          email: 'inetiki422@gmail.com',
+          access_token: 'tok-pro',
+          refresh_token: 'ref-pro',
+          token_type: 'Bearer',
+          expires_in: 3600,
+          expiry_timestamp: 9999999999,
+          model_quotas: {
+            'gemini-4-argon-low': 70,
+            'gemini-4-argon-medium': 70,
+            'gemini-4-argon-high': 70,
+            'gemini-4-hydrogen-low': 94,
+            'gemini-4-hydrogen-medium': 94,
+            'gemini-4-hydrogen-high': 94,
+            'gemini-4-hydrogen-xhigh': 94,
+            'gemini-4-hydrogen-tiered-high': 94,
+            'gemini-4-hydrogen-tiered-xhigh': 94,
+            'gemini-4-hydrogen-sonar': 94,
+          },
+          model_limits: {},
+          model_reset_times: {},
+          model_forwarding_rules: {},
+        },
+      ],
+      [
+        'free-account',
+        {
+          account_id: 'free-account',
+          email: 'free@gmail.com',
+          access_token: 'tok-free',
+          refresh_token: 'ref-free',
+          token_type: 'Bearer',
+          expires_in: 3600,
+          expiry_timestamp: 9999999999,
+          model_quotas: {
+            'gemini-3.8-flash-high': 100,
+            'gemini-3.8-flash-medium': 100,
+            'gemini-4-hydrogen-sonar': 100,
+          },
+          model_limits: {},
+          model_reset_times: {},
+          model_forwarding_rules: {},
+        },
+      ],
+    ]);
+
+    const policy = new AccountLeaseModelPolicy({
+      getTokenCache: () => tokenCache,
+      logger: { log: vi.fn() },
+    });
+
+    expect(policy.isModelRequestableForAccount('pro-account', 'gemini-4-argon-medium')).toBe(true);
+    expect(policy.isModelRequestableForAccount('pro-account', 'gemini-4-hydrogen-medium')).toBe(true);
+    expect(policy.isModelRequestableForAccount('pro-account', 'gemini-4-hydrogen-xhigh')).toBe(true);
+
+    expect(policy.isModelRequestableForAccount('free-account', 'gemini-4-argon-medium')).toBe(false);
+    expect(policy.isModelRequestableForAccount('free-account', 'gemini-4-hydrogen-medium')).toBe(false);
+    expect(policy.isModelRequestableForAccount('free-account', 'gemini-4-hydrogen-high')).toBe(false);
+  });
+
+  it('applies 5h and weekly quota_groups floor to Gemini, Argon, and Claude/GPT models', async () => {
+    const { buildAccountLeaseQuotaSnapshot } = await import('../../modules/proxy-gateway/server/account-lease-quota-policy');
+    const snapshot = buildAccountLeaseQuotaSnapshot({
+      models: {
+        'gemini-4-hydrogen-medium': { percentage: 94, resetTime: '2026-11-18T08:40:53Z' },
+        'gemini-4-argon-medium': { percentage: 70, resetTime: '2026-11-23T16:40:10Z' },
+        'claude-opus-5-5-high': { percentage: 100, resetTime: '2026-11-18T09:00:00Z' },
+      },
+      quota_groups: [
+        {
+          display_name: 'Gemini Models',
+          buckets: [
+            { bucket_id: 'gemini-5h', window: '5h', remaining_fraction: 0.94, reset_time: '2026-11-18T08:40:53Z' },
+            { bucket_id: 'gemini-weekly', window: 'weekly', remaining_fraction: 0.40, reset_time: '2026-11-20T05:13:20Z' },
+          ],
+        },
+        {
+          display_name: 'Gemini 4 Argon',
+          buckets: [
+            { bucket_id: 'gemini-argon-wtu-weekly', window: 'weekly', remaining_fraction: 0.25, reset_time: '2026-11-23T16:40:10Z' },
+          ],
+        },
+        {
+          display_name: 'Claude and GPT models',
+          buckets: [
+            { bucket_id: '3p-5h', window: '5h', remaining_fraction: 0.80, reset_time: '2026-11-18T09:15:36Z' },
+            { bucket_id: '3p-weekly', window: 'weekly', remaining_fraction: 0.50, reset_time: '2026-11-25T04:15:36Z' },
+          ],
+        },
+      ],
+    });
+
+    expect(snapshot.modelQuotas['gemini-4-hydrogen-medium']).toBe(40);
+    expect(snapshot.modelResetTimes['gemini-4-hydrogen-medium']).toBe('2026-11-20T05:13:20Z');
+    expect(snapshot.modelQuotas['gemini-4-argon-medium']).toBe(25);
+    expect(snapshot.modelQuotas['claude-opus-5-5-high']).toBe(50);
+  });
 });

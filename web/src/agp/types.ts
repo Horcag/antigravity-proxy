@@ -21,9 +21,21 @@ export interface Account {
   review_required: boolean;
   access_check?: AccessCheck | null;
   quota?: {
-    models: Record<string, { percentage: number; resetTime: string }>;
+    models: Record<string, { percentage: number; resetTime: string; display_name?: string }>;
     last_successful_refresh_at?: number;
     subscription_tier?: string;
+    quota_groups?: Array<{
+      display_name: string;
+      description?: string;
+      buckets: Array<{
+        bucket_id: string;
+        window: string;
+        remaining_fraction: number;
+        reset_time: string;
+        display_name?: string;
+        description?: string;
+      }>;
+    }>;
   };
   created_at?: string;
   last_used?: string;

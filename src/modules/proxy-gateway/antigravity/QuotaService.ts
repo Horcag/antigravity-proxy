@@ -10,7 +10,7 @@ const QUOTA_API_ENDPOINTS = [
   'https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels',
 ] as const;
 const CLOUD_CODE_BASE_URL = 'https://cloudcode-pa.googleapis.com';
-const USER_AGENT = 'antigravity/2.29.0 linux/amd64';
+const USER_AGENT = 'antigravity/hub/2.32.2 (aidev_client; os_type=linux; arch=amd64)';
 const QUOTA_FALLBACK_DELAY_MS = 1000;
 
 // Service Class

@@ -333,7 +333,7 @@ function isTrackedModel(modelName: string): boolean {
 }
 
 function toModelQuotaInfo(modelName: string, info: ModelInfoRaw): ModelQuotaInfo | null {
-  if (!isTrackedModel(modelName) || !info.quotaInfo) {
+  if (!isTrackedModel(modelName) || !info.quotaInfo || modelName.endsWith('-disabled')) {
     return null;
   }
 
