@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
-import { readForbiddenErrorBody, toGeminiUpstreamRequestError } from './upstream-error-classification';
+import {
+  formatSafeUpstreamErrorDetail,
+  readUpstreamErrorBody,
+  toGeminiUpstreamRequestError,
+} from './upstream-error-classification';
 import { UserProjectCapabilityCache } from './user-project-capability-cache';
 import { hedgedStreamRequest } from './hedged-stream-request';
 import { Injectable, Logger } from '@nestjs/common';
@@ -68,10 +72,11 @@ export class GeminiClient {
     } catch (error) {
       throwIfUpstreamRequestCanceled(error, signal);
       if (axios.isAxiosError(error)) {
-        await readForbiddenErrorBody(error, signal);
+        await readUpstreamErrorBody(error, signal);
         throwIfUpstreamRequestCanceled(error, signal);
+        const safeDetail = formatSafeUpstreamErrorDetail(error);
         const upstreamError = toGeminiUpstreamRequestError(error);
-        this.logUpstreamFailure('stream_generate', upstreamError);
+        this.logUpstreamFailure('stream_generate', upstreamError, safeDetail);
         throw upstreamError;
       }
       this.throwAsCleanError(error);
@@ -100,10 +105,11 @@ export class GeminiClient {
     } catch (error) {
       throwIfUpstreamRequestCanceled(error, signal);
       if (axios.isAxiosError(error)) {
-        await readForbiddenErrorBody(error, signal);
+        await readUpstreamErrorBody(error, signal);
         throwIfUpstreamRequestCanceled(error, signal);
+        const safeDetail = formatSafeUpstreamErrorDetail(error);
         const upstreamError = toGeminiUpstreamRequestError(error);
-        this.logUpstreamFailure('generate', upstreamError);
+        this.logUpstreamFailure('generate', upstreamError, safeDetail);
         throw upstreamError;
       }
       this.throwAsCleanError(error);
@@ -313,19 +319,21 @@ export class GeminiClient {
 
   private async throwUpstreamRequestError(error: unknown, operation: string, signal?: AxiosRequestConfig['signal']): Promise<never> {
     if (axios.isAxiosError(error)) {
-      await readForbiddenErrorBody(error, signal);
+      await readUpstreamErrorBody(error, signal);
       if (error.response?.data instanceof Readable) error.response.data.destroy();
       throwIfUpstreamRequestCanceled(error, signal);
+      const safeDetail = formatSafeUpstreamErrorDetail(error);
       const upstreamError = toGeminiUpstreamRequestError(error);
-      this.logUpstreamFailure(operation, upstreamError);
+      this.logUpstreamFailure(operation, upstreamError, safeDetail);
       throw upstreamError;
     }
     this.throwAsCleanError(error);
   }
 
-  private logUpstreamFailure(operation: string, error: UpstreamRequestError): void {
+  private logUpstreamFailure(operation: string, error: UpstreamRequestError, safeDetail?: string): void {
+    const suffix = safeDetail ? ` ${safeDetail}` : '';
     this.logger.error(
-      `[${operation}] upstream_request_failed status=${error.status ?? 'none'} reason=${error.reason}`,
+      `[${operation}] upstream_request_failed status=${error.status ?? 'none'} reason=${error.reason}${suffix}`,
     );
   }
 
