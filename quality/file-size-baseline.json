@@ -11,7 +11,7 @@
     "scripts/release-lib.sh": 1480,
     "src/modules/cloud-account/services/GoogleAPIService.ts": 1068,
     "src/modules/config/ipc/manager.ts": 931,
-    "src/modules/proxy-gateway/antigravity/ClaudeRequestMapper.ts": 949,
+    "src/modules/proxy-gateway/antigravity/ClaudeRequestMapper.ts": 897,
     "src/modules/proxy-gateway/antigravity/ClaudeStreamingMapper.ts": 518,
     "src/modules/proxy-gateway/antigravity/OpenAIResponsesStreamingMapper.ts": 518,
     "src/modules/proxy-gateway/server/account-lease-model-policy.ts": 635,
