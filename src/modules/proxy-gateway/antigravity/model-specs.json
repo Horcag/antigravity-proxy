@@ -149,6 +149,41 @@
       "max_output_tokens": 128000,
       "thinking_budget": 32768,
       "is_thinking": true
+    },
+    "gemini-4-neon-low": {
+      "max_output_tokens": 262144,
+      "thinking_budget": 8192,
+      "is_thinking": true
+    },
+    "gemini-4-neon-medium": {
+      "max_output_tokens": 262144,
+      "thinking_budget": 24576,
+      "is_thinking": true
+    },
+    "gemini-4-neon-high": {
+      "max_output_tokens": 262144,
+      "thinking_budget": 32768,
+      "is_thinking": true
+    },
+    "gemini-4-neon-xhigh": {
+      "max_output_tokens": 262144,
+      "thinking_budget": 32768,
+      "is_thinking": true
+    },
+    "gemini-pro-orchestrator-neon": {
+      "max_output_tokens": 65536,
+      "thinking_budget": 32768,
+      "is_thinking": true
+    },
+    "gemini-pro-orchestrator-argon": {
+      "max_output_tokens": 65536,
+      "thinking_budget": 32768,
+      "is_thinking": true
+    },
+    "gemini-pro-orchestrator": {
+      "max_output_tokens": 65536,
+      "thinking_budget": 32768,
+      "is_thinking": true
     }
   },
   "aliases": {
@@ -167,6 +202,7 @@
     "gemini-4-hydrogen": "gemini-4-hydrogen-medium",
     "gemini-3.8-flash": "gemini-3.8-flash-high",
     "claude-opus-5-5": "claude-opus-5-5-high",
-    "claude-sonnet-5-5": "claude-sonnet-5-5-high"
+    "claude-sonnet-5-5": "claude-sonnet-5-5-high",
+    "gemini-4-neon": "gemini-4-neon-high"
   }
 }

@@ -31,6 +31,14 @@ const PUBLIC_SUPPORTED_MODELS = [
 
 const CLAUDE_TO_GEMINI: Record<string, string> = {
   // Directly supported models
+  'gemini-4-neon-low': 'gemini-4-neon-low',
+  'gemini-4-neon-medium': 'gemini-4-neon-medium',
+  'gemini-4-neon-high': 'gemini-4-neon-high',
+  'gemini-4-neon-xhigh': 'gemini-4-neon-xhigh',
+  'gemini-pro-orchestrator-neon': 'gemini-pro-orchestrator-neon',
+  'gemini-pro-orchestrator-argon': 'gemini-pro-orchestrator-argon',
+  'gemini-pro-orchestrator': 'gemini-pro-orchestrator',
+  'gemini-flash-worker-agy': 'gemini-flash-worker-agy',
   'gemini-4-argon-low': 'gemini-4-argon-low',
   'gemini-4-argon-medium': 'gemini-4-argon-medium',
   'gemini-4-argon-high': 'gemini-4-argon-high',
@@ -99,6 +107,7 @@ const CLAUDE_TO_GEMINI: Record<string, string> = {
   'gpt-3.5-turbo-0613': 'gemini-3-flash',
 
   // Gemini Protocol Mapping
+  'gemini-4-neon': 'gemini-4-neon-high',
   'gemini-4-argon': 'gemini-4-argon-medium',
   'gemini-4-hydrogen': 'gemini-4-hydrogen-medium',
   'gemini-3.8-flash': 'gemini-3.8-flash-high',

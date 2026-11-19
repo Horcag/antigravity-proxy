@@ -19,7 +19,7 @@ import { AnonymousTransportReceiptOwner } from './anonymous-transport-receipt';
 import { authorizesMigration, createMigrationAuthorization, safeAffinityCommitRejectionReason, type MigrationAuthorization, type MigrationAuthorizationReason } from './cache-affinity-coordinator';
 import { extractModelName, extractSessionKey, isReplaySafeOperation, composeAttemptRequest, preflightValidateJsonRequest } from './cloudcode-request-adapter';
 import { classifyUpstreamFailure, safeDecodeGrpcMessage, type FailureEvidence } from './upstream-failure';
-import { evaluateRetryDecision } from './upstream-retry-decision';
+import { evaluateRetryDecision } from './upstream-retry-decision'; import { observeClientUserAgent } from './request-user-agent';
 import { logUpstreamFailure, sanitizeLogString } from './cloudcode-diagnostics';
 import { formatPoolCapacityError, formatTerminalDownstreamError, resolveHasAlternativeAccounts } from './cloudcode-terminal-response';
 export { isVerifiedSessionKey, isHintSessionKey };
@@ -92,7 +92,7 @@ export class CloudCodeFailoverGateway {
     }
     const method = req.method || 'POST';
     // Determine upstream target host strictly from :authority or host header
-    const rawAuthority =
+    observeClientUserAgent(req.headers['user-agent']); const rawAuthority =
       (req.headers[':authority'] as string) ||
       (req.headers['host'] as string) ||
       this.defaultUpstreamHost;
@@ -249,7 +249,7 @@ export class CloudCodeFailoverGateway {
       }
       migrationAuthorization = createMigrationAuthorization(reason, sessionKey, binding, requestId) ?? undefined;
     };
-    migrationAuthorization = this.accountLeaseService?.authorizeBoundSessionMigration?.(sessionKey, modelName, requestId);
+    migrationAuthorization = this.accountLeaseService?.authorizeBoundSessionMigration?.(sessionKey, modelName, requestId, true);
     let activeLease: {
       account: CloudAccount;
       sessionKey?: string;
@@ -303,32 +303,32 @@ export class CloudCodeFailoverGateway {
         if (this.accountLeaseService) {
           if (typeof this.accountLeaseService.acquireAttemptLease === 'function') {
             activeLease = await this.accountLeaseService.acquireAttemptLease({
-              model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey,
+              model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, allowUnadvertisedModelFallback: true,
               deferSessionBinding: true, migrationAuthorization, signal: requestAbortController.signal, requestId, affinityOwnerTimeoutMs,
             });
             if (!activeLease && migrationAuthorization) {
               migrationAuthorization = undefined;
               activeLease = await this.accountLeaseService.acquireAttemptLease({
-                model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey,
+                model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, allowUnadvertisedModelFallback: true,
                 deferSessionBinding: true, migrationAuthorization: undefined, signal: requestAbortController.signal, requestId, affinityOwnerTimeoutMs,
               });
             }
             if (!activeLease && sessionKey) {
               activeLease = await this.accountLeaseService.acquireAttemptLease({
-                model: modelName, excludeAccountIds: Array.from(attemptedAccountIds),
+                model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), allowUnadvertisedModelFallback: true,
                 signal: requestAbortController.signal, requestId,
               });
             }
           } else {
             const acc = await this.accountLeaseService.getNextToken({
-              model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, deferSessionBinding: true,
+              model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, deferSessionBinding: true, allowUnadvertisedModelFallback: true,
             });
             if (acc) {
               activeLease = { account: acc, sessionKey, generation: 1, tableIncarnation: this.accountLeaseService.getTableIncarnation?.(), releaseReservation: acc.releaseReservation ?? (() => {}) };
             }
           }
         }
-        if (this.accountLeaseService && !activeLease) {
+        if (this.accountLeaseService && !activeLease) { if (clientAborted || res.destroyed) return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
           logger.warn(`[CloudCodeGateway] No account lease available in managed pool on attempt ${attempt}. Disallowing unreserved passthrough.`);
           if (!responseCommitted && !res.writableEnded) {
             const ambiguous = lastAmbiguousError as { statusCode: number; headers: http.IncomingHttpHeaders; bufferedBody?: Buffer } | null;
@@ -874,7 +874,7 @@ export class CloudCodeFailoverGateway {
             }
             activeCompleteAffinityPlacement?.('committed'); activeCompleteAffinityPlacement = undefined; activeAbortMigration = undefined; upstreamResponseSelected = true;
             receiptOwner.expectDownstreamCommit('validated_response'); activeStopCandidateRenewal?.();
-            writeDownstreamHeaders('validated_response', statusCode, headers);
+            writeDownstreamHeaders('validated_response', statusCode, headers); clearLogicalDeadline();
             break;
           }
         }
@@ -1424,7 +1424,7 @@ export class CloudCodeFailoverGateway {
         path: url,
         method,
         headers,
-        timeout: 60000, // Inactivity timeout on socket
+        timeout: 300000, // Inactivity timeout on socket
       };
       let settled = false, deadlineTimer: NodeJS.Timeout | null = null, upstreamResRef: http.IncomingMessage | null = null;
       const cleanupCall = () => { if (deadlineTimer) { clearTimeout(deadlineTimer); deadlineTimer = null; } };
@@ -1492,7 +1492,7 @@ export class CloudCodeFailoverGateway {
       onReqCreated?.(upstreamReq);
       // Inactivity timeout
       upstreamReq.on('timeout', () => {
-        upstreamReq.destroy(new Error('Upstream socket inactivity timeout after 60s'));
+        upstreamReq.destroy(new Error('Upstream socket inactivity timeout after 300s'));
       });
       // Overall attempt absolute deadline timer
       deadlineTimer = setTimeout(() => {

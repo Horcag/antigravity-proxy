@@ -71,6 +71,18 @@ export class AccountLeaseLimitPolicy {
     this.rateLimitTracker.clearAll();
   }
 
+  clearAccountLimits(accountIdOrEmail: string): void {
+    const accountId = this.resolveAccountId(accountIdOrEmail);
+    this.accountCooldowns.delete(accountId);
+    this.accountCooldownReasons.delete(accountId);
+    this.rateLimitTracker.clear(accountId);
+    for (const lockout of this.rateLimitTracker.peekActiveLockouts()) {
+      if (lockout.accountId === accountId && lockout.modelId) {
+        this.rateLimitTracker.clearModel(accountId, lockout.modelId);
+      }
+    }
+  }
+
   getActiveAccountCooldowns(now = Date.now()): ActiveAccountCooldown[] {
     for (const [accountId, unavailableUntil] of this.accountCooldowns) {
       if (unavailableUntil <= now) {

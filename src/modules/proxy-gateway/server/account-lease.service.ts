@@ -51,7 +51,7 @@ import {
   type AffinityPlacementOutcome,
   type MigrationAuthorization,
 } from './cache-affinity-coordinator';
-import { authorizeBoundSessionMigration } from './bound-session-migration-authorization';
+import { authorizeBoundSessionMigration, selectUnadvertisedFallbackCandidates } from './bound-session-migration-authorization';
 export interface AttemptLease {
   account: CloudAccount;
   sessionKey?: string;
@@ -86,7 +86,7 @@ export interface GetNextTokenOptions {
   requestId?: string;
   /** Internal re-entry after a placement owner has settled. */
   skipAffinityCoordination?: boolean;
-  affinityOwnerTimeoutMs?: number;
+  affinityOwnerTimeoutMs?: number; allowUnadvertisedModelFallback?: boolean;
 }
 type TokenData = AccountLeaseTokenData;
 type TokenEntry = [string, TokenData];
@@ -226,9 +226,10 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   isAccountSuspensionFenced(accountId: string): boolean { return this.suspensionPolicy.isFenced(accountId); }
   clearAccountSuspensionAfterReview(accountId: string, revision: SuspensionReview): void { this.suspensionPolicy.clearAfterReview(accountId, revision); }
   async reloadAllAccounts(): Promise<number> {
+    const previousIds = new Set(this.tokens.keys());
     const count = await this.loadAccounts();
-    this.clearAllRateLimits();
-    this.clearAllSessions();
+    for (const id of this.tokens.keys()) { if (!previousIds.has(id)) this.limitPolicy.clearAccountLimits(id); }
+    for (const id of previousIds) { if (!this.tokens.has(id)) this.limitPolicy.clearAccountLimits(id); }
     return count;
   }
   refreshQuotaCatalog(options: { force?: boolean; model?: string } = {}): Promise<AccountLeaseQuotaCatalogRefreshResult> {
@@ -502,7 +503,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
           if (options?.signal?.aborted) { abortAffinityPlacement(); return null; }
         }
       }
-      let candidateAccountPool = await this.buildCurrentCandidatePool(model, excludedAccountIds);
+      let candidateAccountPool = await this.buildCurrentCandidatePool(model, excludedAccountIds, Boolean(options?.allowUnadvertisedModelFallback));
       const isStickyAvailable = stickyForWait && candidateAccountPool.some(([id]) => id === stickyForWait.accountId);
       const isMigratingTargetAvailable = stickyForWait?.state === 'migrating' && stickyForWait.migratingToAccountId && candidateAccountPool.some(([id]) => id === stickyForWait.migratingToAccountId);
       const migrationAuthorized = authorizesMigration(options?.migrationAuthorization, sessionKey, stickyForWait, options?.requestId);
@@ -521,7 +522,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
           if (options?.signal?.aborted || Date.now() >= deadline) { abortAffinityPlacement(); return null; }
           await waitForAdmissionSlot(Math.min(25, Math.max(1, deadline - Date.now())), options?.signal);
           if (options?.signal?.aborted) { abortAffinityPlacement(); return null; }
-          candidateAccountPool = await this.buildCurrentCandidatePool(model, excludedAccountIds);
+          candidateAccountPool = await this.buildCurrentCandidatePool(model, excludedAccountIds, Boolean(options?.allowUnadvertisedModelFallback));
           if (!candidateAccountPool.some(([accountId]) => accountId === stickyBinding.accountId)) break;
         }
       }
@@ -536,7 +537,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         const isCurrentMigratingAvailable = currentBinding?.state === 'migrating' && currentBinding.migratingToAccountId && candidateAccountPool.some(([id]) => id === currentBinding.migratingToAccountId);
         const effectiveStickyId = (currentBinding?.state === 'migrating' && isCurrentMigratingAvailable) ? currentBinding.migratingToAccountId : (isCurrentStickyAvailable ? currentBinding?.accountId : undefined);
         if (currentBinding && options?.deferSessionBinding && !currentMigrationAuthorized) {
-          const freshCandidates = await this.buildCurrentCandidatePool(model, excludedAccountIds);
+          const freshCandidates = await this.buildCurrentCandidatePool(model, excludedAccountIds, Boolean(options?.allowUnadvertisedModelFallback));
           candidateAccountPool = effectiveStickyId && freshCandidates.some(([id]) => id === effectiveStickyId) ? freshCandidates.filter(([accountId]) => accountId === effectiveStickyId) : freshCandidates;
         }
         const boundCandidate = effectiveStickyId && !currentMigrationAuthorized && !(
@@ -552,7 +553,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
         }
         selectedTokenEntry = await this.selectionPolicy.selectCandidate({
           allTokens: candidateAccountPool,
-          getCurrentCandidates: () => this.buildCurrentCandidatePool(model, excludedAccountIds),
+          getCurrentCandidates: () => this.buildCurrentCandidatePool(model, excludedAccountIds, Boolean(options?.allowUnadvertisedModelFallback)),
           sessionKey,
           skipWait: true,
           model,
@@ -717,34 +718,31 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
     }
     return available.length > 0 ? available : unknown;
   }
-  private async buildCurrentCandidatePool(
-    model: string | undefined,
-    excludedAccountIds: ReadonlySet<string>,
-  ): Promise<TokenEntry[]> {
+  private async buildCurrentCandidatePool(model: string | undefined, excludedAccountIds: ReadonlySet<string>, allowUnadvertisedModelFallback = false): Promise<TokenEntry[]> {
     const activeTokens = () => Array.from(this.tokens.entries()).filter(([, token]) => token.status !== 'expired');
     let modelCapableAccountPool = this.selectModelCapableAccounts(activeTokens(), model);
     if (model && modelCapableAccountPool.length === 0) {
       await this.refreshQuotaCatalog({ force: true, model });
       modelCapableAccountPool = this.selectModelCapableAccounts(activeTokens(), model);
     }
-    if (modelCapableAccountPool.length === 0) {
+    const useUnadvertised = Boolean(allowUnadvertisedModelFallback && model && modelCapableAccountPool.length === 0);
+    const unadvertisedPool = useUnadvertised ? selectUnadvertisedFallbackCandidates(activeTokens(), model!, (id, m) => proxyModelAvailabilityStore.hasHardCapabilityFailure(id, m)) : modelCapableAccountPool;
+    if (unadvertisedPool.length === 0) {
       this.logger.warn(`No account advertises requested model: ${model ?? 'unknown'}`);
       return [];
     }
-    const requestableAccountPool = this.selectModelCapableAccounts(activeTokens().filter(([accountId]) =>
-      (this.accountCooldowns.get(accountId) ?? 0) <= Date.now() &&
-      !this.rateLimitTracker.isRateLimited(accountId, model ? this.modelPolicy.resolveDynamicModelForAccount(accountId, model, false) : undefined) &&
-      (!model || this.modelPolicy.isModelRequestableForAccount(accountId, model))), model);
+    const requestableAccountPool = useUnadvertised
+      ? unadvertisedPool.filter(([accountId]) => (this.accountCooldowns.get(accountId) ?? 0) <= Date.now() && !this.rateLimitTracker.isRateLimited(accountId, model) && proxyModelAvailabilityStore.isAvailable(accountId, model!))
+      : this.selectModelCapableAccounts(activeTokens().filter(([accountId]) =>
+        (this.accountCooldowns.get(accountId) ?? 0) <= Date.now() &&
+        !this.rateLimitTracker.isRateLimited(accountId, model ? this.modelPolicy.resolveDynamicModelForAccount(accountId, model, false) : undefined) &&
+        (!model || this.modelPolicy.isModelRequestableForAccount(accountId, model))), model);
     if (requestableAccountPool.length === 0) {
       this.logger.warn(`All compatible account/model pairs are temporarily unavailable: ${model ?? 'unknown'}`);
       return [];
     }
-    const filteredAccountPool = requestableAccountPool.filter(
-      ([accountId]) => !excludedAccountIds.has(accountId),
-    );
-    if (filteredAccountPool.length === 0 && excludedAccountIds.size > 0) {
-      this.logger.warn('All eligible accounts were already attempted for this request');
-    }
+    const filteredAccountPool = requestableAccountPool.filter(([accountId]) => !excludedAccountIds.has(accountId));
+    if (filteredAccountPool.length === 0 && excludedAccountIds.size > 0) this.logger.warn('All eligible accounts were already attempted for this request');
     return filteredAccountPool;
   }
   public resetSelectionState(): void {
@@ -834,9 +832,9 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
   public getTableIncarnation(): number {
     return this.selectionPolicy.getTableIncarnation();
   }
-  public authorizeBoundSessionMigration(sessionKey: string | undefined, model: string | undefined, ownerRequestId: string | undefined): MigrationAuthorization | undefined {
+  public authorizeBoundSessionMigration(sessionKey: string | undefined, model: string | undefined, ownerRequestId: string | undefined, allowUnadvertisedModelFallback = false): MigrationAuthorization | undefined {
     return authorizeBoundSessionMigration(this.tokens, this.getSessionBinding(sessionKey), sessionKey, model, ownerRequestId,
-      (accountId, requestedModel) => this.modelPolicy.isModelRequestableForAccount(accountId, requestedModel),
+      (accountId, requestedModel) => this.modelPolicy.isModelRequestableForAccount(accountId, requestedModel) || Boolean(allowUnadvertisedModelFallback && proxyModelAvailabilityStore.isAvailable(accountId, requestedModel) && this.selectModelCapableAccounts(Array.from(this.tokens.entries()).filter(([, t]) => t.status !== 'expired'), requestedModel).length === 0),
       (accountId) => (this.accountCooldowns.get(accountId) ?? 0) > Date.now() || this.rateLimitTracker.isRateLimited(accountId, model ? this.modelPolicy.resolveDynamicModelForAccount(accountId, model, false) : undefined));
   }
   public clearSessions(): void {

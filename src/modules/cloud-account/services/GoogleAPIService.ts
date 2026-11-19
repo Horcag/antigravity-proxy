@@ -4,8 +4,7 @@ import { AuthServer } from '@/modules/cloud-account/ipc/authServer';
 import { EnvHttpProxyAgent, ProxyAgent } from 'undici';
 import {
   buildUserAgent,
-  FALLBACK_VERSION,
-  resolveLocalInstalledVersion,
+  resolveEffectiveUpstreamVersion,
 } from '@/modules/proxy-gateway/server/request-user-agent';
 import { isEmpty, isNumber, isString } from 'lodash-es';
 import { v4 } from 'uuid';
@@ -286,7 +285,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 function buildInternalApiHeaders(accessToken: string): Record<string, string> {
-  const discoveryVersion = resolveLocalInstalledVersion() ?? FALLBACK_VERSION;
+  const discoveryVersion = resolveEffectiveUpstreamVersion();
   return {
     Authorization: `Bearer ${accessToken}`,
     'User-Agent': buildUserAgent(discoveryVersion),
@@ -806,7 +805,7 @@ export class GoogleAPIService {
   ): Promise<{ credits: number; expiryDate: string } | null> {
     try {
       const fetchOptions = this.getFetchOptions(proxyUrl);
-      const discoveryVersion = resolveLocalInstalledVersion() ?? FALLBACK_VERSION;
+      const discoveryVersion = resolveEffectiveUpstreamVersion();
       const request = createDisposableRequestSignal(REQUEST_TIMEOUT_MS, parentSignal);
       const fallbackResponse = await fetch(URLS.DAILY_LOAD_PROJECT, {
         method: 'POST',

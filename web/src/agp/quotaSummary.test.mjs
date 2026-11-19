@@ -94,3 +94,35 @@ test('summarizeAccountQuota omits Argon row on standard accounts without Argon a
   assert.equal(summary.hasHydrogen, false);
   assert.deepEqual(summary.groups.map((g) => g.compactText), ['Gemini (3.8 Flash): 5ч 100% · Нед 65%']);
 });
+
+test('summarizeAccountQuota highlights Neon alongside Argon and Hydrogen when present', () => {
+  const quota = {
+    subscription_tier: 'Google AI Pro',
+    models: {
+      'gemini-4-neon-high': { percentage: 100, resetTime: '2026-11-19T07:01:01Z', display_name: 'Gemini 4 Neon (High)' },
+      'gemini-4-argon-medium': { percentage: 80, resetTime: '2026-11-26T02:01:01Z', display_name: 'Gemini 4 Argon (Medium)' },
+      'gemini-4-hydrogen-medium': { percentage: 95, resetTime: '2026-11-19T07:01:01Z', display_name: 'Gemini 4 Hydrogen (Medium)' },
+    },
+    quota_groups: [
+      {
+        display_name: 'Gemini Models',
+        buckets: [
+          { bucket_id: 'gemini-weekly', window: 'weekly', remaining_fraction: 0.99, reset_time: '2026-11-26T02:01:01Z' },
+          { bucket_id: 'gemini-5h', window: '5h', remaining_fraction: 0.95, reset_time: '2026-11-19T07:01:01Z' },
+        ],
+      },
+      {
+        display_name: 'Gemini 4 Argon',
+        buckets: [
+          { bucket_id: 'gemini-argon-wtu-weekly', window: 'weekly', remaining_fraction: 0.80, reset_time: '2026-11-26T02:01:01Z' },
+        ],
+      },
+    ],
+  };
+
+  const summary = summarizeAccountQuota(quota);
+  assert.equal(summary.hasNeon, true);
+  assert.equal(summary.tierLabel, 'Google AI Pro · Neon + Argon + Hydrogen');
+  assert.equal(summary.groups[0].compactText, 'Gemini (Neon / Hydrogen / 3.8): 5ч 95% · Нед 99%');
+  assert.equal(listDisplayQuotaModels(quota)[0].modelId, 'gemini-4-neon-high');
+});

@@ -24,6 +24,7 @@ export interface DisplayQuotaModelRow {
 
 export interface AccountQuotaSummary {
   tierLabel: string;
+  hasNeon: boolean;
   hasArgon: boolean;
   hasHydrogen: boolean;
   groups: QuotaGroupSummaryRow[];
@@ -101,6 +102,11 @@ export function listDisplayQuotaModels(quota: Account['quota']): DisplayQuotaMod
 
   const rankModel = (modelId: string): number => {
     const id = modelId.toLowerCase();
+    if (id.startsWith('gemini-4-neon-xhigh')) return 5;
+    if (id.startsWith('gemini-4-neon-high')) return 6;
+    if (id.startsWith('gemini-4-neon-medium')) return 7;
+    if (id.startsWith('gemini-4-neon-low')) return 8;
+    if (id.startsWith('gemini-4-neon')) return 9;
     if (id.startsWith('gemini-4-argon-high')) return 10;
     if (id.startsWith('gemini-4-argon-medium')) return 11;
     if (id.startsWith('gemini-4-argon-low')) return 12;
@@ -135,6 +141,7 @@ export function summarizeAccountQuota(quota: Account['quota']): AccountQuotaSumm
   if (!quota) return null;
   const models = quota.models ?? {};
   const modelKeys = Object.keys(models).map((k) => k.toLowerCase());
+  const hasNeonModel = modelKeys.some((k) => k.startsWith('gemini-4-neon') && !k.endsWith('-disabled'));
   const hasArgonModel = modelKeys.some((k) => k.startsWith('gemini-4-argon') && !k.endsWith('-disabled'));
   const hasHydrogenModel = modelKeys.some(
     (k) => k.startsWith('gemini-4-hydrogen') && !k.endsWith('-sonar') && !k.endsWith('-disabled'),
@@ -188,11 +195,20 @@ export function summarizeAccountQuota(quota: Account['quota']): AccountQuotaSumm
     thirdParty5h = findLowestModelWindow(models, (id) => id.includes('claude') || id.includes('gpt'));
   }
 
+  const hasNeon = hasNeonModel;
   const hasArgon = Boolean(argonWeekly || argon5h || hasArgonModel);
   const hasHydrogen = hasHydrogenModel;
 
-  const geminiLabel = hasHydrogen ? 'Gemini (Hydrogen / 3.8)' : 'Gemini (3.8 Flash)';
-  const geminiModelsHint = hasHydrogen ? 'Gemini 4 Hydrogen, Gemini 3.8 Flash' : 'Gemini 3.8 Flash';
+  const geminiLabel = hasNeon && hasHydrogen
+    ? 'Gemini (Neon / Hydrogen / 3.8)'
+    : hasHydrogen
+      ? 'Gemini (Hydrogen / 3.8)'
+      : 'Gemini (3.8 Flash)';
+  const geminiModelsHint = hasNeon && hasHydrogen
+    ? 'Gemini 4 Neon, Gemini 4 Hydrogen, Gemini 3.8 Flash'
+    : hasHydrogen
+      ? 'Gemini 4 Hydrogen, Gemini 3.8 Flash'
+      : 'Gemini 3.8 Flash';
   const claudeModelsHint = modelKeys.some((k) => k.includes('5-5'))
     ? 'Claude 5.5, GPT-OSS 120B'
     : 'Claude 4.6, GPT-OSS 120B';
@@ -204,11 +220,12 @@ export function summarizeAccountQuota(quota: Account['quota']): AccountQuotaSumm
   ].filter((row): row is QuotaGroupSummaryRow => row !== null);
 
   const baseTier = quota.subscription_tier ?? 'Квота по группам';
-  const capabilityTags = [hasArgon ? 'Argon' : null, hasHydrogen ? 'Hydrogen' : null].filter(Boolean);
+  const capabilityTags = [hasNeon ? 'Neon' : null, hasArgon ? 'Argon' : null, hasHydrogen ? 'Hydrogen' : null].filter(Boolean);
   const tierLabel = capabilityTags.length > 0 ? `${baseTier} · ${capabilityTags.join(' + ')}` : baseTier;
 
   return {
     tierLabel,
+    hasNeon,
     hasArgon,
     hasHydrogen,
     groups,

@@ -100,10 +100,24 @@ describe('request User-Agent version resolution', () => {
 
   it('formats hub User-Agent required for Argon, Hydrogen, and quota group discovery', async () => {
     const resolver = await loadResolver();
-    expect(resolver.FALLBACK_VERSION).toBe('2.32.2');
-    expect(resolver.buildUserAgent('2.32.2')).toMatch(
-      /^antigravity\/hub\/2\.32\.2 \(aidev_client; os_type=(linux|windows|darwin); arch=(amd64|arm64|[a-z0-9]+)\)$/,
+    expect(resolver.FALLBACK_VERSION).toBe('2.33.0');
+    expect(resolver.buildUserAgent('2.33.0')).toMatch(
+      /^antigravity\/hub\/2\.33\.0 \(aidev_client; os_type=(linux|windows|darwin); arch=(amd64|arm64|[a-z0-9]+)\)$/,
     );
+  });
+
+  it('advances resolveEffectiveUpstreamVersion from observed client User-Agent while respecting explicit env pins', async () => {
+    const resolver = await loadResolver();
+    resolver.resetObservedClientUserAgentForTesting();
+    try {
+      expect(resolver.resolveEffectiveUpstreamVersion()).toBe(resolver.FALLBACK_VERSION);
+      resolver.observeClientUserAgent('antigravity/hub/2.34.0 (aidev_client; os_type=windows; arch=amd64)');
+      expect(resolver.resolveEffectiveUpstreamVersion()).toBe('2.34.0');
+      vi.stubEnv('AG_PROXY_UPSTREAM_VERSION', '1.2.3');
+      expect(resolver.resolveEffectiveUpstreamVersion()).toBe('1.2.3');
+    } finally {
+      resolver.resetObservedClientUserAgentForTesting();
+    }
   });
 });
 
