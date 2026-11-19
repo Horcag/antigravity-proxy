@@ -486,10 +486,10 @@ export class CloudCodeFailoverGateway {
             writeDownstream('bad_gateway', lastAmbiguousError.statusCode, lastAmbiguousError.headers, lastAmbiguousError.bufferedBody);
             return 'terminal';
           }
-          const classification = (status === 503 || exhaustedByUnavailable) ? 'unavailable'
-            : status === 413 ? 'request_too_large'
-            : status === 429 ? 'rate_limited'
-            : 'bad_gateway';
+          if (exhaustedByUnavailable && failureEvidence.category === 'model-capability') {
+            writeDownstream('unavailable', 503, { 'content-type': 'application/json' }, JSON.stringify({ error: { code: 503, message: 'All upstream attempts are unavailable.', status: 'UNAVAILABLE' } })); return 'terminal';
+          }
+          const classification = (status === 503 || exhaustedByUnavailable) ? 'unavailable' : status === 413 ? 'request_too_large' : status === 429 ? 'rate_limited' : 'bad_gateway';
           writeDownstream(classification, status, responseHeaders, responseBody);
           return 'terminal';
         };
