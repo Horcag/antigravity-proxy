@@ -275,12 +275,20 @@ export function Accounts() {
                 </>
               );
             })()}
-            <Link
-              className="btn btn-secondary"
-              to={`/requests?accountId=${encodeURIComponent(selected.id)}`}
-            >
-              История запросов аккаунта
-            </Link>
+            <div className="agp-actions">
+              <Link
+                className="btn btn-secondary"
+                to={`/requests?accountId=${encodeURIComponent(selected.id)}`}
+              >
+                История запросов аккаунта
+              </Link>
+              <Link
+                className="btn btn-secondary"
+                to={`/quota?accountId=${encodeURIComponent(selected.id)}`}
+              >
+                Динамика квоты и API-эквивалент
+              </Link>
+            </div>
           </>
         )}
       </Modal>

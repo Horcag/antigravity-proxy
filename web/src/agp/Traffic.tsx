@@ -139,6 +139,11 @@ export function Requests() {
             value={params.get('model') ?? ''}
             onChange={(e) => change('model', e.target.value)}
           />
+          <Input
+            label="Сессия (серверный фильтр)"
+            value={params.get('sessionKey') ?? ''}
+            onChange={(e) => change('sessionKey', e.target.value)}
+          />
           <label className="agp-field">
             Наличие модели
             <select
@@ -286,7 +291,7 @@ export function Requests() {
           ]}
           rows={(resource.data?.items ?? [])
             .filter((r) =>
-              `${r.request_id} ${r.project_name} ${requestAccountLabel(r, accounts.data ?? [])} ${r.requested_model} ${r.effective_model} ${r.route}`
+              `${r.request_id} ${r.session_key ?? ''} ${r.project_name} ${requestAccountLabel(r, accounts.data ?? [])} ${r.requested_model} ${r.effective_model} ${r.route}`
                 .toLowerCase()
                 .includes(search.toLowerCase())
             )

@@ -1,6 +1,6 @@
 import { StringDecoder } from 'node:string_decoder';
 import { createGunzip, createInflate, createBrotliDecompress } from 'node:zlib';
-import { extractResponseUsage, getRequestObservation, type ResponseUsage } from './request-context';
+import { extractResponseUsage, mergeStreamResponseUsage, getRequestObservation, type ResponseUsage } from './request-context';
 
 const MESSAGE_LIMIT = 64 * 1024;
 const DECODED_LIMIT = 16 * 1024 * 1024;
@@ -24,7 +24,7 @@ export function createNativeResponseUsage(contentType: string | undefined, encod
       const payload = JSON.parse(text);
       const frames = Array.isArray(payload) ? payload : [payload];
       if (frames.some(frame => frame?.error || frame?.response?.error)) { discard(); return; }
-      for (const frame of frames) Object.assign(usage, extractResponseUsage(frame));
+      for (const frame of frames) mergeStreamResponseUsage(usage, extractResponseUsage(frame));
     } catch { /* Неполный или неподдерживаемый формат не даёт измерений. */ }
   };
   const consume = (chunk: Buffer) => {

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { QuotaPricingConfigSchema } from '@/observability/quota-analytics-types';
 
 export const UpstreamProxyConfigSchema = z.object({
   enabled: z.boolean().nullable().optional().transform((val) => val ?? false).default(false),
@@ -45,6 +46,7 @@ export const ProxyConfigSchema = z.object({
   request_timeout: z.number().positive().nullable().optional().transform((val) => val ?? 120).default(120),
   upstream_proxy: UpstreamProxyConfigSchema.nullable().optional().transform((val) => val ?? { enabled: false, url: '' }).default({ enabled: false, url: '' }),
   experimental: ProxyExperimentalConfigSchema.nullable().optional().transform((val) => val ?? { enable_cloud_code_meta: false }).default({ enable_cloud_code_meta: false }),
+  quota_pricing: QuotaPricingConfigSchema.optional(),
 }).superRefine((config, context) => {
   if (config.compatibility_ports?.some((port, index, ports) => port === config.port || ports.indexOf(port) !== index)) {
     context.addIssue({ code: 'custom', path: ['compatibility_ports'], message: 'Compatibility ports must be unique and different from the primary port' });

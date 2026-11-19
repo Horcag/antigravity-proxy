@@ -73,6 +73,7 @@ export interface RequestEntry {
   project_id: string;
   project_name: string;
   account_id: string | null;
+  session_key?: string | null;
   status: number;
   grpc_status: string | null;
   error_category: string | null;
@@ -80,7 +81,10 @@ export interface RequestEntry {
   ttft_ms: number | null;
   input_tokens: number | null;
   output_tokens: number | null;
+  thought_tokens?: number | null;
   cache_tokens: number | null;
+  cache_write_tokens?: number | null;
+  usage_schema?: string | null;
   attempts: Array<{
     account_id: string;
     effective_model?: string | null;

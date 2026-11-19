@@ -11,6 +11,7 @@ import {
   IconSlidersHorizontal,
   IconNetwork,
   IconSidebarSystem,
+  IconTrendingUp,
 } from '@/components/ui/icons';
 import { Input } from '@/components/ui/Input';
 import { Button, Card, ErrorMessage } from './shared';
@@ -20,6 +21,7 @@ import { Projects } from './Projects';
 import { Models, SettingsPage } from './Configuration';
 import { Requests } from './Traffic';
 import { StatisticsPage } from './Statistics';
+import { QuotaAnalytics } from './QuotaAnalytics';
 import license from '../../LICENSE?raw';
 import './console.scss';
 const nav: SidebarNavGroup[] = [
@@ -33,6 +35,12 @@ const nav: SidebarNavGroup[] = [
         end: true,
         label: 'Обзор',
         icon: <IconSidebarDashboard size={20} />,
+      },
+      {
+        kind: 'link',
+        path: '/quota',
+        label: 'Квота и стоимость',
+        icon: <IconTrendingUp size={20} />,
       },
       {
         kind: 'link',
@@ -142,6 +150,7 @@ function Shell({ logout }: { logout: () => Promise<void> }) {
         <main id="main" tabIndex={-1} className="main-content agp-main">
           <Routes>
             <Route path="/" element={<StatisticsPage overview />} />
+            <Route path="/quota" element={<QuotaAnalytics />} />
             <Route path="/accounts" element={<Accounts />} />
             <Route path="/models" element={<Models />} />
             <Route path="/projects" element={<Projects />} />

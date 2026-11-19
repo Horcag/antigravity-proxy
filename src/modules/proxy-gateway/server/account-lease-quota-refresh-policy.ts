@@ -1,5 +1,6 @@
 import type { AccountLeaseAccountStore, AccountLeaseUpstream } from './account-lease-adapters';
 import type { CloudQuotaData } from '@/modules/cloud-account/types';
+import { tryRecordQuotaSnapshot } from '@/observability/request-history';
 import { isAICreditsAuthenticationError } from '@/modules/cloud-account/services/ai-credits-authentication-error';
 import {
   buildAccountLeaseQuotaSnapshot,
@@ -369,6 +370,7 @@ export class AccountLeaseQuotaRefreshPolicy {
       accountId,
       Object.keys(extractedState.modelQuotas),
     );
+    tryRecordQuotaSnapshot(accountId, quotaSnapshot, refreshedAt);
     return true;
   }
 

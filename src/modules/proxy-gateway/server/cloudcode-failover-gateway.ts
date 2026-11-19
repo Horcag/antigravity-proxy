@@ -1,5 +1,5 @@
 import { createRelayCompletionPromise, createNativeRelayEnd } from './native-relay-completion';
-import { observeAttemptStart, observeAccountOutcome, observeUpstreamStreamFailure } from '../../../observability/request-context';
+import { observeAttemptStart, observeAccountOutcome, observeUpstreamStreamFailure, observeSessionKey } from '../../../observability/request-context';
 import http from 'node:http';
 import http2 from 'node:http2';
 import https from 'node:https';
@@ -235,7 +235,7 @@ export class CloudCodeFailoverGateway {
       headers: http.IncomingHttpHeaders;
       bufferedBody?: Buffer;
     } | null = null;
-    const sessionKey = this.extractSessionKey(req, parsedBody);
+    const sessionKey = observeSessionKey(this.extractSessionKey(req, parsedBody));
     const requestId = crypto.randomUUID(); const attemptedAccountIds = new Set<string>();
     const anyLeaseService = this.accountLeaseService as any;
     const totalPoolAccounts = typeof anyLeaseService?.getAccountCount === 'function' ? anyLeaseService.getAccountCount() : (typeof anyLeaseService?.getUsableAccountCount === 'function' ? anyLeaseService.getUsableAccountCount() : (anyLeaseService?.getQuotaDiagnostics?.()?.accounts?.length ?? 5));

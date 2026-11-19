@@ -3,6 +3,8 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { z } from 'zod';
 import { ConfigManager, ConfigPersistenceError } from '@/modules/config/ipc/manager';
 import { type ProxyConfig } from '@/modules/config/types';
+import { QuotaPricingConfigSchema } from '@/observability/quota-analytics-types';
+import { BUILTIN_MODEL_RATES, DEFAULT_TIER_MONTHLY_USD, normalizePricingConfig } from '@/observability/pricing-catalog';
 import { getServerConfig, setServerConfig } from '@/server/server-config';
 
 const mapping = z.record(z.string().trim().min(1).max(200), z.string().trim().min(1).max(200));
@@ -28,6 +30,21 @@ export class ConsoleConfigService {
     return { scheduling_mode: c.scheduling_mode, max_wait_seconds: c.max_wait_seconds,
       max_concurrency_per_account: c.max_concurrency_per_account, request_timeout: c.request_timeout,
       custom_mapping: c.custom_mapping, anthropic_mapping: c.anthropic_mapping };
+  }
+  getQuotaPricing() {
+    const c = this.current();
+    return {
+      config: normalizePricingConfig(c.quota_pricing),
+      defaults: {
+        tier_monthly_usd: DEFAULT_TIER_MONTHLY_USD,
+        models: BUILTIN_MODEL_RATES,
+      },
+    };
+  }
+  async updateQuotaPricing(body: unknown) {
+    const next = parse(QuotaPricingConfigSchema, body);
+    await this.update(() => ({ quota_pricing: next }));
+    return this.getQuotaPricing();
   }
   private update(change: (current: ProxyConfig) => Partial<ProxyConfig>): Promise<void> {
     const operation = this.pending.catch(() => {}).then(async () => {
