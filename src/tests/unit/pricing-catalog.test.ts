@@ -83,9 +83,11 @@ describe('pricing-catalog', () => {
     // >= 200_001 -> input $4, output $18 => 0.25*4 + 0.1*18 = 2.8
     expect(longGem.total_usd).toBeCloseTo(2.8, 6);
 
-    expect(resolveModelRateCard('gpt-oss-120b-medium', defaults)).toBeNull();
+    expect(resolveModelRateCard('gpt-oss-120b-medium', defaults)).toMatchObject({
+      canonical_model: 'gpt-oss-120b', input: 0.15, cached_input: 0.075, output: 0.60,
+    });
     const unpriced = calculateRequestCost(
-      { model: 'gpt-oss-120b-medium', input_tokens: 1000, output_tokens: 200 },
+      { model: 'gpt-unknown-model', input_tokens: 1000, output_tokens: 200 },
       defaults,
     );
     expect(unpriced.priced).toBe(false);

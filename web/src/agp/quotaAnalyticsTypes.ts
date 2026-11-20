@@ -186,6 +186,15 @@ export interface QuotaAnalyticsResponse {
     verdict_delta_pct: number | null;
   };
   timeline: QuotaTimelinePoint[];
+  by_integration: Array<{
+    source: 'native' | 'api';
+    requests: number;
+    measured_requests: number;
+    priced_requests: number;
+    api_usd: number | null;
+    matched_drain_pp: number | null;
+    matched_intervals: number;
+  }>;
   resets: QuotaResetEvent[];
   efficiency: EfficiencyComparison;
   sessions: SessionUsageRow[];

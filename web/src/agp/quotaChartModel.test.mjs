@@ -50,13 +50,29 @@ test('createQuotaChartGeometry handles empty, single-point, direction toggle, an
   const rem = createQuotaChartGeometry(timeline, 'remaining', ['a1']);
   assert.equal(rem.points[0].pct, 90);
   assert.equal(rem.points[1].hasReset, true);
-  assert.equal(rem.points[1].resetLabel, '↺ +40%');
+  assert.deepEqual(rem.resetMarkers, [rem.points[1]]);
   assert.equal(rem.accountSeries.length, 1);
 
   const used = createQuotaChartGeometry(timeline, 'used', ['a1']);
   assert.equal(used.points[0].pct, 10);
   assert.equal(used.points[1].pct, 0);
   assert.equal(pointAtX(used.points, used.points[1].x), 1);
+});
+
+test('dense reset marks leave room at either viewport size and preserve point details', () => {
+  const timeline = Array.from({ length: 300 }, (_, i) => ({
+    time_ms: i,
+    pool_remaining_pct: 50,
+    api_usd: 0,
+    resets: [{ from_pct: 35, to_pct: 50, delta_pct: 15 }],
+  }));
+  for (const width of [335, 1850]) {
+    const layout = { width, height: 220, left: 52, right: 20, top: 24, bottom: 200 };
+    const plot = createQuotaChartGeometry(timeline, 'remaining', [], layout);
+    assert.equal(plot.points.filter((point) => point.hasReset).length, 300);
+    assert.ok(plot.resetMarkers.every((mark, i, all) => i === 0 || mark.x - all[i - 1].x >= 20));
+    assert.equal(plot.points.at(-1).x, width - layout.right);
+  }
 });
 
 test('formatters render Russian/USD/countdown safely', () => {

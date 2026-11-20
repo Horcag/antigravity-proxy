@@ -1,5 +1,6 @@
 import { createRelayCompletionPromise, createNativeRelayEnd } from './native-relay-completion';
-import { observeAttemptStart, observeAccountOutcome, observeUpstreamStreamFailure, observeSessionKey } from '../../../observability/request-context';
+import { observeAttemptStart, observeAccountOutcome, observeUpstreamStreamFailure, observeSessionKey, observeGrpcStatus } from '../../../observability/request-context';
+import { observedModelIdentifier } from '../../../observability/metadata';
 import http from 'node:http';
 import http2 from 'node:http2';
 import https from 'node:https';
@@ -76,6 +77,7 @@ export class CloudCodeFailoverGateway {
       if (trailers && typeof (res as any).addTrailers === 'function') {
         try { (res as any).addTrailers(trailers); } catch (err) { rejectAndTerminateDownstream(err); return false; }
       }
+      observeGrpcStatus(trailers?.['grpc-status'] ?? h['grpc-status']);
       return endDownstream(b);
     };
     const writeDownstreamChunk = (chunk: Buffer): boolean => {
@@ -222,9 +224,9 @@ export class CloudCodeFailoverGateway {
       return;
     }
     const parsedBody = preflight.parsedBody || null;
-    const modelName = extractModelName(urlPath, parsedBody);
-    observeNativeModel(req, modelName);
-    const requestedModel = modelName;
+    const requestedModel = extractModelName(urlPath, parsedBody);
+    const sentModel = observedModelIdentifier(requestedModel);
+    observeNativeModel(req, sentModel);
     const isReplaySafe = isReplaySafeOperation(method, urlPath, {
       hasAccountPinnedResources: preflight.hasAccountPinnedResources,
     });
@@ -249,7 +251,7 @@ export class CloudCodeFailoverGateway {
       }
       migrationAuthorization = createMigrationAuthorization(reason, sessionKey, binding, requestId) ?? undefined;
     };
-    migrationAuthorization = this.accountLeaseService?.authorizeBoundSessionMigration?.(sessionKey, modelName, requestId, true);
+    migrationAuthorization = this.accountLeaseService?.authorizeBoundSessionMigration?.(sessionKey, requestedModel, requestId, true);
     let activeLease: {
       account: CloudAccount;
       sessionKey?: string;
@@ -303,25 +305,25 @@ export class CloudCodeFailoverGateway {
         if (this.accountLeaseService) {
           if (typeof this.accountLeaseService.acquireAttemptLease === 'function') {
             activeLease = await this.accountLeaseService.acquireAttemptLease({
-              model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, allowUnadvertisedModelFallback: true,
+              model: requestedModel, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, allowUnadvertisedModelFallback: true,
               deferSessionBinding: true, migrationAuthorization, signal: requestAbortController.signal, requestId, affinityOwnerTimeoutMs,
             });
             if (!activeLease && migrationAuthorization) {
               migrationAuthorization = undefined;
               activeLease = await this.accountLeaseService.acquireAttemptLease({
-                model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, allowUnadvertisedModelFallback: true,
+                model: requestedModel, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, allowUnadvertisedModelFallback: true,
                 deferSessionBinding: true, migrationAuthorization: undefined, signal: requestAbortController.signal, requestId, affinityOwnerTimeoutMs,
               });
             }
             if (!activeLease && sessionKey) {
               activeLease = await this.accountLeaseService.acquireAttemptLease({
-                model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), allowUnadvertisedModelFallback: true,
+                model: requestedModel, excludeAccountIds: Array.from(attemptedAccountIds), allowUnadvertisedModelFallback: true,
                 signal: requestAbortController.signal, requestId,
               });
             }
           } else {
             const acc = await this.accountLeaseService.getNextToken({
-              model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, deferSessionBinding: true, allowUnadvertisedModelFallback: true,
+              model: requestedModel, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, deferSessionBinding: true, allowUnadvertisedModelFallback: true,
             });
             if (acc) {
               activeLease = { account: acc, sessionKey, generation: 1, tableIncarnation: this.accountLeaseService.getTableIncarnation?.(), releaseReservation: acc.releaseReservation ?? (() => {}) };
@@ -385,18 +387,16 @@ export class CloudCodeFailoverGateway {
           activeStopCandidateRenewal = () => { if (candidateRenewalTimer) { clearInterval(candidateRenewalTimer); candidateRenewalTimer = null; } };
         }
         leaseRetainedForSameAccount = false;
-
         if (clientAborted || res.destroyed) {
           releaseActiveLease();
           return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
         }
-
         const account = activeLease?.account ?? null;
         const effectiveModel =
           account && requestedModel && typeof this.accountLeaseService?.resolveDynamicModelForAccount === 'function'
             ? this.accountLeaseService.resolveDynamicModelForAccount(account.id, requestedModel)
             : requestedModel;
-        observeAttemptStart(account?.id, effectiveModel);
+        observeAttemptStart(account?.id, sentModel);
         const attemptStartedAt = performance.now();
         const { urlPath: attemptUrlPath, headers: upstreamHeaders, payloadToSend } = composeAttemptRequest({
           rawBody, reqHeaders: req.headers, targetHost, method, urlPath,
@@ -409,7 +409,7 @@ export class CloudCodeFailoverGateway {
         const handleFailureOutcome = async (
           failureEvidence: FailureEvidence, status: number, responseHeaders: http.IncomingHttpHeaders, responseBody?: Buffer,
         ): Promise<'continue' | 'terminal'> => {
-          if (account) observeAccountOutcome(account.id, effectiveModel, 'failure', undefined, status);
+          if (account) observeAccountOutcome(account.id, sentModel, 'failure', undefined, status);
           const hasAlternatives = resolveHasAlternativeAccounts(this.accountLeaseService, account, attemptedAccountIds, attempt, maxAttempts);
           const decision = evaluateRetryDecision({
             evidence: failureEvidence, attempt, maxAttempts, downstreamCommitted: responseCommitted,
@@ -818,7 +818,7 @@ export class CloudCodeFailoverGateway {
             return;
           }
           case 'VALIDATED_RESPONSE': {
-            if (account) observeAccountOutcome(account.id, effectiveModel, 'success', performance.now() - attemptStartedAt);
+            if (account) observeAccountOutcome(account.id, sentModel, 'success', performance.now() - attemptStartedAt);
             if (sessionKey && account) {
               if (isHintSessionKey(sessionKey)) {
                 if (typeof this.accountLeaseService?.recordCacheHint === 'function') {
@@ -891,7 +891,7 @@ export class CloudCodeFailoverGateway {
         });
         bodyStream.once('error', (err) => {
           if (downstreamClosed || (res as any).destroyed || res.writableEnded) return;
-          observeUpstreamStreamFailure(account?.id, effectiveModel);
+          observeUpstreamStreamFailure(account?.id, sentModel);
           logger.warn(
             '[CloudCodeGateway] Upstream streaming error: operation=upstream_stream reason=stream_error',
           );

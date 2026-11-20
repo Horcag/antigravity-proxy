@@ -10,6 +10,7 @@ export interface RequestObservation {
   requested_model?: string;
   effective_model?: string;
   account_id?: string;
+  grpc_status?: string;
   session_key?: string | null;
   attempts: AttemptRecord[];
   ttft_ms?: number | null;
@@ -26,6 +27,18 @@ const observations = new AsyncLocalStorage<RequestObservation>();
 export function createRequestObservation(): RequestObservation { return { request_id: randomUUID(), attempts: [], finished: false }; }
 export function runWithRequestObservation<T>(observation: RequestObservation, work: () => T): T { return observations.run(observation, work); }
 export function getRequestObservation(): RequestObservation | undefined { return observations.getStore(); }
+
+export function observeGrpcStatus(value: unknown): void {
+  const context = observations.getStore();
+  if (context && !context.finished && typeof value === 'string' && /^(?:[0-9]|1[0-6])$/.test(value)) {
+    context.grpc_status = value;
+    const attempt = context.attempts.at(-1);
+    if (attempt && value !== '0') {
+      attempt.outcome = 'failure';
+      attempt.error_category ??= 'upstream_error';
+    }
+  }
+}
 
 export function observeSessionKey(sessionKey: string | undefined): string | undefined {
   if (!sessionKey) return sessionKey;
@@ -46,10 +59,11 @@ export function observeSelectedAccount(accountId: string): void {
 }
 export function observeAttemptStart(accountId: string | undefined, model: string | undefined): void {
   const context = observations.getStore();
-  if (!context || context.finished || !accountId) return;
+  if (!context || context.finished) return;
+  context.effective_model = safeLabel(model, '') || undefined;
+  if (!accountId) return;
   const current = context.attempts.at(-1);
   if (!current || current.account_id !== accountId || current.outcome !== 'unknown') observeSelectedAccount(accountId);
-  context.effective_model = safeLabel(model, '') || undefined;
   const attempt = context.attempts.at(-1);
   if (attempt) attempt.effective_model = context.effective_model;
 }

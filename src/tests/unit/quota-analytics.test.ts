@@ -49,6 +49,60 @@ function req(acc: string, hoursFromT0: number, inputTokens: number, outputTokens
 }
 
 describe('quota-analytics engine', () => {
+  it('excludes blocked and expired snapshots but retains historical API cost', () => {
+    const nowMs = T0 + 72 * H;
+    const account = (id: string, disabled = false) => ({ id, label: id, subscription_tier: null, disabled });
+    const native = {
+      ...req('active', 71.8, 1_000_000, 500_000),
+      protocol: 'connect', route: '/v1internal:streamGenerateContent',
+      project_id: 'native', project_name: 'Antigravity и AGY',
+      requested_model: 'gpt-oss-120b-medium', effective_model: null,
+    };
+    const snapshot = (id: string, hour: number, fraction: number, resetAt = 168) => ({
+      ...snap(id, hour, fraction, resetAt), pool: 'third_party' as const, bucket_id: '3p-weekly',
+    });
+    const input: Parameters<typeof computeQuotaAnalytics>[0] = {
+      nowMs, fromMs: T0 + 70 * H, toExclusiveMs: nowMs + 1,
+      baselineFromMs: T0 + 68 * H, baselineToExclusiveMs: T0 + 70 * H,
+      preset: '24h', pool: 'third_party', window: 'weekly',
+      accountId: null, projectId: null, model: null, tier: null, splitAt: null,
+      idleGapMinutes: 5, minDeltaPp: 0.5, rawRetentionDays: 7, snapshotRetentionDays: 90,
+      accounts: [account('active'), account('blocked', true), account('expired'), account('forbidden'), account('stale')],
+      snapshots: [
+        snapshot('active', 71.6, 1, 125),
+        snapshot('active', 71.7, 1, 146),
+        snapshot('active', 71.9, 0, 146),
+        snapshot('blocked', 71.9, 1, 100),
+        snapshot('expired', 71.9, 1, 71.95),
+        snapshot('stale', 71, 1, 100),
+        snapshot('forbidden', 71.8, 0, 100),
+        { ...snapshot('forbidden', 71.9, 1, 110), is_forbidden: 1 },
+      ],
+      rawRequests: [native, { ...native, account_id: 'blocked' }],
+      baselineRawRequests: [], hourlyRollups: [], pricing,
+    };
+    const report = computeQuotaAnalytics(input);
+    expect(report.summary).toMatchObject({
+      api_usd: 0.90, pool_weekly_pct: 0, pool_account_equivalents: 0,
+      eligible_accounts: 4, stale_accounts: 3, nearest_reset_time: new Date(T0 + 146 * H).toISOString(),
+    });
+    expect(report.timeline.at(-1)).toMatchObject({ pool_remaining_pct: 0, active_accounts_count: 1 });
+    expect(report.resets).toEqual([]);
+    expect(report.by_integration).toEqual([{
+      source: 'native', requests: 2, measured_requests: 2, priced_requests: 2, api_usd: 0.90,
+      matched_drain_pp: 100, matched_intervals: 1,
+    }]);
+    const filtered = computeQuotaAnalytics({ ...input, accountId: 'blocked' });
+    expect(filtered.summary).toMatchObject({ eligible_accounts: 0, pool_weekly_pct: null });
+    expect(filtered.timeline).toEqual([]);
+
+    const mixed = computeQuotaAnalytics({
+      ...input,
+      rawRequests: [...input.rawRequests, { ...native, protocol: 'http', route: '/v1/chat/completions', project_id: 'api' }],
+    });
+    expect(mixed.by_integration.map((row) => row.matched_drain_pp)).toEqual([null, null]);
+  });
+
   it('detects resets, excludes reset jumps from drain, computes active time, and flags a >=15% nerf', () => {
     // Baseline period [0..48h]: 2 drain intervals consuming 10% total (1.00 -> 0.95 -> 0.90) with $6 API spend => $0.60 / 1%
     // Reset at 48h (0.90 -> 1.00) with new reset time!

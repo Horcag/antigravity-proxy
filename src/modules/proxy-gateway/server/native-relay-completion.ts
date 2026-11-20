@@ -1,5 +1,5 @@
 import { createNativeResponseUsage } from '../../../observability/native-response-usage';
-import { observeUpstreamStreamFailure } from '../../../observability/request-context';
+import { observeGrpcStatus, observeUpstreamStreamFailure } from '../../../observability/request-context';
 import type http from 'node:http';
 import type http2 from 'node:http2';
 import type { Readable } from 'node:stream';
@@ -73,7 +73,9 @@ export function createNativeRelayEnd(
   const responseUsage = createNativeResponseUsage(contentType, headers['content-encoding'] as string | undefined);
   const onStreamEnd = async () => {
     onUpstreamEnd();
-    await responseUsage.finish(!bodyStream.trailers?.['grpc-status'] || String(bodyStream.trailers['grpc-status']) === '0');
+    const grpcStatus = bodyStream.trailers?.['grpc-status'] ?? headers['grpc-status'];
+    observeGrpcStatus(grpcStatus);
+    await responseUsage.finish(grpcStatus === undefined || grpcStatus === '0');
     try {
       if (bodyStream.trailers && typeof res.addTrailers === 'function' && !res.writableEnded) res.addTrailers(bodyStream.trailers);
       if (!res.writableEnded) endDownstream();

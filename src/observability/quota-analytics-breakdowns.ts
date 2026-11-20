@@ -1,11 +1,65 @@
-import { round1, round4, type AccountMeta, type WorkloadEvent } from './quota-analytics-core';
+import { round1, round4, type AccountMeta, type DrainInterval, type WorkloadEvent } from './quota-analytics-core';
 import type {
+  IntegrationUsageRow,
   ModelCostRow,
   OptimizationHint,
   QuotaPreset,
   SessionUsageRow,
   ShiftVerdict,
 } from './quota-analytics-types';
+
+export function summarizeIntegrations(workload: WorkloadEvent[], intervals: DrainInterval[]): IntegrationUsageRow[] {
+  const rows = new Map<IntegrationUsageRow['source'], IntegrationUsageRow>();
+  const byAccountPool = new Map<string, WorkloadEvent[]>();
+  for (const event of workload) {
+    const source = event.integration;
+    if (!source) continue;
+    const row = rows.get(source) ?? {
+      source, requests: 0, measured_requests: 0, priced_requests: 0, api_usd: null,
+      matched_drain_pp: null, matched_intervals: 0,
+    };
+    row.requests++;
+    if (event.input_tokens !== null && event.output_tokens !== null) row.measured_requests++;
+    if (event.priced && event.api_usd !== null) {
+      row.priced_requests++;
+      row.api_usd = (row.api_usd ?? 0) + event.api_usd;
+    }
+    rows.set(source, row);
+    if (event.account_id && !event.failed) {
+      const key = `${event.account_id}|${event.pool}`;
+      const events = byAccountPool.get(key) ?? [];
+      events.push(event);
+      byAccountPool.set(key, events);
+    }
+  }
+
+  for (const events of byAccountPool.values()) events.sort((a, b) => a.time_ms - b.time_ms);
+  for (const interval of intervals) {
+    const events = byAccountPool.get(`${interval.account_id}|${interval.pool}`);
+    if (!events) continue;
+    let start = 0;
+    let end = events.length;
+    while (start < end) {
+      const middle = Math.floor((start + end) / 2);
+      if (events[middle].time_ms <= interval.start_ms) start = middle + 1;
+      else end = middle;
+    }
+    const source = events[start]?.integration;
+    if (!source || events[start].time_ms > interval.end_ms) continue;
+    let cursor = start + 1;
+    while (cursor < events.length && events[cursor].time_ms <= interval.end_ms && events[cursor].integration === source) cursor++;
+    if (cursor < events.length && events[cursor].time_ms <= interval.end_ms) continue;
+    const row = rows.get(source)!;
+    row.matched_intervals++;
+    row.matched_drain_pp = (row.matched_drain_pp ?? 0) + interval.drain_pct;
+  }
+
+  return Array.from(rows.values(), (row) => ({
+    ...row,
+    api_usd: row.api_usd === null ? null : round4(row.api_usd),
+    matched_drain_pp: row.matched_drain_pp === null ? null : round1(row.matched_drain_pp),
+  })).sort((a, b) => Number(b.source === 'native') - Number(a.source === 'native'));
+}
 
 function formatSessionLabel(sessionKey: string | null): string {
   if (!sessionKey) return 'Без идентификатора сессии';
@@ -61,13 +115,13 @@ export function aggregateWorkloadBreakdowns(
       pricedCount += 1;
       totalApiUsd += w.api_usd;
       cacheSavingsUsd += w.cache_savings_usd;
-    } else if (w.model) {
+    } else if (w.model && !w.canonical_model && w.input_tokens !== null && w.output_tokens !== null) {
       unpricedSet.add(w.model);
     }
 
     const mKey = w.model ?? 'Без модели';
     const mRow = modelMap.get(mKey) ?? {
-      model: mKey, canonical_model: null, pool: w.pool, requests: 0, failed_requests: 0,
+      model: mKey, canonical_model: w.canonical_model ?? null, pool: w.pool, requests: 0, failed_requests: 0,
       input_tokens: 0, cache_tokens: 0, cache_write_tokens: 0, output_tokens: 0, thought_tokens: 0,
       api_usd: w.priced ? 0 : null, cache_savings_usd: 0, cost_share_pct: null, priced: w.priced,
     };

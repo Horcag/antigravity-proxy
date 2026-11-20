@@ -59,6 +59,12 @@ const RATE_RULES: BuiltinRateRule[] = [
     source: 'Google AI Studio',
   },
   {
+    canonical: 'gpt-oss-120b',
+    prefixes: ['gpt-oss-120b', 'openai/gpt-oss-120b'],
+    card: { input: 0.15, cached_input: 0.075, output: 0.60 },
+    source: 'Groq API · https://console.groq.com/docs/model/openai/gpt-oss-120b',
+  },
+  {
     canonical: 'claude-opus-5-5',
     prefixes: ['claude-opus-5-5', 'claude-opus-5'],
     card: { input: 4.0, cached_input: 0.2, cache_write: 5.0, output: 20.0 },

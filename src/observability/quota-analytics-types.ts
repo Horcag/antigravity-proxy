@@ -98,6 +98,16 @@ export interface QuotaTimelinePoint {
   resets: QuotaResetEvent[];
 }
 
+export interface IntegrationUsageRow {
+  source: 'native' | 'api';
+  requests: number;
+  measured_requests: number;
+  priced_requests: number;
+  api_usd: number | null;
+  matched_drain_pp: number | null;
+  matched_intervals: number;
+}
+
 export interface PeriodEfficiencyStats {
   from: string;
   to_exclusive: string;
@@ -252,6 +262,7 @@ export interface QuotaAnalyticsResponse {
     verdict_delta_pct: number | null;
   };
   timeline: QuotaTimelinePoint[];
+  by_integration: IntegrationUsageRow[];
   resets: QuotaResetEvent[];
   efficiency: EfficiencyComparison;
   sessions: SessionUsageRow[];

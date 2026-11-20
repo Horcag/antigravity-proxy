@@ -121,7 +121,7 @@ describe('quota analytics & pricing console API integration', () => {
           },
         ],
       },
-      now - 3600_000,
+      now - 600_000,
     );
     store.record({
       time: new Date(now - 1800_000).toISOString(),
@@ -147,6 +147,8 @@ describe('quota analytics & pricing console API integration', () => {
     expect(analytics.body).not.toMatch(/secret-refresh-token|secret-access-token|admin-secret|proj-secret/);
     const json = analytics.json();
     expect(json.summary.api_usd).toBeCloseTo(6.1, 4);
+    expect(json.summary.pool_weekly_pct).toBe(90);
+    expect(json.by_integration).toEqual([expect.objectContaining({ source: 'api', api_usd: 6.1, requests: 1 })]);
     expect(json.sessions[0]).toMatchObject({ session_key: 'session:chat-42', requests: 1 });
 
     // Session filter on requests endpoint

@@ -1,4 +1,4 @@
-import { useId, useMemo, useState, type KeyboardEvent, type MouseEvent } from 'react';
+import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from 'react';
 import { Collapsible } from '@/components/ui/Collapsible';
 import type { AccountQuotaCostRow, QuotaTimelinePoint } from './quotaAnalyticsTypes';
 import {
@@ -39,6 +39,25 @@ export function QuotaTimelineChart({
   const descId = useId();
   const [selectedIdx, setSelectedIdx] = useState<number>();
   const [tableOpen, setTableOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const plotRef = useRef<SVGSVGElement>(null);
+  const [layout, setLayout] = useState(quotaChartLayout);
+  const hasChart = timeline.length >= 2;
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    const plot = plotRef.current;
+    if (!hasChart || !wrap || !plot) return;
+    const observer = new ResizeObserver(() => {
+      const { width, height } = plot.getBoundingClientRect();
+      if (width > 0 && height > 0) {
+        setLayout((current) => current.width === width && current.height === height
+          ? current
+          : { ...quotaChartLayout, width, height, bottom: height - 20 });
+      }
+    });
+    observer.observe(wrap);
+    return () => observer.disconnect();
+  }, [hasChart]);
 
   const accountIds = useMemo(() => accounts.map((a) => a.account_id), [accounts]);
   const accountLabels = useMemo(
@@ -46,8 +65,8 @@ export function QuotaTimelineChart({
     [accounts]
   );
   const geometry = useMemo(
-    () => createQuotaChartGeometry(timeline, direction, showAccountsOverlay ? accountIds : []),
-    [timeline, direction, showAccountsOverlay, accountIds]
+    () => createQuotaChartGeometry(timeline, direction, showAccountsOverlay ? accountIds : [], layout),
+    [timeline, direction, showAccountsOverlay, accountIds, layout]
   );
 
   const activeIndex =
@@ -59,7 +78,7 @@ export function QuotaTimelineChart({
 
   function locateX(event: MouseEvent<SVGSVGElement>): number {
     const bounds = event.currentTarget.getBoundingClientRect();
-    const x = ((event.clientX - bounds.left) / Math.max(1, bounds.width)) * quotaChartLayout.width;
+    const x = ((event.clientX - bounds.left) / Math.max(1, bounds.width)) * layout.width;
     return pointAtX(geometry.points, x);
   }
 
@@ -81,7 +100,7 @@ export function QuotaTimelineChart({
   }
 
   return (
-    <div className={styles.chartWrap}>
+    <div ref={wrapRef} className={styles.chartWrap}>
       <div className={chartStyles.legend}>
         <span className={chartStyles.timezone}>Самара · UTC+4 · Факт Google (снимки квот)</span>
         <div className={styles.pillGroup} role="group" aria-label="Направление шкалы квоты">
@@ -120,11 +139,12 @@ export function QuotaTimelineChart({
       ) : (
         <>
           <p id={descId} className={chartStyles.help}>
-            Линия показывает {direction === 'remaining' ? 'остаток пула (%)' : 'израсходованную квоту (%)'}. Зелёные пунктиры — сбросы квоты. Нажмите на точку или Enter, чтобы открыть запросы интервала.
+            Зелёные отметки показывают пополнения, соседние отметки сгруппированы. Нажмите на точку или Enter, чтобы открыть запросы интервала.
           </p>
           <svg
+            ref={plotRef}
             className={styles.chartSvg}
-            viewBox={`0 0 ${quotaChartLayout.width} ${quotaChartLayout.height}`}
+            viewBox={`0 0 ${layout.width} ${layout.height}`}
             preserveAspectRatio="none"
             role="group"
             tabIndex={0}
@@ -149,14 +169,14 @@ export function QuotaTimelineChart({
               <g key={pct}>
                 <line
                   className={chartStyles.grid}
-                  x1={quotaChartLayout.left}
-                  x2={quotaChartLayout.width - quotaChartLayout.right}
+                  x1={layout.left}
+                  x2={layout.width - layout.right}
                   y1={geometry.yPct(pct)}
                   y2={geometry.yPct(pct)}
                 />
                 <text
-                  className={chartStyles.axis}
-                  x={quotaChartLayout.left - 8}
+                  className={styles.chartAxis}
+                  x={layout.left - 8}
                   y={geometry.yPct(pct) + 4}
                   textAnchor="end"
                 >
@@ -196,21 +216,16 @@ export function QuotaTimelineChart({
                 />
               ))}
 
-            {geometry.points
-              .filter((gp) => gp.hasReset)
+            {geometry.resetMarkers
               .map((gp) => (
-                <g key={`rst-${gp.point.time_ms}`}>
-                  <line
-                    className={styles.resetLine}
-                    x1={gp.x}
-                    x2={gp.x}
-                    y1={quotaChartLayout.top}
-                    y2={quotaChartLayout.bottom}
-                  />
-                  <text className={styles.resetLabel} x={gp.x + 4} y={quotaChartLayout.top + 10}>
-                    {gp.resetLabel}
-                  </text>
-                </g>
+                <line
+                  key={gp.point.time_ms}
+                  className={styles.resetLine}
+                  x1={gp.x}
+                  x2={gp.x}
+                  y1={layout.top - 12}
+                  y2={layout.top - 3}
+                />
               ))}
 
             {activePoint && (
@@ -219,22 +234,19 @@ export function QuotaTimelineChart({
                   className={chartStyles.crosshair}
                   x1={activePoint.x}
                   x2={activePoint.x}
-                  y1={quotaChartLayout.top}
-                  y2={quotaChartLayout.bottom}
+                  y1={layout.top}
+                  y2={layout.bottom}
                 />
                 {activePoint.pct !== null && (
-                  <circle cx={activePoint.x} cy={activePoint.y} r={4.5} fill="#262626" />
+                  <circle cx={activePoint.x} cy={activePoint.y} r={4} className={styles.chartPoint} />
                 )}
               </g>
             )}
           </svg>
 
-          <div className={chartStyles.timeLabels} aria-hidden="true">
-            {[0, Math.floor((timeline.length - 1) / 2), timeline.length - 1]
-              .filter((idx, i, all) => all.indexOf(idx) === i)
-              .map((idx) => (
-                <span key={idx}>{formatSamaraDateTime(timeline[idx].time)}</span>
-              ))}
+          <div className={styles.chartDates} aria-hidden="true">
+            {formatSamaraDateTime(timeline[0].time)}
+            <span>{formatSamaraDateTime(timeline[timeline.length - 1].time)}</span>
           </div>
 
           {showAccountsOverlay && geometry.accountSeries.length > 0 && (
@@ -278,7 +290,7 @@ export function QuotaTimelineChart({
                 </span>
                 {activePoint.hasReset && (
                   <span className={chartStyles.success}>
-                    Сброс: {activePoint.point.resets.map((r) => `${r.account_label} ${r.from_pct}%→${r.to_pct}%`).join(', ')}
+                    Пополнения ({activePoint.point.resets.length}): {activePoint.point.resets.slice(0, 3).map((r) => `${r.account_label} ${r.from_pct}% → ${r.to_pct}%`).join(', ')}
                   </span>
                 )}
               </div>

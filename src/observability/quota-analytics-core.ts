@@ -12,18 +12,19 @@ export interface AccountMeta {
   label: string;
   subscription_tier: string | null;
   disabled: boolean;
-  last_refresh_at?: number | null;
 }
 
 export interface WorkloadEvent {
   time_ms: number;
   account_id: string | null;
   model: string | null;
+  canonical_model?: string | null;
   pool: QuotaPoolId | 'other';
   route: string;
   usage_schema: string | null;
   project_id: string;
   project_name: string;
+  integration?: 'native' | 'api';
   session_key: string | null;
   failed: boolean;
   duration_ms: number;
@@ -50,6 +51,14 @@ export interface DrainInterval {
 const RESET_JUMP_FRACTION = 0.02;
 const RESET_SHIFT_MS = 5 * 60_000;
 const ANCHOR_JITTER_MS = 60_000;
+export const QUOTA_FRESH_MS = 30 * 60_000;
+
+export function isCurrentQuota(snapshot: QuotaSnapshotRow, atMs: number): boolean {
+  const resetMs = Date.parse(snapshot.reset_time ?? '');
+  return !snapshot.is_forbidden
+    && atMs - snapshot.observed_ms <= QUOTA_FRESH_MS
+    && (!Number.isFinite(resetMs) || resetMs > atMs);
+}
 
 export function round1(v: number): number {
   return Math.round(v * 10) / 10;
@@ -93,16 +102,16 @@ export function detectResetsAndDrainIntervals(
     for (let i = 1; i < series.length; i += 1) {
       const prev = series[i - 1];
       const curr = series[i];
+      if (prev.is_forbidden || curr.is_forbidden) {
+        reboundBlockedAnchor = undefined;
+        continue;
+      }
       const prevResetMs = prev.reset_time ? Date.parse(prev.reset_time) : NaN;
       const currResetMs = curr.reset_time ? Date.parse(curr.reset_time) : NaN;
-      const resetJump = curr.remaining_fraction > prev.remaining_fraction + RESET_JUMP_FRACTION;
-      const resetShift =
-        Number.isFinite(prevResetMs) &&
-        Number.isFinite(currResetMs) &&
-        currResetMs - prevResetMs > RESET_SHIFT_MS &&
-        curr.remaining_fraction >= prev.remaining_fraction - 0.005;
+      const increase = curr.remaining_fraction - prev.remaining_fraction;
+      const crossedReset = prevResetMs <= curr.observed_ms && currResetMs - prevResetMs > RESET_SHIFT_MS;
 
-      if (resetJump || resetShift) {
+      if (increase > RESET_JUMP_FRACTION || (crossedReset && increase > 0.001)) {
         reboundBlockedAnchor = undefined;
         resets.push({
           observed_at: curr.observed_at,
@@ -113,13 +122,17 @@ export function detectResetsAndDrainIntervals(
           window: curr.window,
           from_pct: round1(prev.remaining_fraction * 100),
           to_pct: round1(curr.remaining_fraction * 100),
-          delta_pct: round1((curr.remaining_fraction - prev.remaining_fraction) * 100),
+          delta_pct: round1(increase * 100),
           new_reset_time: curr.reset_time,
           boundary_accuracy: prev.remaining_fraction < 0.99 ? 'exact' : 'inferred',
         });
         continue;
       }
 
+      if (crossedReset) {
+        reboundBlockedAnchor = undefined;
+        continue;
+      }
       if (curr.remaining_fraction > prev.remaining_fraction + 0.001) {
         reboundBlockedAnchor = curr.reset_time ?? null;
         continue;
@@ -160,16 +173,17 @@ export function buildPoolTimeline(options: {
   const { snapshots, resets, workload, eligibleAccountIds, poolFilter, window, fromMs, toMs } = options;
   const eligibleSet = new Set(eligibleAccountIds);
   const filteredSnaps = snapshots
-    .filter((s) => s.window === window && matchesPool(s.pool, poolFilter) && (eligibleSet.size === 0 || eligibleSet.has(s.account_id)))
+    .filter((s) => s.window === window && matchesPool(s.pool, poolFilter) && eligibleSet.has(s.account_id))
     .sort((a, b) => a.observed_ms - b.observed_ms);
 
   const timeSet = new Set<number>();
   for (const s of filteredSnaps) {
     if (s.observed_ms >= fromMs && s.observed_ms < toMs) timeSet.add(s.observed_ms);
   }
+  if (timeSet.size) timeSet.add(toMs - 1);
   const resetMsSet = new Set<number>();
   for (const r of resets) {
-    if (r.window === window && matchesPool(r.pool, poolFilter) && r.observed_ms >= fromMs && r.observed_ms < toMs) {
+    if (r.window === window && matchesPool(r.pool, poolFilter) && eligibleSet.has(r.account_id) && r.observed_ms >= fromMs && r.observed_ms < toMs) {
       timeSet.add(r.observed_ms);
       resetMsSet.add(r.observed_ms);
     }
@@ -185,7 +199,6 @@ export function buildPoolTimeline(options: {
   }
   if (timestamps.length === 0) return [];
 
-  const maxStaleMs = window === '5h' ? 2 * 3_600_000 : 24 * 3_600_000;
   const latestByAccPool = new Map<string, QuotaSnapshotRow>();
   let snapCursor = 0;
   while (snapCursor < filteredSnaps.length && filteredSnaps[snapCursor].observed_ms < fromMs) {
@@ -222,11 +235,11 @@ export function buildPoolTimeline(options: {
     const accValues = new Map<string, number[]>();
     const staleAccounts = new Set<string>();
     for (const s of latestByAccPool.values()) {
-      if (t - s.observed_ms <= maxStaleMs) {
+      if (isCurrentQuota(s, t)) {
         const list = accValues.get(s.account_id) ?? [];
         list.push(s.remaining_fraction * 100);
         accValues.set(s.account_id, list);
-      } else {
+      } else if (!s.is_forbidden) {
         staleAccounts.add(s.account_id);
       }
     }

@@ -8,6 +8,12 @@ export function safeLabel(value: unknown, fallback = 'unknown', privateValues: s
   return typeof value === 'string' && /^[\p{L}\p{N}_. @:+-]{1,100}$/u.test(value) ? value : fallback;
 }
 
+export function observedModelIdentifier(value: unknown): string | undefined {
+  if (typeof value !== 'string') return;
+  const model = value.replace(/^models\//, '');
+  if (/^[A-Za-z0-9_.:-]{1,100}$/.test(model)) return safeLabel(model, '') || undefined;
+}
+
 export function normalizedRoute(value: unknown): string {
   const path = typeof value === 'string' ? value.split('?')[0] : '';
   if (path === '/') return '/';

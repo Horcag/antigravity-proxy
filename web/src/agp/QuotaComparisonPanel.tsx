@@ -91,8 +91,8 @@ export function QuotaComparisonPanel({
           ],
           [
             'Выборка расхода / интервалов',
-            `${baseline.sample_drain_pct}% (${baseline.interval_count} инт.)`,
-            `${current.sample_drain_pct}% (${current.interval_count} инт.)`,
+            `${baseline.sample_drain_pct} п.п. (${baseline.interval_count} инт.)`,
+            `${current.sample_drain_pct} п.п. (${current.interval_count} инт.)`,
             '≥ 5% и ≥ 2 инт.',
           ],
           [

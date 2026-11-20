@@ -19,7 +19,6 @@ export interface QuotaGeometryPoint {
   barTop: number;
   barHeight: number;
   hasReset: boolean;
-  resetLabel: string;
 }
 
 export interface QuotaAccountSeries {
@@ -39,9 +38,10 @@ function projectValue(pct: number | null, direction: QuotaChartDirection): numbe
 export function createQuotaChartGeometry(
   timeline: QuotaTimelinePoint[],
   direction: QuotaChartDirection = 'remaining',
-  accountIds: string[] = []
+  accountIds: string[] = [],
+  layout = quotaChartLayout,
 ) {
-  const { width, left, right, top, bottom } = quotaChartLayout;
+  const { width, left, right, top, bottom } = layout;
   const fromMs = timeline.length ? timeline[0].time_ms : 0;
   const toMs = timeline.length
     ? Math.max(fromMs + 1, timeline[timeline.length - 1].time_ms)
@@ -58,13 +58,6 @@ export function createQuotaChartGeometry(
   const points: QuotaGeometryPoint[] = timeline.map((point) => {
     const pct = projectValue(point.pool_remaining_pct, direction);
     const barH = point.api_usd > 0 ? Math.max(2, (point.api_usd / maxUsd) * (bottom - top) * 0.45) : 0;
-    const maxDelta = point.resets.reduce((acc, r) => (Math.abs(r.delta_pct) > Math.abs(acc) ? r.delta_pct : acc), 0);
-    const hasReset = point.resets.length > 0;
-    const resetLabel = hasReset
-      ? maxDelta > 0
-        ? `↺ +${Math.round(maxDelta)}%`
-        : '↺ сброс'
-      : '';
     return {
       point,
       x: x(point.time_ms),
@@ -72,8 +65,7 @@ export function createQuotaChartGeometry(
       pct,
       barTop: bottom - barH,
       barHeight: barH,
-      hasReset,
-      resetLabel,
+      hasReset: point.resets.length > 0,
     };
   });
 
@@ -115,7 +107,12 @@ export function createQuotaChartGeometry(
     }))
     .filter((s) => Boolean(s.path));
 
-  return { points, poolLinePath, poolAreaPath, accountSeries, yPct, fromMs, toMs, maxUsd };
+  const resetMarkers: QuotaGeometryPoint[] = [];
+  for (const point of points) {
+    const previous = resetMarkers[resetMarkers.length - 1];
+    if (point.hasReset && point.x - (previous?.x ?? -Infinity) >= 20) resetMarkers.push(point);
+  }
+  return { points, poolLinePath, poolAreaPath, accountSeries, resetMarkers, yPct, fromMs, toMs, maxUsd };
 }
 
 export function pointAtX(points: QuotaGeometryPoint[], x: number): number {

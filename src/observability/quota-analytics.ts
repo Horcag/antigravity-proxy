@@ -1,10 +1,12 @@
 import { calculateRequestCost, resolveAccountMonthlyUsd } from './pricing-catalog';
 import { requestMetadata } from './metadata';
-import { aggregateWorkloadBreakdowns, buildOptimizationHints } from './quota-analytics-breakdowns';
+import { aggregateWorkloadBreakdowns, buildOptimizationHints, summarizeIntegrations } from './quota-analytics-breakdowns';
 import {
   buildPoolTimeline,
   detectResetsAndDrainIntervals,
+  isCurrentQuota,
   matchesPool,
+  QUOTA_FRESH_MS,
   round1,
   round4,
   type AccountMeta,
@@ -74,6 +76,7 @@ function rollupsToWorkload(rollups: HourlyRollupRow[], pricing: QuotaPricingConf
       time_ms: r.hour_ms + 1_800_000,
       account_id: r.account_id || null,
       model: r.model || null,
+      canonical_model: cost.canonical_model,
       pool: r.pool,
       route: '',
       usage_schema: r.usage_schema,
@@ -125,11 +128,13 @@ function computePaceHealth(
 
 export function computeQuotaAnalytics(input: ComputeQuotaAnalyticsInput): QuotaAnalyticsResponse {
   const accountsById = new Map(input.accounts.map((a) => [a.id, a]));
-  const eligibleAccounts = input.accounts.filter((a) => {
+  const scopedAccounts = input.accounts.filter((a) => {
     if (input.accountId && a.id !== input.accountId) return false;
     if (input.tier && (a.subscription_tier ?? '').toLowerCase() !== input.tier.toLowerCase()) return false;
     return true;
   });
+  const eligibleAccounts = scopedAccounts.filter((a) => !a.disabled);
+  const scopedIds = new Set(scopedAccounts.map((a) => a.id));
   const eligibleIds = eligibleAccounts.map((a) => a.id);
   const eligibleSet = new Set(eligibleIds);
 
@@ -137,7 +142,7 @@ export function computeQuotaAnalytics(input: ComputeQuotaAnalyticsInput): QuotaA
     rows.filter((r) => {
       if (requestMetadata(r.route, r.protocol, r.account_id).request_kind !== 'inference') return false;
       if (input.accountId && r.account_id !== input.accountId) return false;
-      if (input.tier && !eligibleSet.has(r.account_id ?? '')) return false;
+      if (input.tier && !scopedIds.has(r.account_id ?? '')) return false;
       if (input.projectId && r.project_id !== input.projectId) return false;
       if (input.model) {
         const m = (r.effective_model ?? r.requested_model ?? '').toLowerCase();
@@ -157,7 +162,7 @@ export function computeQuotaAnalytics(input: ComputeQuotaAnalyticsInput): QuotaA
       input.hourlyRollups.filter((r) => {
         if (r.hour_ms < Math.floor(fromMs / 3_600_000) * 3_600_000 || r.hour_ms >= toMs) return false;
         if (input.accountId && r.account_id !== input.accountId) return false;
-        if (input.tier && !eligibleSet.has(r.account_id)) return false;
+        if (input.tier && !scopedIds.has(r.account_id)) return false;
         if (input.model && !r.model.toLowerCase().includes(input.model.toLowerCase())) return false;
         return matchesPool(r.pool, input.pool);
       }),
@@ -174,10 +179,16 @@ export function computeQuotaAnalytics(input: ComputeQuotaAnalyticsInput): QuotaA
     ? buildWorkloadFromRaw(filterRawInference(input.baselineRawRequests), input.pricing).filter((w) => matchesPool(w.pool, input.pool))
     : filteredRollups(input.baselineFromMs, input.baselineToExclusiveMs);
 
-  const filteredSnaps = input.snapshots.filter((s) => (eligibleSet.size === 0 || eligibleSet.has(s.account_id)) && matchesPool(s.pool, input.pool));
+  const filteredSnaps = input.snapshots.filter((s) => eligibleSet.has(s.account_id) && matchesPool(s.pool, input.pool));
   const { resets, intervals } = detectResetsAndDrainIntervals(filteredSnaps, accountsById, input.minDeltaPp);
+  const integrationIntervals = input.projectId || input.model ? [] : intervals.filter((iv) =>
+    iv.window === input.window &&
+    iv.end_ms - iv.start_ms <= QUOTA_FRESH_MS &&
+    iv.start_ms >= Math.max(input.fromMs, rawEarliestMs) &&
+    iv.end_ms < input.toExclusiveMs
+  );
   const timeline = buildPoolTimeline({
-    snapshots: input.snapshots, resets, workload: currentWorkload, eligibleAccountIds: eligibleIds,
+    snapshots: filteredSnaps, resets, workload: currentWorkload, eligibleAccountIds: eligibleIds,
     poolFilter: input.pool, window: input.window, fromMs: input.fromMs, toMs: input.toExclusiveMs,
   });
 
@@ -191,9 +202,12 @@ export function computeQuotaAnalytics(input: ComputeQuotaAnalyticsInput): QuotaA
 
   const latestByAccWinPool = new Map<string, QuotaSnapshotRow>();
   for (const s of filteredSnaps) {
-    if (s.observed_ms <= input.toExclusiveMs) latestByAccWinPool.set(`${s.account_id}|${s.window}|${s.pool}|${s.bucket_id}`, s);
+    const key = `${s.account_id}|${s.window}|${s.pool}|${s.bucket_id}`;
+    const previous = latestByAccWinPool.get(key);
+    if (s.observed_ms < input.toExclusiveMs && (!previous || s.observed_ms >= previous.observed_ms)) latestByAccWinPool.set(key, s);
   }
 
+  const asOfMs = Math.min(input.nowMs, input.toExclusiveMs - 1);
   const periodDays = Math.max(0.01, (input.toExclusiveMs - input.fromMs) / 86_400_000);
   let monthlyTotalUsd: number | null = 0;
   let staleCount = 0;
@@ -210,14 +224,15 @@ export function computeQuotaAnalytics(input: ComputeQuotaAnalyticsInput): QuotaA
     else if (monthlyTotalUsd !== null) monthlyTotalUsd += monthly;
 
     const accSnaps = Array.from(latestByAccWinPool.values()).filter((s) => s.account_id === acc.id);
-    const wSnaps = accSnaps.filter((s) => s.window === 'weekly');
-    const hSnaps = accSnaps.filter((s) => s.window === '5h');
+    const currentSnaps = accSnaps.filter((s) => isCurrentQuota(s, asOfMs));
+    const wSnaps = currentSnaps.filter((s) => s.window === 'weekly');
+    const hSnaps = currentSnaps.filter((s) => s.window === '5h');
     const weeklyPct = wSnaps.length ? round1((wSnaps.reduce((a, b) => a + b.remaining_fraction, 0) / wSnaps.length) * 100) : null;
     const fiveHPct = hSnaps.length ? round1((hSnaps.reduce((a, b) => a + b.remaining_fraction, 0) / hSnaps.length) * 100) : null;
-    const wReset = wSnaps.map((s) => s.reset_time).filter((v): v is string => Boolean(v)).sort()[0] ?? null;
-    const hReset = hSnaps.map((s) => s.reset_time).filter((v): v is string => Boolean(v)).sort()[0] ?? null;
-    const latestMs = accSnaps.reduce((mx, s) => Math.max(mx, s.observed_ms), acc.last_refresh_at ?? 0);
-    const stale = !latestMs || input.nowMs - latestMs > 30 * 60_000;
+    const wReset = wSnaps.map((s) => s.reset_time).filter((v): v is string => Date.parse(v ?? '') > asOfMs).sort()[0] ?? null;
+    const hReset = hSnaps.map((s) => s.reset_time).filter((v): v is string => Date.parse(v ?? '') > asOfMs).sort()[0] ?? null;
+    const latestMs = accSnaps.reduce((mx, s) => Math.max(mx, s.observed_ms), 0);
+    const stale = !(input.window === '5h' ? hSnaps : wSnaps).length;
     if (stale) staleCount += 1;
     if (weeklyPct !== null) weeklyPcts.push(weeklyPct);
     if (fiveHPct !== null) fiveHPcts.push(fiveHPct);
@@ -243,6 +258,7 @@ export function computeQuotaAnalytics(input: ComputeQuotaAnalyticsInput): QuotaA
   const poolWeeklyPct = weeklyPcts.length ? round1(weeklyPcts.reduce((a, b) => a + b, 0) / weeklyPcts.length) : null;
   const pool5hPct = fiveHPcts.length ? round1(fiveHPcts.reduce((a, b) => a + b, 0) / fiveHPcts.length) : null;
   const selectedPoolPct = input.window === '5h' ? pool5hPct : poolWeeklyPct;
+  const selectedPcts = input.window === '5h' ? fiveHPcts : weeklyPcts;
   const nearestReset = futureResets.sort()[0] ?? null;
   const avgAccountDrainPct = eligibleAccounts.length > 0 ? currentEff.sample_drain_pct / Math.max(1, eligibleAccounts.length) : 0;
   const pctPerActiveHour = active.active_hours > 0 && avgAccountDrainPct > 0 ? round4(avgAccountDrainPct / active.active_hours) : null;
@@ -277,7 +293,7 @@ export function computeQuotaAnalytics(input: ComputeQuotaAnalyticsInput): QuotaA
       cache_hit_pct: cacheHitPct, subscription_monthly_usd: monthlyTotalUsd, period_subscription_usd: periodSubUsd,
       roi_ratio: periodSubUsd && periodSubUsd > 0 ? round4(agg.totalApiUsd / periodSubUsd) : null,
       pool_weekly_pct: poolWeeklyPct, pool_5h_pct: pool5hPct,
-      pool_account_equivalents: round4((selectedPoolPct ?? 0) / 100 * Math.max(0, eligibleAccounts.length - staleCount)),
+      pool_account_equivalents: round4(selectedPcts.reduce((sum, pct) => sum + pct, 0) / 100),
       eligible_accounts: eligibleAccounts.length, stale_accounts: staleCount, nearest_reset_time: nearestReset,
       elapsed_window_pct: pace.elapsed_window_pct, pace_delta_pct: pace.pace_delta_pct, pace_status: pace.pace_status,
       active_minutes: active.active_minutes, active_hours: active.active_hours, wall_hours: active.wall_hours,
@@ -290,7 +306,8 @@ export function computeQuotaAnalytics(input: ComputeQuotaAnalyticsInput): QuotaA
       implied_100pct_usd: currentEff.implied_100pct_usd, implied_monthly_usd: currentEff.implied_monthly_usd,
       verdict: efficiency.verdict, verdict_delta_pct: efficiency.usd_per_1pct_delta_pct,
     },
-    timeline, resets: resets.filter((r) => r.observed_ms >= input.fromMs && r.observed_ms < input.toExclusiveMs),
+    timeline, resets: resets.filter((r) => r.window === input.window && r.observed_ms >= input.fromMs && r.observed_ms < input.toExclusiveMs),
+    by_integration: summarizeIntegrations(currentRawWorkload, integrationIntervals),
     efficiency, sessions: agg.sessions, by_model: agg.byModel, by_account: byAccount, spikes: agg.spikes, hints,
   };
 }

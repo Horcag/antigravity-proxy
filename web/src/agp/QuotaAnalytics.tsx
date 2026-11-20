@@ -24,7 +24,7 @@ import type { Account, Project } from './types';
 import { Button, Card, DataTable, ErrorMessage, PageHeader, useMutation, useResource } from './shared';
 import styles from './QuotaAnalytics.module.scss';
 
-type BreakdownTab = 'sessions' | 'models' | 'accounts' | 'resets';
+type BreakdownTab = 'integrations' | 'sessions' | 'models' | 'accounts' | 'resets';
 
 const presetLabels: Array<[QuotaPreset, string]> = [
   ['24h', '24 ч'],
@@ -67,7 +67,7 @@ function buildAnalyticsQuery(params: URLSearchParams): string {
 export function QuotaAnalytics() {
   const [params, setParams] = useSearchParams();
   const navigate = useNavigate();
-  const [tab, setTab] = useState<BreakdownTab>('sessions');
+  const [tab, setTab] = useState<BreakdownTab>('integrations');
   const [direction, setDirection] = useState<QuotaChartDirection>('remaining');
   const [showAccountsOverlay, setShowAccountsOverlay] = useState(false);
   const [showUsdBars, setShowUsdBars] = useState(true);
@@ -256,7 +256,7 @@ export function QuotaAnalytics() {
           {dq.heterogeneous_tiers && `Смешанные тарифы (${dq.tier_breakdown.map((t) => `${t.tier}: ${t.accounts}`).join(', ')}) — при необходимости отфильтруйте в Pro-режиме. `}
           {dq.unpriced_models.length > 0 && `Без тарифа (не учтены в $): ${dq.unpriced_models.join(', ')}. Покрытие: ${dq.priced_coverage_pct ?? 0}%. `}
           {dq.using_hourly_rollups && `Для периода > ${dq.raw_retention_days} д используются часовые агрегаты (до ${dq.snapshot_retention_days} д). `}
-          {(s?.stale_accounts ?? 0) > 0 && `Устаревшие снимки квот (>30м): ${s?.stale_accounts}.`}
+          {(s?.stale_accounts ?? 0) > 0 && `Без актуального снимка выбранного окна: ${s?.stale_accounts} из ${s?.eligible_accounts} аккаунтов.`}
         </p>
       )}
 
@@ -287,13 +287,14 @@ export function QuotaAnalytics() {
             <div className={styles.progressTrack}>
               <div
                 className={`${styles.progressFill} ${s?.pace_status === 'will_exhaust' ? styles.progressDanger : s?.pace_status === 'tight' ? styles.progressTight : ''}`}
-                style={{ width: `${Math.max(2, Math.min(100, activePoolPct))}%` }}
+                style={{ width: `${Math.min(100, activePoolPct)}%` }}
               />
             </div>
           )}
           <div className={styles.kpiSub}>
             <span>
-              5ч: {s?.pool_5h_pct ?? '—'}% · Нед: {s?.pool_weekly_pct ?? '—'}% · Сброс: {formatCountdownUntil(s?.nearest_reset_time)}
+              5ч: {s?.pool_5h_pct == null ? '—' : `${s.pool_5h_pct}%`} · Нед: {s?.pool_weekly_pct == null ? '—' : `${s.pool_weekly_pct}%`}
+              {s?.nearest_reset_time && ` · Ближайший сброс: ${formatCountdownUntil(s.nearest_reset_time)}`}
             </span>
             <span>
               {s?.pace_delta_pct !== null && s?.pace_delta_pct !== undefined
@@ -340,7 +341,7 @@ export function QuotaAnalytics() {
             <span>
               {s?.verdict_delta_pct !== null && s?.verdict_delta_pct !== undefined
                 ? `Сдвиг к прошлому периоду: ${s.verdict_delta_pct > 0 ? '+' : ''}${s.verdict_delta_pct}%`
-                : `Выборка: ${data?.efficiency.current.sample_drain_pct ?? 0}% (${data?.efficiency.current.interval_count ?? 0} инт.)`}
+                : `Выборка: ${data?.efficiency.current.sample_drain_pct ?? 0} п.п. по аккаунтам (${data?.efficiency.current.interval_count ?? 0} инт.)`}
             </span>
           </div>
         </Card>
@@ -384,6 +385,7 @@ export function QuotaAnalytics() {
             <div className={styles.pillGroup} role="tablist" aria-label="Разрез потребления">
               {(
                 [
+                  ['integrations', 'Интеграции'],
                   ['sessions', `Сессии (${data.sessions.length})`],
                   ['models', `Модели (${data.by_model.length})`],
                   ['accounts', `Аккаунты (${data.by_account.length})`],
@@ -404,6 +406,25 @@ export function QuotaAnalytics() {
             </div>
           }
         >
+          {tab === 'integrations' && (
+            <div className="agp-stack">
+              <DataTable
+                headers={['Источник запросов', 'Запросы', 'С тарифом и токенами', 'API-эквивалент', 'Расход по снимкам квоты']}
+                rows={(data.by_integration ?? []).map((row) => [
+                  row.source === 'native' ? 'Antigravity / AGY' : 'API прокси',
+                  row.requests.toLocaleString('ru-RU'),
+                  `${row.priced_requests.toLocaleString('ru-RU')} из ${row.measured_requests.toLocaleString('ru-RU')}`,
+                  formatUsd(row.api_usd),
+                  row.matched_drain_pp !== null ? `${row.matched_drain_pp} п.п. · ${row.matched_intervals} инт.` : 'Неизвестно',
+                ])}
+                empty="За выбранный период нет детальных логов запросов"
+              />
+              <small className="agp-muted">
+                Расход суммируется по аккаунтам за интервалы между снимками, в которых был один источник запросов.
+                Источники доступны за период хранения детальных логов ({dq?.raw_retention_days} д).
+              </small>
+            </div>
+          )}
           {tab === 'sessions' && (
             <DataTable
               headers={['Сессия / контекст', 'Проект и модель', 'Запросы', 'Вход / кэш / выход (+thinking)', 'Cache Hit', 'API-$ (доля)', 'Последний запрос']}
@@ -430,7 +451,7 @@ export function QuotaAnalytics() {
                 `${m.requests} (ош: ${m.failed_requests})`,
                 `${formatTokensCompact(m.input_tokens)} / ${formatTokensCompact(m.cache_tokens)} / ${formatTokensCompact(m.output_tokens)} (+${formatTokensCompact(m.thought_tokens)})`,
                 formatUsd(m.cache_savings_usd, 3),
-                m.priced ? `${formatUsd(m.api_usd, 3)}${m.cost_share_pct !== null ? ` (${m.cost_share_pct}%)` : ''}` : 'Без тарифа',
+                m.priced ? `${formatUsd(m.api_usd, 3)}${m.cost_share_pct !== null ? ` (${m.cost_share_pct}%)` : ''}` : m.canonical_model ? 'Нет токенов' : 'Без оценки',
               ])}
             />
           )}
@@ -444,7 +465,7 @@ export function QuotaAnalytics() {
                 `${a.requests} (ош: ${a.failed_requests})`,
                 a.monthly_usd !== null ? formatUsd(a.monthly_usd, 0) : 'Неизвестно',
                 `${formatUsd(a.api_usd, 2)}${a.roi_ratio !== null ? ` (${a.roi_ratio}×)` : ''}`,
-                `${a.drain_pct}% · ${formatUsd(a.usd_per_1pct, 3)}`,
+                `${a.drain_pct} п.п. · ${formatUsd(a.usd_per_1pct, 3)}`,
               ])}
             />
           )}
@@ -456,7 +477,7 @@ export function QuotaAnalytics() {
                   formatSamaraDateTime(r.observed_at),
                   r.account_label,
                   `${r.pool} · ${r.window}`,
-                  `${r.from_pct}% → ${r.to_pct}% (+${r.delta_pct}%)`,
+                  `${r.from_pct}% → ${r.to_pct}% (+${r.delta_pct} п.п.)`,
                   r.boundary_accuracy === 'exact' ? 'Точно' : 'Прибл.',
                   formatSamaraDateTime(r.new_reset_time),
                 ])}

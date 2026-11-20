@@ -2,6 +2,7 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import type { CloudQuotaData } from '@/modules/cloud-account/types';
 import { getRequestHistoryStore } from '@/observability/request-history';
 import { computeQuotaAnalytics } from '@/observability/quota-analytics';
+import { detectResetsAndDrainIntervals } from '@/observability/quota-analytics-core';
 import type {
   QuotaAnalyticsResponse,
   QuotaPoolFilter,
@@ -49,7 +50,7 @@ export class ConsoleQuotaService {
     const store = getRequestHistoryStore();
     const accountList = await this.accounts.list();
     for (const acc of accountList) {
-      if (acc.quota) {
+      if (acc.quota && !acc.disabled && !acc.review_required) {
         store.quotaHistory.seedAccountSnapshotIfMissing(acc.id, acc.quota as unknown as CloudQuotaData);
       }
     }
@@ -77,11 +78,15 @@ export class ConsoleQuotaService {
         ...(query.pool !== 'all' ? { pool: query.pool } : {}),
         ...(query.accountId ? { accountId: query.accountId } : {}),
       });
-      const resetCandidates = recentSnaps
-        .filter((s, idx, arr) => idx > 0 && s.remaining_fraction > arr[idx - 1].remaining_fraction + 0.02)
-        .map((s) => s.observed_ms);
-      const lastReset = resetCandidates.length ? Math.max(...resetCandidates) : undefined;
-      if (lastReset && lastReset < toExclusiveMs) {
+      const eligibleIds = new Set(accountList.filter((a) =>
+        !a.disabled && !a.review_required &&
+        (!query.tier || a.quota?.subscription_tier?.toLowerCase() === query.tier.toLowerCase())
+      ).map((a) => a.id));
+      const { resets } = detectResetsAndDrainIntervals(
+        recentSnaps.filter((s) => eligibleIds.has(s.account_id)), new Map(), query.minDeltaPp,
+      );
+      const lastReset = resets.at(-1)?.observed_ms;
+      if (lastReset) {
         fromMs = lastReset;
       }
     }
@@ -125,10 +130,8 @@ export class ConsoleQuotaService {
     const pricing = this.config.getQuotaPricing().config;
     const summaryMeta = store.getUsageSummary({ limit: 1 });
     const latestTierByAccount = new Map<string, string>();
-    const latestObservedByAccount = new Map<string, number>();
     for (const s of snapshots) {
       if (s.subscription_tier) latestTierByAccount.set(s.account_id, s.subscription_tier);
-      latestObservedByAccount.set(s.account_id, Math.max(latestObservedByAccount.get(s.account_id) ?? 0, s.observed_ms));
     }
 
     return computeQuotaAnalytics({
@@ -154,8 +157,7 @@ export class ConsoleQuotaService {
         id: a.id,
         label: a.email || a.name || a.id,
         subscription_tier: a.quota?.subscription_tier ?? latestTierByAccount.get(a.id) ?? null,
-        disabled: Boolean(a.disabled),
-        last_refresh_at: a.quota?.last_successful_refresh_at ?? latestObservedByAccount.get(a.id) ?? null,
+        disabled: a.disabled || a.review_required,
       })),
       rawRequests,
       baselineRawRequests,
@@ -173,6 +175,12 @@ export class ConsoleQuotaService {
       ['Сводка', 'Экономия кэша', report.summary.cache_savings_usd, 'USD'].map(csvCell).join(','),
       ['Сводка', 'Активное время', report.summary.active_minutes, 'мин'].map(csvCell).join(','),
       ['Сводка', 'API-$ / 1% квоты', report.summary.usd_per_1pct ?? '', report.efficiency.verdict].map(csvCell).join(','),
+      '',
+      ['Интеграция', 'Запросы', 'С токенами', 'С тарифом и токенами', 'API-$', 'Расход квоты, п.п.', 'Интервалы'].map(csvCell).join(','),
+      ...report.by_integration.map((row) => [
+        row.source === 'native' ? 'Antigravity / AGY' : 'API прокси',
+        row.requests, row.measured_requests, row.priced_requests, row.api_usd, row.matched_drain_pp, row.matched_intervals,
+      ].map(csvCell).join(',')),
       '',
       ['Сессия / Модель / Аккаунт', 'Тип', 'Запросы', 'Входные токены', 'Кэш чтение', 'Кэш запись', 'Выходные токены', 'Thinking', 'API-$', 'Доля %'].map(csvCell).join(','),
     ];

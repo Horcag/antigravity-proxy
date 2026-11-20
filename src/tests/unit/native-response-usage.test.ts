@@ -7,7 +7,7 @@ import { createNativeResponseUsage } from '@/observability/native-response-usage
 import * as nativeUsage from '@/observability/native-response-usage';
 import { createNativeRelayEnd } from '@/modules/proxy-gateway/server/native-relay-completion';
 import { createRequestObservation, runWithRequestObservation } from '@/observability/request-context';
-import { configureRequestHistory, closeRequestHistory, getRequestHistory } from '@/observability/request-history';
+import { configureRequestHistory, closeRequestHistory, getRequestHistory, getRequestHistoryStore } from '@/observability/request-history';
 import { observeNativeRequest } from '@/dashboard/native-request-journal';
 import { CloudCodeFailoverGateway } from '@/modules/proxy-gateway/server/cloudcode-failover-gateway';
 
@@ -85,12 +85,15 @@ describe('native numeric usage sidechannel', () => {
   });
 });
 
-async function relay(chunks: Buffer[], contentType: string, encoding?: string, options: { cancelAfterWrite?: boolean; failAfterChunks?: boolean } = {}) {
+async function relay(chunks: Buffer[], contentType: string, encoding?: string, options: {
+  cancelAfterWrite?: boolean; failAfterChunks?: boolean; pool?: boolean; grpcStatus?: string; grpcTrailer?: string;
+} = {}) {
   configureRequestHistory(':memory:');
-  const body = Buffer.from('{"model":"gemini-pro"}');
+  const grpc = contentType === 'application/grpc';
+  const body = grpc ? Buffer.alloc(0) : Buffer.from(options.pool ? '{"model":"gpt-oss-120b-medium"}' : '{"model":"gemini-pro"}');
   const req = Object.assign(new EventEmitter(), {
-    method: 'POST', url: '/v1internal:streamGenerateContent', complete: true,
-    headers: { host: 'daily-cloudcode-pa.googleapis.com', 'content-type': 'application/json', authorization: 'Bearer fixture' },
+    method: 'POST', url: grpc ? '/google.gca.aicode.v1alpha.PredictionService/BidiGenerateContent' : '/v1internal:streamGenerateContent', complete: true,
+    headers: { host: 'daily-cloudcode-pa.googleapis.com', 'content-type': grpc ? contentType : 'application/json', authorization: 'Bearer fixture' },
     async *[Symbol.asyncIterator]() { yield body; },
   });
   const written: Buffer[] = [];
@@ -105,17 +108,27 @@ async function relay(chunks: Buffer[], contentType: string, encoding?: string, o
     },
     destroy() { this.destroyed = true; responseEvents.emit('close'); },
   });
-  const gateway = new CloudCodeFailoverGateway();
-  vi.spyOn(gateway as any, 'executeUpstreamCall').mockResolvedValue({
-    statusCode: 200, headers: { 'content-type': contentType, ...(encoding ? { 'content-encoding': encoding } : {}) },
-    bodyStream: Readable.from((async function* () { for (const chunk of chunks) { yield chunk; await new Promise((resolve) => setImmediate(resolve)); } if (options.failAfterChunks) throw new Error('private-stream-error'); })()),
+  const gateway = new CloudCodeFailoverGateway(options.pool ? {
+    getNextToken: vi.fn().mockResolvedValue({ id: 'pool-account', token: { access_token: 'pool-token' } }),
+    resolveDynamicModelForAccount: vi.fn().mockReturnValue('scheduler-alias'),
+  } as never : undefined);
+  const trailers: http.IncomingHttpHeaders = {};
+  const bodyStream = Object.assign(Readable.from((async function* () {
+    for (const chunk of chunks) { yield chunk; await new Promise((resolve) => setImmediate(resolve)); }
+    if (options.grpcTrailer) trailers['grpc-status'] = options.grpcTrailer;
+    if (options.failAfterChunks) throw new Error('private-stream-error');
+  })()), { trailers });
+  const upstream = vi.spyOn(gateway as any, 'executeUpstreamCall').mockResolvedValue({
+    statusCode: 200, headers: { 'content-type': contentType, ...(encoding ? { 'content-encoding': encoding } : {}),
+      ...(options.grpcStatus ? { 'grpc-status': options.grpcStatus } : {}) },
+    bodyStream,
   });
   await new Promise<void>((resolve, reject) => {
     observeNativeRequest(req as unknown as http.IncomingMessage, res as unknown as http.ServerResponse, () => {
       gateway.handleRequest(req as unknown as http.IncomingMessage, res as unknown as http.ServerResponse).then(resolve, reject);
     });
   });
-  return { bytes: Buffer.concat(written), history: getRequestHistory() };
+  return { bytes: Buffer.concat(written), history: getRequestHistory(), rollups: getRequestHistoryStore().quotaHistory.getHourlyRollups(), upstream };
 }
 
 describe('native gateway persisted usage ordering', () => {
@@ -151,6 +164,40 @@ describe('native gateway persisted usage ordering', () => {
     expect(result.bytes).toEqual(bytes);
     expect(result.history).toMatchObject({ total: 1, items: [{ status: 200, input_tokens: 12, output_tokens: 4, cache_tokens: 0 }] });
     expect(JSON.stringify(result.history)).not.toMatch(/private-response|usageMetadata|fixture/);
+  });
+
+  it.each([['request model', undefined], ['response model', 'gpt-oss-120b-high']] as const)('attributes pool-authenticated native GPT usage to the %s', async (_source, responseModel) => {
+    const requested = 'gpt-oss-120b-medium';
+    const charged = responseModel ?? requested;
+    const bytes = Buffer.from(`data: ${JSON.stringify({ response: { usageMetadata: usage, modelVersion: responseModel } })}\n\n`);
+    const result = await relay([bytes], 'text/event-stream', undefined, { pool: true });
+    expect(result.upstream.mock.calls[0][2]).toMatchObject({ authorization: 'Bearer pool-token' });
+    expect(String(result.upstream.mock.calls[0][3])).toBe(`{"model":"${requested}"}`);
+    expect(result.bytes).toEqual(bytes);
+    expect(result.history).toMatchObject({ total: 1, items: [{
+      protocol: 'connect', project_id: 'native', account_id: 'pool-account', authorization_source: 'pool',
+      requested_model: requested, effective_model: charged, input_tokens: 12, output_tokens: 4, cache_tokens: 0,
+      attempts: [{ account_id: 'pool-account', effective_model: charged, outcome: 'success' }],
+    }] });
+    expect(result.rollups).toMatchObject([{ account_id: 'pool-account', model: charged, pool: 'third_party',
+      requests: 1, measured_requests: 1, input_tokens: 12, output_tokens: 4 }]);
+    expect(JSON.stringify(result.history)).not.toMatch(/pool-token|scheduler-alias/);
+  });
+
+  it('records terminal native gRPC status when the HTTP transport returns 200', async () => {
+    const result = await relay([], 'application/grpc', undefined, { grpcStatus: '7' });
+    expect(result.history).toMatchObject({ total: 1, items: [{ status: 200, grpc_status: '7', input_tokens: null }] });
+    expect(result.rollups).toMatchObject([{ requests: 1, failed_requests: 1, measured_requests: 0 }]);
+  });
+
+  it('updates a pool attempt when the native gRPC trailer reports failure after the first message', async () => {
+    const frame = Buffer.from([0, 0, 0, 0, 2, 0x08, 0x01]);
+    const result = await relay([frame], 'application/grpc', undefined, { pool: true, grpcTrailer: '7' });
+    expect(result.bytes).toEqual(frame);
+    expect(result.history).toMatchObject({ total: 1, items: [{ status: 200, grpc_status: '7', input_tokens: null,
+      attempts: [{ account_id: 'pool-account', outcome: 'failure' }],
+    }] });
+    expect(result.rollups).toMatchObject([{ requests: 1, failed_requests: 1, measured_requests: 0 }]);
   });
 
   it.each([['cancel', 499], ['upstream failure', 502]] as const)('discards observed usage on %s without retaining response contents', async (failure, status) => {
