@@ -23,6 +23,7 @@ import { classifyUpstreamFailure, safeDecodeGrpcMessage, type FailureEvidence } 
 import { evaluateRetryDecision } from './upstream-retry-decision'; import { observeClientUserAgent } from './request-user-agent';
 import { logUpstreamFailure, sanitizeLogString } from './cloudcode-diagnostics';
 import { formatPoolCapacityError, formatTerminalDownstreamError, resolveHasAlternativeAccounts } from './cloudcode-terminal-response';
+import { tryBufferAndProjectQuotaResponse } from './cloudcode-quota-projection';
 export { isVerifiedSessionKey, isHintSessionKey };
 export type ProtocolFailureCategory = 'inspection-limit' | 'unsupported-encoding' | 'malformed-upstream-message' | 'deadline-exceeded' | 'account-quota' | 'upstream-transient';
 export interface ProtocolFrameDecision {
@@ -765,7 +766,7 @@ export class CloudCodeFailoverGateway {
           bodyStream.destroy();
           return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
         }
-        const firstChunk = firstChunkResult.buffer;
+        let firstChunk = firstChunkResult.buffer;
         const frameDecision = firstChunkResult.decision;
         switch (frameDecision.state) {
           case 'VALIDATED_ERROR': {
@@ -872,10 +873,14 @@ export class CloudCodeFailoverGateway {
                 }
               }
             }
-            activeCompleteAffinityPlacement?.('committed'); activeCompleteAffinityPlacement = undefined; activeAbortMigration = undefined; upstreamResponseSelected = true;
-            receiptOwner.expectDownstreamCommit('validated_response'); activeStopCandidateRenewal?.();
-            writeDownstreamHeaders('validated_response', statusCode, headers); clearLogicalDeadline();
-            break;
+            activeCompleteAffinityPlacement?.('committed'); activeCompleteAffinityPlacement = undefined; activeAbortMigration = undefined;
+            const projected = await tryBufferAndProjectQuotaResponse({ urlPath: attemptUrlPath, statusCode, headers, firstChunk, bodyStream, req, res, isClientAborted: () => clientAborted, getSnapshot: typeof this.accountLeaseService?.getPoolQuotaProjectionSnapshot === 'function' ? () => this.accountLeaseService!.getPoolQuotaProjectionSnapshot() : undefined, currentAccountId: account?.id });
+            if (projected.handled) {
+              if (projected.aborted) { releaseActiveLease(); return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined; }
+              upstreamResponseSelected = true; receiptOwner.expectDownstreamCommit('validated_response'); activeStopCandidateRenewal?.(); clearLogicalDeadline();
+              writeDownstream('validated_response', statusCode, projected.headers, projected.body); releaseActiveLease(); return;
+            }
+            firstChunk = projected.initialChunk; upstreamResponseSelected = true; receiptOwner.expectDownstreamCommit('validated_response'); activeStopCandidateRenewal?.(); writeDownstreamHeaders('validated_response', statusCode, headers); clearLogicalDeadline(); break;
           }
         }
         const { responseUsage, onStreamEnd } = createNativeRelayEnd(res, bodyStream, headers, endDownstream, rejectAndTerminateDownstream, clearLogicalDeadline);
@@ -1079,23 +1084,10 @@ export class CloudCodeFailoverGateway {
       }
     }
     if (errorText !== undefined) {
-      const isQuota =
-        code === 429 || code === 'RESOURCE_EXHAUSTED' ||
-        (!msg.includes('quota project') && (
-          msg.includes('individual quota reached') ||
-          msg.includes('exhausted your quota') ||
-          msg.includes('quota exceeded') ||
-          msg.includes('resource_exhausted') ||
-          (msg.includes('rate limit') && !msg.includes('project'))
-        ));
+      const isQuota = code === 429 || code === 'RESOURCE_EXHAUSTED' ||
+        (!msg.includes('quota project') && (msg.includes('quota reached') || msg.includes('baseline quota') || msg.includes('credit overages') || msg.includes('exhausted your quota') || msg.includes('quota exceeded') || msg.includes('resource_exhausted') || (msg.includes('rate limit') && !msg.includes('project'))));
       const isTransient = code === 503 || msg.includes('unavailable');
-      return {
-        state: 'VALIDATED_ERROR',
-        isQuota,
-        isTransient,
-        category: isQuota ? 'account-quota' : isTransient ? 'upstream-transient' : undefined,
-        errorText,
-      };
+      return { state: 'VALIDATED_ERROR', isQuota, isTransient, category: isQuota ? 'account-quota' : isTransient ? 'upstream-transient' : undefined, errorText };
     }
     return null;
   }

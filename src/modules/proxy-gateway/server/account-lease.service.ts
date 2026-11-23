@@ -41,8 +41,7 @@ import {
 import { AccountLeaseConfigPolicy } from './account-lease-config-policy';
 import { proxyModelAvailabilityStore } from './proxy-model-availability-store';
 import { AccountPerformancePolicy } from './account-performance-policy';
-import { CaManager } from './cert/ca-manager';
-import { waitForAdmissionSlot } from './admission-wait';
+import { CaManager } from './cert/ca-manager'; import { waitForAdmissionSlot } from './admission-wait'; import { buildPoolQuotaProjectionSnapshot } from './account-lease-quota-policy';
 import {
   authorizesMigration,
   CacheAffinityCoordinator,
@@ -388,6 +387,7 @@ export class AccountLeaseService implements OnModuleInit, OnModuleDestroy {
       ),
     };
   }
+  getPoolQuotaProjectionSnapshot(now = Date.now()) { return buildPoolQuotaProjectionSnapshot({ tokens: this.tokens, availabilityEntries: proxyModelAvailabilityStore.peekSnapshot(now), lockouts: this.rateLimitTracker.peekActiveLockouts(now), accountCooldownIds: this.limitPolicy.peekActiveAccountCooldowns(now).map((entry) => entry.accountId) }); }
   private selectTemporaryBlock(
     ...entries: Array<TemporaryBlockSource | undefined>
   ): TemporaryBlockSource | undefined {

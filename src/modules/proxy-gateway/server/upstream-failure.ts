@@ -280,6 +280,9 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
     statusCode === 429 ||
     rpcStatus === 'RESOURCE_EXHAUSTED' ||
     lowerText.includes('individual quota reached') ||
+    lowerText.includes('quota reached') ||
+    lowerText.includes('baseline quota') ||
+    lowerText.includes('credit overages') ||
     lowerText.includes('exhausted your quota') ||
     lowerText.includes('quota exceeded') ||
     ((statusCode === 403 || source === 'sse' || source === 'json') && (

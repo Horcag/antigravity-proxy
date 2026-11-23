@@ -1,5 +1,7 @@
 import { isEmpty, isNumber, isString } from 'lodash-es';
 import type { CloudQuotaData } from '@/modules/cloud-account/types';
+import type { AccountLeaseTokenData } from './account-lease-token-types';
+import type { PoolAccountQuotaProjection, PoolModelQuotaEntry, PoolQuotaProjectionSnapshot } from './cloudcode-quota-projection';
 
 const THIRD_PARTY_QUOTA_GROUP_PATTERN = /claude|gpt|3p/i;
 const ARGON_QUOTA_GROUP_PATTERN = /argon/i;
@@ -20,9 +22,9 @@ function normalizeModelId(modelId: string | null | undefined): string | undefine
   return normalized !== '' ? normalized : undefined;
 }
 
-type QuotaPoolKind = 'third_party' | 'argon' | 'gemini';
+export type QuotaPoolKind = 'third_party' | 'argon' | 'gemini';
 
-function classifyModelQuotaPool(modelName: string): QuotaPoolKind | null {
+export function classifyModelQuotaPool(modelName: string): QuotaPoolKind | null {
   const normalized = modelName.toLowerCase();
   if (normalized.includes('claude') || normalized.includes('gpt')) {
     return 'third_party';
@@ -36,7 +38,7 @@ function classifyModelQuotaPool(modelName: string): QuotaPoolKind | null {
   return null;
 }
 
-function classifyQuotaBucketPool(groupText: string, bucketText: string): QuotaPoolKind | null {
+export function classifyQuotaBucketPool(groupText: string, bucketText: string): QuotaPoolKind | null {
   if (THIRD_PARTY_QUOTA_GROUP_PATTERN.test(groupText) || THIRD_PARTY_QUOTA_GROUP_PATTERN.test(bucketText)) {
     return 'third_party';
   }
@@ -158,4 +160,61 @@ export function findEarliestQuotaResetTime(modelResetTimes?: Record<string, stri
     return null;
   }
   return [...validTimes].sort()[0];
+}
+
+export function buildPoolQuotaProjectionSnapshot(params: {
+  tokens: Map<string, AccountLeaseTokenData>;
+  availabilityEntries: Array<{ accountId: string; modelId: string; unavailableUntil: number }>;
+  lockouts: Array<{ accountId: string; modelId?: string; unavailableUntil: number }>;
+  accountCooldownIds: Iterable<string>;
+}): PoolQuotaProjectionSnapshot {
+  const availabilityByAccountModel = new Map(
+    params.availabilityEntries.map((entry) => [`${entry.accountId}:${entry.modelId.toLowerCase()}`, entry] as const),
+  );
+  const modelLockouts = new Map(
+    params.lockouts
+      .filter((entry) => entry.modelId)
+      .map((entry) => [`${entry.accountId}:${(entry.modelId as string).toLowerCase()}`, entry] as const),
+  );
+  const accountCooldowns = new Set(params.accountCooldownIds);
+  const accountLockouts = new Set(
+    params.lockouts.filter((entry) => !entry.modelId).map((entry) => entry.accountId),
+  );
+
+  const accounts: PoolAccountQuotaProjection[] = [];
+  for (const [accountId, tokenData] of params.tokens.entries()) {
+    if (tokenData.status === 'expired' || accountCooldowns.has(accountId) || accountLockouts.has(accountId)) {
+      continue;
+    }
+
+    const models: Record<string, PoolModelQuotaEntry> = {};
+    for (const [rawModelId, pct] of Object.entries(tokenData.model_quotas ?? {})) {
+      const normalized = normalizeModelId(rawModelId);
+      if (!normalized) continue;
+      const lower = normalized.toLowerCase();
+      const block =
+        modelLockouts.get(`${accountId}:${lower}`) ??
+        availabilityByAccountModel.get(`${accountId}:${lower}`);
+      if (block) {
+        models[lower] = {
+          remainingFraction: 0,
+          resetTime: new Date(block.unavailableUntil).toISOString(),
+        };
+        continue;
+      }
+      const resetTime = tokenData.model_reset_times?.[rawModelId] ?? tokenData.model_reset_times?.[normalized];
+      models[lower] = {
+        remainingFraction: Math.max(0, Math.min(1, pct / 100)),
+        ...(resetTime ? { resetTime } : {}),
+      };
+    }
+
+    accounts.push({
+      accountId,
+      models,
+      quotaGroups: tokenData.quota?.quota_groups ?? [],
+    });
+  }
+
+  return { accounts };
 }
