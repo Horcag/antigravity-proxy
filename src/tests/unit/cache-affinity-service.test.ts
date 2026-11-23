@@ -325,23 +325,63 @@ describe('AccountLeaseService cache affinity fences', () => {
   });
 
   it('uses the requested model resetTime instead of an earlier unrelated model resetTime', () => {
+    const now = Date.now();
+    const resetAt = now + 604_800_000;
     const tokens = (service as any).tokens as Map<string, any>;
+    tokens.get('acc-1').model_quotas = { 'gemini-4-argon-high': 0 };
     tokens.get('acc-1').model_reset_times = {
-      'gemini-4-hydrogen-medium': '2026-11-18T10:00:00Z',
-      'gemini-4-argon-high': '2026-11-25T04:00:00Z',
+      'gemini-4-hydrogen-medium': new Date(now + 3_600_000).toISOString(),
+      'gemini-4-argon-high': new Date(resetAt).toISOString(),
     };
     const applied = (service as any).quotaRefreshPolicy.setPreciseLockoutFromCachedQuota(
       'acc-1', RateLimitReason.QuotaExhausted, 'gemini-4-argon-high',
     );
     expect(applied).toBe(true);
-    const lockouts = (service as any).rateLimitTracker.peekActiveLockouts(new Date('2026-11-18T08:00:00Z').getTime());
+    const lockouts = (service as any).rateLimitTracker.peekActiveLockouts(now);
     expect(lockouts).toEqual([
       expect.objectContaining({
         accountId: 'acc-1',
         modelId: 'gemini-4-argon-high',
-        unavailableUntil: new Date('2026-11-25T04:00:00Z').getTime(),
+        unavailableUntil: resetAt,
       }),
     ]);
+  });
+
+  it.each([
+    { quota: 85, resetDelay: 604_800_000, expectedDelay: 60_000 },
+    { quota: 0, resetDelay: null, expectedDelay: 60_000 },
+    { quota: 0, resetDelay: -1_000, expectedDelay: 60_000 },
+    { quota: 0, resetDelay: 3_600_000, expectedDelay: 3_600_000 },
+  ])('uses the model reset after a 429 only if quota is exhausted and reset is in the future (%j)', async ({
+    quota, resetDelay, expectedDelay,
+  }) => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.now();
+      const model = 'gemini-4-neon-high';
+      const tokens = (service as any).tokens;
+      tokens.delete('acc-2');
+      const token = tokens.get('acc-1');
+      token.model_quotas = { [model]: quota };
+      token.model_reset_times = {
+        'gemini-4-neon-medium': new Date(now + 604_800_000).toISOString(),
+        ...(resetDelay !== null ? { [model]: new Date(now + resetDelay).toISOString() } : {}),
+      };
+      token.model_forwarding_rules = {};
+      vi.spyOn((service as any).quotaRefreshPolicy, 'refreshAccountQuota').mockResolvedValue(true);
+
+      await service.markFromUpstreamError({
+        accountIdOrEmail: 'acc-1', status: 429, reason: RateLimitReason.QuotaExhausted, model,
+      });
+
+      expect(service.getPoolCapacityFailure(model, now)).toEqual({
+        reason: 'quota_exhausted',
+        retryAfterSeconds: expectedDelay / 1000,
+        retryAt: new Date(now + expectedDelay).toISOString(),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('allows unadvertised model fallback on native routes while staying sticky and honoring hard 404 learning', async () => {

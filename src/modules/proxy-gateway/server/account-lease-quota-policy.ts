@@ -151,17 +151,6 @@ export function buildAccountLeaseQuotaSnapshot(
   };
 }
 
-export function findEarliestQuotaResetTime(modelResetTimes?: Record<string, string>): string | null {
-  if (!modelResetTimes || typeof modelResetTimes !== 'object') {
-    return null;
-  }
-  const validTimes = Object.values(modelResetTimes).filter((value) => typeof value === 'string' && !isEmpty(value.trim()));
-  if (validTimes.length === 0) {
-    return null;
-  }
-  return [...validTimes].sort()[0];
-}
-
 export function buildPoolQuotaProjectionSnapshot(params: {
   tokens: Map<string, AccountLeaseTokenData>;
   availabilityEntries: Array<{ accountId: string; modelId: string; unavailableUntil: number }>;
