@@ -10,8 +10,11 @@ import {
   requestsHref,
 } from './trafficNavigation';
 import { formatSamaraDateTime, localDateValue, samaraDayBoundary } from './time';
+import { formatUsd } from './quotaChartModel';
+import type { QuotaAnalyticsResponse } from './quotaAnalyticsTypes';
 import type { Account, Project, Statistics, StatisticsGranularity } from './types';
 import { Button, Card, DataTable, PageHeader, useResource } from './shared';
+import quotaStyles from './QuotaAnalytics.module.scss';
 
 const groupLabels: Record<StatisticsGranularity, string> = {
   minute: 'По минутам',
@@ -40,6 +43,51 @@ function MetricLink({
     >
       {formatMetric(value)}
     </Link>
+  );
+}
+function OverviewQuotaStrip() {
+  const quotaOverview = useResource<QuotaAnalyticsResponse>(
+    '/quota-analytics?preset=7d&pool=all&window=weekly'
+  );
+  if (!quotaOverview.data) return null;
+  const s = quotaOverview.data.summary;
+  return (
+    <Card
+      title="Квота пула и API-эквивалент (7 дней)"
+      extra={<Link to="/quota" className="btn btn-secondary btn-sm">Открыть мониторинг →</Link>}
+    >
+      <div className={quotaStyles.summaryStrip}>
+        <div>
+          <small className="agp-muted">Остаток пула (Неделя / 5ч)</small>
+          <div>
+            <strong>{s.pool_weekly_pct ?? '—'}% / {s.pool_5h_pct ?? '—'}%</strong>
+          </div>
+        </div>
+        <div>
+          <small className="agp-muted">API-эквивалент (7 д)</small>
+          <div>
+            <strong>{formatUsd(s.api_usd, 2)}</strong>
+            {s.roi_ratio !== null ? ` (${s.roi_ratio}×)` : ''}
+          </div>
+        </div>
+        <div>
+          <small className="agp-muted">Активный темп</small>
+          <div>
+            <strong>
+              {s.api_usd_per_active_hour !== null
+                ? `${formatUsd(s.api_usd_per_active_hour, 2)}/акт.ч`
+                : '—'}
+            </strong>
+          </div>
+        </div>
+        <div>
+          <small className="agp-muted">API-$ за 1% квоты</small>
+          <div>
+            <strong>{formatUsd(s.usd_per_1pct, 3)}</strong>
+          </div>
+        </div>
+      </div>
+    </Card>
   );
 }
 export function StatisticsPage({ overview = false }: { overview?: boolean }) {
@@ -197,6 +245,7 @@ export function StatisticsPage({ overview = false }: { overview?: boolean }) {
           </Card>
         ))}
       </div>
+      {overview && <OverviewQuotaStrip />}
       <Card title={`Запросы ${groupLabels[granularity].toLowerCase()} · Самара`}>
         {s ? (
           <TrafficChart

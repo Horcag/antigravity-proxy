@@ -11,7 +11,13 @@ export function AccessCheckStatus({ result }: { result?: AccessCheck | null }) {
   return (
     <div>
       <span className={`agp-badge ${result.outcome === 'working' ? '' : 'agp-warning'}`}>{title}</span>
-      <small>{formatSamaraDateTime(result.checked_at)}</small>
+      <small>Проверено: {formatSamaraDateTime(result.checked_at)}</small>
+      <small>Длительность: {result.duration_ms === undefined ? 'не измерена' : `${result.duration_ms} мс`}</small>
+      <small>{result.evidence.http_status !== undefined
+        ? `Ответ Google (генерация): HTTP ${result.evidence.http_status}`
+        : result.evidence.stage === 'oauth'
+          ? 'Проверка остановилась на OAuth: ответ генерации не получен.'
+          : 'HTTP-ответ генерации не получен.'}</small>
       <small>{result.message}</small>
       <small>
         {result.comparison === 'same' ? 'Та же причина, что в прошлый раз.'
@@ -23,7 +29,6 @@ export function AccessCheckStatus({ result }: { result?: AccessCheck | null }) {
         <summary>Диагностика проверки</summary>
         <small>Причина: {result.reason}. Этап: {result.evidence.stage}.</small>
         {result.evidence.model && <small>Модель: {result.evidence.model}</small>}
-        {result.evidence.http_status && <small>HTTP: {result.evidence.http_status}</small>}
         {result.evidence.rule_id && <small>Признак: {result.evidence.rule_id}</small>}
         {result.previous_checked_at && <small>Прошлая проверка: {formatSamaraDateTime(result.previous_checked_at)}</small>}
       </details>

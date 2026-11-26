@@ -95,7 +95,7 @@ function makeEvidence(
 }
 
 export function classifyUpstreamFailure(options: ClassifyFailureOptions): FailureEvidence {
-  const { headers, bufferedBody, errorText: explicitErrorText, modelName, source = 'http' } = options;
+  const { headers, bufferedBody, errorText: explicitErrorText, modelName, urlPath, source = 'http' } = options;
   let { statusCode } = options;
 
   let errorText = explicitErrorText;
@@ -120,8 +120,9 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
   let isValidJson = false;
   try {
     const trimmed = errorText.trim();
-    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-      const parsed = JSON.parse(trimmed);
+    const jsonCandidate = trimmed.startsWith('data:') ? trimmed.slice(5).trim() : trimmed;
+    if (jsonCandidate.startsWith('{') || jsonCandidate.startsWith('[')) {
+      const parsed = JSON.parse(jsonCandidate);
       isValidJson = true;
       if (parsed?.error && typeof parsed.error === 'object') {
         if (typeof parsed.error.message === 'string') errorMessage = parsed.error.message;
@@ -160,6 +161,11 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
       buildSafeErrorMessage('permission-denied', 'google.tos.violation', rpc, statusCode, 'TOS_VIOLATION'), errorText, false, 'explicit');
   }
 
+  const isModelInferencePath = !urlPath || /generateContent|streamGenerateContent|countTokens|embedContent|models\//i.test(urlPath);
+  const isGenericEntityNotFound =
+    /^requested entity was not found\.?$/i.test(errorMessage.trim()) ||
+    /"message"\s*:\s*"requested entity was not found\.?"/i.test(errorText);
+
   // 1. gRPC status header / trailers
   if (grpcHeader !== undefined && String(grpcHeader) !== '0') {
     const code = String(grpcHeader);
@@ -181,8 +187,8 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
       const mentionsModel = errorInfoReason === 'MODEL_NOT_FOUND' || errorInfoReason === 'MODEL_DEPRECATED' || /models\//i.test(errorText) ||
         /model.*not found|unsupported model|model not supported|model does not exist/i.test(errorText) ||
         (Boolean(escapedModel) && (new RegExp(`models/${escapedModel}`, 'i').test(errorText) || new RegExp(`model ['"]?${escapedModel}['"]?`, 'i').test(errorText)));
-      if (mentionsModel) {
-        return makeEvidence('model-capability', 'google.grpc.not-found', 'grpc', 404, 'NOT_FOUND', buildSafeErrorMessage('model-capability', 'google.grpc.not-found', 'NOT_FOUND', 404, errorInfoReason || modelName), errorText, false, 'explicit');
+      if (mentionsModel || (Boolean(escapedModel) && isModelInferencePath && isGenericEntityNotFound)) {
+        return makeEvidence('model-capability', 'google.grpc.not-found', 'grpc', 404, 'NOT_FOUND', buildSafeErrorMessage('model-capability', 'google.grpc.not-found', 'NOT_FOUND', 404, errorInfoReason || modelName), errorText, false, mentionsModel ? 'explicit' : 'heuristic');
       }
       return makeEvidence('invalid-request', 'google.grpc.not-found', 'grpc', 404, 'NOT_FOUND', buildSafeErrorMessage('invalid-request', 'google.grpc.not-found', 'NOT_FOUND', 404, errorInfoReason), errorText, false, 'unknown');
     }
@@ -274,6 +280,9 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
     statusCode === 429 ||
     rpcStatus === 'RESOURCE_EXHAUSTED' ||
     lowerText.includes('individual quota reached') ||
+    lowerText.includes('quota reached') ||
+    lowerText.includes('baseline quota') ||
+    lowerText.includes('credit overages') ||
     lowerText.includes('exhausted your quota') ||
     lowerText.includes('quota exceeded') ||
     ((statusCode === 403 || source === 'sse' || source === 'json') && (
@@ -298,7 +307,8 @@ export function classifyUpstreamFailure(options: ClassifyFailureOptions): Failur
       new RegExp(`models/${escapedModel}.*(?:not found|is not supported|does not exist)`, 'i').test(errorText) ||
       new RegExp(`model ['"]?${escapedModel}['"]?.*(?:not found|is not supported|does not exist)`, 'i').test(errorText) ||
       /unsupported model|model not supported|model does not exist/i.test(errorText) ||
-      (statusCode === 404 && /model.*not found/i.test(errorText))
+      (statusCode === 404 && /model.*not found/i.test(errorText)) ||
+      (statusCode === 404 && (!rpcStatus || rpcStatus === 'NOT_FOUND') && isModelInferencePath && isGenericEntityNotFound)
     );
   if (isModelIncompatible) {
     const rpc = rpcStatus || 'NOT_FOUND';

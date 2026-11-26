@@ -4,6 +4,7 @@ import { CloudAccountRepo } from '@/modules/cloud-account/persistence/cloudHandl
 import type { CloudAccount } from '@/modules/cloud-account/types';
 import { AccountLeaseService } from '@/modules/proxy-gateway/server/account-lease.service';
 import { createMigrationAuthorization } from '@/modules/proxy-gateway/server/cache-affinity-coordinator';
+import { proxyModelAvailabilityStore } from '@/modules/proxy-gateway/server/proxy-model-availability-store';
 import { RateLimitReason, type RateLimitTracker } from '@/modules/proxy-gateway/server/rate-limit-tracker';
 
 describe('AccountLeaseService cache affinity fences', () => {
@@ -26,6 +27,8 @@ describe('AccountLeaseService cache affinity fences', () => {
   });
 
   afterEach(() => {
+    proxyModelAvailabilityStore.clearAccount('acc-1');
+    proxyModelAvailabilityStore.clearAccount('acc-2');
     vi.restoreAllMocks();
   });
 
@@ -271,5 +274,169 @@ describe('AccountLeaseService cache affinity fences', () => {
     expect(service.getInFlightWork('acc-1')).toBe(0);
     expect(service.getInFlightWork('acc-2')).toBe(0);
     expect((service as any).affinityCoordinator.getStateForTesting()).toEqual({ owners: 0, waiters: 0 });
+  });
+
+  it('coordinates concurrent non-migrating session requests behind an active migration owner', async () => {
+    const sessionKey = 'session:migrating-follower-wait';
+    service.bindSession(sessionKey, 'acc-1');
+    const auth = createMigrationAuthorization(
+      'upstream-transient', sessionKey, service.getSessionBinding(sessionKey), 'req-owner',
+    );
+    const ownerLease = await service.acquireAttemptLease({
+      sessionKey, deferSessionBinding: true, excludeAccountIds: ['acc-1'],
+      migrationAuthorization: auth!, requestId: 'req-owner',
+    });
+    expect(ownerLease?.account.id).toBe('acc-2');
+
+    const migration = service.startSessionMigration(
+      sessionKey, ownerLease!.generation, 'acc-2', 'req-owner', ownerLease!.tableIncarnation,
+    );
+    expect(migration).not.toBeNull();
+
+    // Concurrent request in the same session arrives without migrationAuthorization while state==='migrating'
+    const concurrentPromise = service.acquireAttemptLease({
+      sessionKey, deferSessionBinding: true, requestId: 'req-concurrent',
+    });
+    await Promise.resolve();
+    expect((service as any).affinityCoordinator.getStateForTesting()).toEqual({ owners: 1, waiters: 1 });
+
+    expect(service.confirmOrBindSession(
+      sessionKey, 'acc-2', migration!.generation, 'req-owner', undefined, migration!.tableIncarnation,
+    )).toEqual({ kind: 'confirmed' });
+    ownerLease!.completeAffinityPlacement?.('committed');
+
+    const concurrentLease = await concurrentPromise;
+    expect(concurrentLease?.account.id).toBe('acc-2');
+    expect(concurrentLease?.generation).toBe(migration!.generation);
+    ownerLease!.releaseReservation();
+    concurrentLease!.releaseReservation();
+  });
+
+  it('preserves hint:prefix cache affinity across a 6-minute idle gap (1h default TTL)', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-11-18T08:00:00Z'));
+      service.recordCacheHint('hint:prefix:deadbeef01234567', 'acc-2');
+      vi.advanceTimersByTime(6 * 60 * 1000);
+      expect((service as any).selectionPolicy.getCacheHint('hint:prefix:deadbeef01234567')).toBe('acc-2');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('uses the requested model resetTime instead of an earlier unrelated model resetTime', () => {
+    const now = Date.now();
+    const resetAt = now + 604_800_000;
+    const tokens = (service as any).tokens as Map<string, any>;
+    tokens.get('acc-1').model_quotas = { 'gemini-4-argon-high': 0 };
+    tokens.get('acc-1').model_reset_times = {
+      'gemini-4-hydrogen-medium': new Date(now + 3_600_000).toISOString(),
+      'gemini-4-argon-high': new Date(resetAt).toISOString(),
+    };
+    const applied = (service as any).quotaRefreshPolicy.setPreciseLockoutFromCachedQuota(
+      'acc-1', RateLimitReason.QuotaExhausted, 'gemini-4-argon-high',
+    );
+    expect(applied).toBe(true);
+    const lockouts = (service as any).rateLimitTracker.peekActiveLockouts(now);
+    expect(lockouts).toEqual([
+      expect.objectContaining({
+        accountId: 'acc-1',
+        modelId: 'gemini-4-argon-high',
+        unavailableUntil: resetAt,
+      }),
+    ]);
+  });
+
+  it.each([
+    { quota: 85, resetDelay: 604_800_000, expectedDelay: 60_000 },
+    { quota: 0, resetDelay: null, expectedDelay: 60_000 },
+    { quota: 0, resetDelay: -1_000, expectedDelay: 60_000 },
+    { quota: 0, resetDelay: 3_600_000, expectedDelay: 3_600_000 },
+  ])('uses the model reset after a 429 only if quota is exhausted and reset is in the future (%j)', async ({
+    quota, resetDelay, expectedDelay,
+  }) => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.now();
+      const model = 'gemini-4-neon-high';
+      const tokens = (service as any).tokens;
+      tokens.delete('acc-2');
+      const token = tokens.get('acc-1');
+      token.model_quotas = { [model]: quota };
+      token.model_reset_times = {
+        'gemini-4-neon-medium': new Date(now + 604_800_000).toISOString(),
+        ...(resetDelay !== null ? { [model]: new Date(now + resetDelay).toISOString() } : {}),
+      };
+      token.model_forwarding_rules = {};
+      vi.spyOn((service as any).quotaRefreshPolicy, 'refreshAccountQuota').mockResolvedValue(true);
+
+      await service.markFromUpstreamError({
+        accountIdOrEmail: 'acc-1', status: 429, reason: RateLimitReason.QuotaExhausted, model,
+      });
+
+      expect(service.getPoolCapacityFailure(model, now)).toEqual({
+        reason: 'quota_exhausted',
+        retryAfterSeconds: expectedDelay / 1000,
+        retryAt: new Date(now + expectedDelay).toISOString(),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('allows unadvertised model fallback on native routes while staying sticky and honoring hard 404 learning', async () => {
+    const tokens = (service as any).tokens as Map<string, any>;
+    tokens.get('acc-1').model_quotas = { 'gemini-4-neon-high': 100 };
+    tokens.get('acc-2').model_quotas = { 'gemini-4-neon-high': 100 };
+    const refreshSpy = vi.spyOn(service, 'refreshQuotaCatalog').mockResolvedValue({
+      refreshed: 0, skipped: 2, failed: 0, account_ids: [],
+    });
+
+    // Standard non-fallback caller rejects unadvertised model
+    await expect(
+      service.acquireAttemptLease({ sessionKey: 'session:orch-strict', model: 'gemini-pro-orchestrator-neon', deferSessionBinding: true }),
+    ).resolves.toBeNull();
+
+    // Native CONNECT fallback admits acc-1, commits stickiness, and does not spuriously mark model-incompatible
+    const lease1 = await service.acquireAttemptLease({
+      sessionKey: 'session:orch-fallback', model: 'gemini-pro-orchestrator-neon',
+      deferSessionBinding: true, allowUnadvertisedModelFallback: true, requestId: 'req-orch-1',
+    });
+    expect(lease1?.account.id).toBe('acc-1');
+    expect(service.confirmOrBindSession('session:orch-fallback', 'acc-1', lease1!.generation, 'req-orch-1', undefined, lease1!.tableIncarnation)).toEqual({ kind: 'confirmed' });
+    lease1!.completeAffinityPlacement?.('committed');
+    expect(service.authorizeBoundSessionMigration('session:orch-fallback', 'gemini-pro-orchestrator-neon', 'req-orch-2', true)).toBeUndefined();
+    lease1!.releaseReservation();
+
+    // After acc-1 learns hard 404 (model_not_supported), fallback skips acc-1 and selects acc-2
+    service.markModelUnrequestable('acc-1', 'gemini-pro-orchestrator-neon');
+    const auth = service.authorizeBoundSessionMigration('session:orch-fallback', 'gemini-pro-orchestrator-neon', 'req-orch-3', true);
+    expect(auth).toMatchObject({ reason: 'model-incompatible' });
+    const lease2 = await service.acquireAttemptLease({
+      sessionKey: 'session:orch-fallback', model: 'gemini-pro-orchestrator-neon', excludeAccountIds: ['acc-1'],
+      deferSessionBinding: true, allowUnadvertisedModelFallback: true, migrationAuthorization: auth, requestId: 'req-orch-3',
+    });
+    expect(lease2?.account.id).toBe('acc-2');
+    lease2!.completeAffinityPlacement?.('committed');
+    lease2!.releaseReservation();
+    expect(refreshSpy).toHaveBeenCalled();
+  });
+
+  it('preserves active sessions and quota lockouts for untouched accounts across reloadAllAccounts', async () => {
+    const accounts: CloudAccount[] = [...(service as any).tokens.values()].map((token) => ({
+      id: token.account_id, provider: 'google', email: token.email,
+      token: { ...token }, created_at: 1, last_used: 1, status: 'active', is_active: true,
+    }));
+    vi.spyOn(CloudAccountRepo, 'getAccounts').mockImplementation(async () => accounts);
+    await service.loadAccounts();
+    service.bindSession('session:preserve-across-reload', 'acc-2');
+    await service.markFromUpstreamError({
+      accountIdOrEmail: 'acc-1', status: 429, model: 'gemini-4-argon-high',
+      body: JSON.stringify({ error: { details: [{ reason: 'QUOTA_EXHAUSTED', metadata: { quotaResetDelay: '600s' } }] } }),
+    });
+
+    await expect(service.reloadAllAccounts()).resolves.toBe(2);
+    expect(service.getSessionBinding('session:preserve-across-reload')).toMatchObject({ accountId: 'acc-2', state: 'active' });
+    expect((service as any).rateLimitTracker.isRateLimited('acc-1', 'gemini-4-argon-high')).toBe(true);
   });
 });

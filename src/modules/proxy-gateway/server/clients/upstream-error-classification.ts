@@ -1,13 +1,17 @@
 import type { AxiosError, AxiosRequestConfig } from 'axios';
 import { Readable } from 'node:stream';
 import { isObjectLike, isString } from 'lodash-es';
-import { classifyUpstreamFailure } from '../upstream-failure';
+import { classifyUpstreamFailure, safeDecodeErrorBody } from '../upstream-failure';
+import { sanitizeLogString } from '../cloudcode-diagnostics';
 import { throwIfUpstreamRequestCanceled, UpstreamRequestError } from './upstream-error';
 
-export async function readForbiddenErrorBody(error: AxiosError, signal?: AxiosRequestConfig['signal']): Promise<void> {
+const READABLE_ERROR_STATUS_MIN = 400;
+
+export async function readUpstreamErrorBody(error: AxiosError, signal?: AxiosRequestConfig['signal']): Promise<void> {
   throwIfUpstreamRequestCanceled(error, signal);
   const response = error.response;
-  if (response?.status !== 403 || !(response.data instanceof Readable)) return;
+  const status = response?.status ?? 0;
+  if (status < READABLE_ERROR_STATUS_MIN || !(response?.data instanceof Readable)) return;
   const stream = response.data;
   const onAbort = () => { stream.destroy(); };
   signal?.addEventListener?.('abort', onAbort, { once: true });
@@ -28,9 +32,23 @@ export async function readForbiddenErrorBody(error: AxiosError, signal?: AxiosRe
     signal?.removeEventListener?.('abort', onAbort);
     stream.destroy();
   }
-  response.data = Buffer.concat(chunks);
+  const rawBuffer = Buffer.concat(chunks);
+  const rawEncoding = response.headers?.['content-encoding'];
+  const encoding = isString(rawEncoding) || Array.isArray(rawEncoding) ? rawEncoding : undefined;
+  if (encoding) {
+    const decoded = safeDecodeErrorBody(rawBuffer, encoding);
+    if (decoded.text) {
+      response.data = Buffer.from(decoded.text, 'utf-8');
+      throwIfUpstreamRequestCanceled(error, signal);
+      return;
+    }
+  }
+  response.data = rawBuffer;
   throwIfUpstreamRequestCanceled(error, signal);
 }
+
+/** Backwards-compatible alias for callers expecting the 403-named helper. */
+export const readForbiddenErrorBody = readUpstreamErrorBody;
 
 export function classifyAxiosFailure(
   status: number | undefined,
@@ -79,6 +97,19 @@ function toClassificationText(value: unknown): string {
   } catch {
     return '';
   }
+}
+
+export function formatSafeUpstreamErrorDetail(error: AxiosError): string | undefined {
+  const status = error.response?.status;
+  if (!status || status < 400) return undefined;
+  const rawText = toClassificationText(error.response?.data);
+  if (!rawText) return undefined;
+  const evidence = classifyUpstreamFailure({
+    statusCode: status,
+    headers: (error.response?.headers ?? {}) as Record<string, string | string[] | undefined>,
+    errorText: rawText,
+  });
+  return sanitizeLogString(evidence.safeMessage) || undefined;
 }
 
 export function toGeminiUpstreamRequestError(error: AxiosError): UpstreamRequestError {

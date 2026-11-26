@@ -1,6 +1,7 @@
 import { StringDecoder } from 'node:string_decoder';
 import { createGunzip, createInflate, createBrotliDecompress } from 'node:zlib';
-import { extractResponseUsage, getRequestObservation, type ResponseUsage } from './request-context';
+import { extractResponseUsage, mergeStreamResponseUsage, getRequestObservation, type ResponseUsage } from './request-context';
+import { observedModelIdentifier } from './metadata';
 
 const MESSAGE_LIMIT = 64 * 1024;
 const DECODED_LIMIT = 16 * 1024 * 1024;
@@ -18,13 +19,18 @@ export function createNativeResponseUsage(contentType: string | undefined, encod
   let disabled = !context || (!sse && !json) || Boolean(compression && compression !== 'identity' && !inflater);
   let pending = '', skipping = false, decodedBytes = 0;
   let usage: ResponseUsage = {};
-  const discard = () => { disabled = true; pending = ''; usage = {}; inflater?.destroy(); };
+  let model: string | undefined;
+  const discard = () => { disabled = true; pending = ''; usage = {}; model = undefined; inflater?.destroy(); };
   const parse = (text: string) => {
     try {
       const payload = JSON.parse(text);
       const frames = Array.isArray(payload) ? payload : [payload];
       if (frames.some(frame => frame?.error || frame?.response?.error)) { discard(); return; }
-      for (const frame of frames) Object.assign(usage, extractResponseUsage(frame));
+      for (const frame of frames) {
+        mergeStreamResponseUsage(usage, extractResponseUsage(frame));
+        const response = frame?.response ?? frame?.message ?? frame;
+        model = observedModelIdentifier(response?.modelVersion ?? response?.model) ?? model;
+      }
     } catch { /* Неполный или неподдерживаемый формат не даёт измерений. */ }
   };
   const consume = (chunk: Buffer) => {
@@ -73,7 +79,14 @@ export function createNativeResponseUsage(contentType: string | undefined, encod
       if (!disabled) {
         pending += decoder.end();
         if (json) parse(pending);
-        if (context && !context.finished) Object.assign(context, usage);
+        if (context && !context.finished) {
+          Object.assign(context, usage);
+          if (model) {
+            context.effective_model = model;
+            const attempt = context.attempts.at(-1);
+            if (attempt) attempt.effective_model = model;
+          }
+        }
       }
       discard();
     },

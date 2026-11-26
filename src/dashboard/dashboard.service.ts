@@ -33,6 +33,13 @@ export class DashboardService {
         const quota = Object.entries(account.quota?.models ?? {}).map(([model, item]) => ({
           model: label(model), remaining_percentage: finite(item.percentage), reset_time: safeDate(item.resetTime),
         }));
+        const quota_groups = (account.quota?.quota_groups ?? []).map((group) => ({
+          display_name: label(group.display_name),
+          buckets: (group.buckets ?? []).map((b) => ({
+            bucket_id: label(b.bucket_id), window: label(b.window),
+            remaining_percentage: finite(Math.floor(b.remaining_fraction * 100)), reset_time: safeDate(b.reset_time),
+          })),
+        }));
         const forbidden = Boolean(account.quota?.is_forbidden || account.quota?.isForbidden);
         const tosBlocked = account.status_reason === 'TOS_VIOLATION';
         const status = forbidden || tosBlocked ? 'disabled' : account.status === 'expired' ? 'expired' : account.status === 'rate_limited' ? 'rate_limited' : 'active';
@@ -41,7 +48,7 @@ export class DashboardService {
           provider: account.provider === 'anthropic' ? 'anthropic' : 'google', status,
           availability: status !== 'active' ? 'unavailable' : quota.length === 0 ? 'unknown' : quota.some((item) => (item.remaining_percentage ?? 0) > 0) ? 'available' : 'unavailable',
           reason: tosBlocked ? 'Блокировка сервиса (ToS)' : forbidden ? 'Доступ запрещён' : status === 'expired' ? 'Требуется авторизация' : status === 'rate_limited' ? 'Ограничение частоты' : null,
-          quota,
+          quota, quota_groups,
         };
       }),
       runtime: diagnostics.accounts.map((account) => ({

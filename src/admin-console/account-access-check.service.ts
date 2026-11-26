@@ -79,12 +79,14 @@ export class AccountAccessCheckService {
     const baselineBan = /^(?:gcp_)?tos_violation$/i.test(account.status_reason ?? '');
     const priorBan = previous?.outcome === 'banned' || (previous?.outcome !== 'working' && baselineBan);
     const identity = { value: accountAccessCheckIdentity(account) };
+    const started = performance.now();
     const probe = await this.probe(account, identity);
+    const duration_ms = Math.round(performance.now() - started);
     const previousReason = previous?.reason ?? (baselineBan ? 'tos_violation' : undefined);
     const sameEvidence = !previous || (previous.message === probe.message && (['stage', 'model', 'http_status', 'rule_id'] as const)
       .every((key) => previous.evidence[key] === probe.evidence[key]));
     const result: AccountAccessCheck = {
-      account_id: id, ...probe, checked_at: new Date().toISOString(),
+      account_id: id, ...probe, duration_ms, checked_at: new Date().toISOString(),
       comparison: probe.outcome === 'working' && priorBan ? 'restored'
         : previousReason === undefined ? 'first'
         : previousReason === probe.reason && sameEvidence && (!previous || previous.outcome === probe.outcome) ? 'same' : 'changed',
@@ -92,7 +94,7 @@ export class AccountAccessCheckService {
       ...(previous ? { previous_checked_at: previous.checked_at } : {}),
     };
     if (!CloudAccountRepo.saveAccessCheck(result, identity.value)) {
-      return { account_id: id, outcome: 'inconclusive', reason: 'account_changed', checked_at: result.checked_at,
+      return { account_id: id, outcome: 'inconclusive', reason: 'account_changed', checked_at: result.checked_at, duration_ms,
         comparison: 'changed', message: 'Учётные данные аккаунта изменились во время проверки. Повторите проверку.', evidence: result.evidence };
     }
     return result;

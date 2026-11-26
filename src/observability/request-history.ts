@@ -3,7 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getDataDir } from '../shared/paths';
+import type { CloudQuotaData } from '@/modules/cloud-account/types';
 import { safeLabel, normalizedRoute, nullableCount, errorCategory, requestMetadata } from './metadata';
+import { QuotaHistoryRepository } from './quota-history';
+import type { UsageSchema } from './quota-analytics-types';
 
 export interface AttemptRecord {
   account_id: string;
@@ -23,13 +26,17 @@ export interface HistoryInput {
   project_id?: unknown;
   project_name?: unknown;
   account_id?: unknown;
+  session_key?: unknown;
   status: number;
   grpc_status?: string;
   duration_ms: number;
   ttft_ms?: number | null;
   input_tokens?: number | null;
   output_tokens?: number | null;
+  thought_tokens?: number | null;
   cache_tokens?: number | null;
+  cache_write_tokens?: number | null;
+  usage_schema?: UsageSchema | null;
   attempts?: AttemptRecord[];
 }
 export type HistoryGranularity = 'minute' | 'five_minutes' | 'hour' | 'day';
@@ -39,6 +46,7 @@ export interface HistoryFilters {
   offset?: number;
   accountId?: string;
   finalAccountId?: string;
+  sessionKey?: string;
   attemptOutcome?: AttemptRecord['outcome'];
   metric?: HistoryMetric;
   missingModel?: boolean;
@@ -65,6 +73,7 @@ export interface HistoryEntry {
   project_name: string;
   project: { id: string; name: string };
   account_id: string | null;
+  session_key: string | null;
   status: number;
   grpc_status: string | null;
   error_category: string | null;
@@ -72,8 +81,31 @@ export interface HistoryEntry {
   ttft_ms: number | null;
   input_tokens: number | null;
   output_tokens: number | null;
+  thought_tokens: number | null;
   cache_tokens: number | null;
+  cache_write_tokens: number | null;
+  usage_schema: string | null;
   attempts: AttemptRecord[];
+}
+export interface AnalyticsRequestRow {
+  time: string;
+  account_id: string | null;
+  requested_model: string | null;
+  effective_model: string | null;
+  route: string;
+  protocol: string;
+  project_id: string;
+  project_name: string;
+  session_key: string | null;
+  status: number;
+  grpc_status: string | null;
+  duration_ms: number;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  thought_tokens: number | null;
+  cache_tokens: number | null;
+  cache_write_tokens: number | null;
+  usage_schema: string | null;
 }
 interface StoredEntry extends Omit<HistoryEntry, 'id' | 'project' | 'attempts' | 'request_kind' | 'authorization_source'> { sequence: number }
 interface StoreOptions { retentionDays?: number; maxEntries?: number; now?: () => number }
@@ -87,6 +119,7 @@ export class RequestHistoryStore {
   private readonly now: () => number;
   private readonly retentionMs: number;
   private readonly maxEntries: number;
+  readonly quotaHistory: QuotaHistoryRepository;
   private closed = false;
   constructor(databasePath: string, options: StoreOptions = {}) {
     this.now = options.now ?? Date.now;
@@ -116,6 +149,8 @@ export class RequestHistoryStore {
     CREATE INDEX IF NOT EXISTS requests_model ON requests(requested_model, time);
     CREATE INDEX IF NOT EXISTS attempts_account ON attempts(account_id);
     CREATE INDEX IF NOT EXISTS attempts_request ON attempts(request_id);`);
+    this.quotaHistory = new QuotaHistoryRepository(this.db, this.now);
+    this.quotaHistory.initSchema();
     this.db.prepare("INSERT OR IGNORE INTO history_metadata(key,value) VALUES ('started_at',?)").run(new Date(this.now()).toISOString());
     this.prune();
   }
@@ -125,14 +160,17 @@ export class RequestHistoryStore {
     const grpc = /^(?:[0-9]|1[0-6])$/.test(input.grpc_status ?? '') ? input.grpc_status! : null;
     const requestedModel = nullableLabel(input.requested_model ?? input.model);
     const time = input.time && Number.isFinite(Date.parse(input.time)) ? new Date(input.time).toISOString() : new Date(this.now()).toISOString();
+    const usageSchema = input.usage_schema === 'gemini' || input.usage_schema === 'anthropic' || input.usage_schema === 'openai' ? input.usage_schema : null;
     const row = { request_id: input.request_id && /^[\da-f-]{36}$/i.test(input.request_id) ? input.request_id : randomUUID(), time,
       protocol: input.protocol === 'connect' ? 'connect' : 'http', route: normalizedRoute(input.route), model: requestedModel,
       requested_model: requestedModel, effective_model: nullableLabel(input.effective_model),
       project_id: safeLabel(input.project_id, 'default'), project_name: safeLabel(input.project_name, 'Общий ключ'),
-      account_id: nullableLabel(input.account_id), status, grpc_status: grpc,
+      account_id: nullableLabel(input.account_id), session_key: nullableLabel(input.session_key), status, grpc_status: grpc,
       error_category: errorCategory(status) ?? (grpc && grpc !== '0' ? 'upstream_error' : null),
       duration_ms: milliseconds(input.duration_ms) ?? 0, ttft_ms: milliseconds(input.ttft_ms),
-      input_tokens: nullableCount(input.input_tokens), output_tokens: nullableCount(input.output_tokens), cache_tokens: nullableCount(input.cache_tokens) };
+      input_tokens: nullableCount(input.input_tokens), output_tokens: nullableCount(input.output_tokens),
+      thought_tokens: nullableCount(input.thought_tokens), cache_tokens: nullableCount(input.cache_tokens),
+      cache_write_tokens: nullableCount(input.cache_write_tokens), usage_schema: usageSchema };
     this.db.transaction(() => {
       const columns = Object.keys(row);
       const inserted = this.db.prepare(`INSERT OR IGNORE INTO requests (${columns.join(',')}) VALUES (${columns.map((key) => `@${key}`).join(',')})`).run(row);
@@ -143,6 +181,20 @@ export class RequestHistoryStore {
           attempt.outcome === 'success' || attempt.outcome === 'failure' ? attempt.outcome : 'unknown',
           ['authentication','rate_limited','timeout','upstream_error','request_error','network_error','protocol_error'].includes(attempt.error_category ?? '') ? attempt.error_category! : null,
           milliseconds(attempt.ttft_ms));
+      }
+      if (requestMetadata(row.route, row.protocol, row.account_id).request_kind === 'inference') {
+        this.quotaHistory.recordUsageRollup({
+          timeMs: Date.parse(row.time),
+          accountId: row.account_id ?? '',
+          model: row.effective_model ?? row.requested_model ?? '',
+          usageSchema: row.usage_schema ?? 'unknown',
+          failed: row.status >= 400 || (row.grpc_status !== null && row.grpc_status !== '0'),
+          inputTokens: row.input_tokens,
+          outputTokens: row.output_tokens,
+          thoughtTokens: row.thought_tokens,
+          cacheTokens: row.cache_tokens,
+          cacheWriteTokens: row.cache_write_tokens,
+        });
       }
       this.prune();
     })();
@@ -252,6 +304,15 @@ export class RequestHistoryStore {
         avg_duration_ms: number | null; input_tokens: number | null; output_tokens: number | null; cache_tokens: number | null; avg_ttft_ms: number | null; last_request_at: string; logical_requests: number; final_requests: number; success_requests: number; failed_requests: number;
       }[];
   }
+  getRawRequestsForAnalytics(filters: HistoryFilters = {}): AnalyticsRequestRow[] {
+    this.prune();
+    const { where, params } = this.filter(filters);
+    return this.db.prepare(`SELECT time, account_id, requested_model, effective_model, route, protocol,
+      project_id, project_name, session_key, status, grpc_status, duration_ms,
+      input_tokens, output_tokens, thought_tokens, cache_tokens, cache_write_tokens, usage_schema
+      FROM requests ${where} ORDER BY time ASC, sequence ASC LIMIT 100000`).all(...params) as AnalyticsRequestRow[];
+  }
+  isClosed(): boolean { return this.closed; }
   close(): void { if (!this.closed) { this.db.close(); this.closed = true; } }
   private filter(filters: HistoryFilters) {
     const clauses: string[] = [], params: (string | number)[] = [];
@@ -263,6 +324,10 @@ export class RequestHistoryStore {
       params.push(filters.accountId, filters.accountId);
     }
     if (filters.finalAccountId !== undefined) { clauses.push('account_id = ?'); params.push(filters.finalAccountId); }
+    if (filters.sessionKey !== undefined) {
+      if (filters.sessionKey === '__none__') clauses.push('session_key IS NULL');
+      else { clauses.push('session_key = ?'); params.push(filters.sessionKey); }
+    }
     if (filters.missingModel !== undefined) clauses.push(`requested_model IS ${filters.missingModel ? '' : 'NOT '}NULL`);
     if (filters.metric !== undefined) {
       const columns: HistoryMetric[] = ['input_tokens', 'output_tokens', 'cache_tokens', 'ttft_ms', 'duration_ms'];
@@ -297,3 +362,7 @@ export function getRequestHistoryStore(): RequestHistoryStore {
 export function getRequestHistory(filters: HistoryFilters = {}) { return getRequestHistoryStore().getRequestHistory(filters); }
 export function getUsageSummary(filters: HistoryFilters = {}, granularity: HistoryGranularity = 'hour') { return getRequestHistoryStore().getUsageSummary(filters, granularity); }
 export function getAccountStats(filters: HistoryFilters = {}) { return getRequestHistoryStore().getAccountStats(filters); }
+export function tryRecordQuotaSnapshot(accountId: string, quota: CloudQuotaData, observedMs?: number): void {
+  if (!store || store.isClosed()) return;
+  try { store.quotaHistory.recordQuotaSnapshot(accountId, quota, observedMs); } catch { /* Best-effort telemetry. */ }
+}

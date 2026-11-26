@@ -1,5 +1,6 @@
 import { createRelayCompletionPromise, createNativeRelayEnd } from './native-relay-completion';
-import { observeAttemptStart, observeAccountOutcome, observeUpstreamStreamFailure } from '../../../observability/request-context';
+import { observeAttemptStart, observeAccountOutcome, observeUpstreamStreamFailure, observeSessionKey, observeGrpcStatus } from '../../../observability/request-context';
+import { observedModelIdentifier } from '../../../observability/metadata';
 import http from 'node:http';
 import http2 from 'node:http2';
 import https from 'node:https';
@@ -19,9 +20,10 @@ import { AnonymousTransportReceiptOwner } from './anonymous-transport-receipt';
 import { authorizesMigration, createMigrationAuthorization, safeAffinityCommitRejectionReason, type MigrationAuthorization, type MigrationAuthorizationReason } from './cache-affinity-coordinator';
 import { extractModelName, extractSessionKey, isReplaySafeOperation, composeAttemptRequest, preflightValidateJsonRequest } from './cloudcode-request-adapter';
 import { classifyUpstreamFailure, safeDecodeGrpcMessage, type FailureEvidence } from './upstream-failure';
-import { evaluateRetryDecision } from './upstream-retry-decision';
+import { evaluateRetryDecision } from './upstream-retry-decision'; import { observeClientUserAgent } from './request-user-agent';
 import { logUpstreamFailure, sanitizeLogString } from './cloudcode-diagnostics';
 import { formatPoolCapacityError, formatTerminalDownstreamError, resolveHasAlternativeAccounts } from './cloudcode-terminal-response';
+import { tryBufferAndProjectQuotaResponse } from './cloudcode-quota-projection';
 export { isVerifiedSessionKey, isHintSessionKey };
 export type ProtocolFailureCategory = 'inspection-limit' | 'unsupported-encoding' | 'malformed-upstream-message' | 'deadline-exceeded' | 'account-quota' | 'upstream-transient';
 export interface ProtocolFrameDecision {
@@ -76,6 +78,7 @@ export class CloudCodeFailoverGateway {
       if (trailers && typeof (res as any).addTrailers === 'function') {
         try { (res as any).addTrailers(trailers); } catch (err) { rejectAndTerminateDownstream(err); return false; }
       }
+      observeGrpcStatus(trailers?.['grpc-status'] ?? h['grpc-status']);
       return endDownstream(b);
     };
     const writeDownstreamChunk = (chunk: Buffer): boolean => {
@@ -92,7 +95,7 @@ export class CloudCodeFailoverGateway {
     }
     const method = req.method || 'POST';
     // Determine upstream target host strictly from :authority or host header
-    const rawAuthority =
+    observeClientUserAgent(req.headers['user-agent']); const rawAuthority =
       (req.headers[':authority'] as string) ||
       (req.headers['host'] as string) ||
       this.defaultUpstreamHost;
@@ -222,9 +225,9 @@ export class CloudCodeFailoverGateway {
       return;
     }
     const parsedBody = preflight.parsedBody || null;
-    const modelName = extractModelName(urlPath, parsedBody);
-    observeNativeModel(req, modelName);
-    const requestedModel = modelName;
+    const requestedModel = extractModelName(urlPath, parsedBody);
+    const sentModel = observedModelIdentifier(requestedModel);
+    observeNativeModel(req, sentModel);
     const isReplaySafe = isReplaySafeOperation(method, urlPath, {
       hasAccountPinnedResources: preflight.hasAccountPinnedResources,
     });
@@ -235,7 +238,7 @@ export class CloudCodeFailoverGateway {
       headers: http.IncomingHttpHeaders;
       bufferedBody?: Buffer;
     } | null = null;
-    const sessionKey = this.extractSessionKey(req, parsedBody);
+    const sessionKey = observeSessionKey(this.extractSessionKey(req, parsedBody));
     const requestId = crypto.randomUUID(); const attemptedAccountIds = new Set<string>();
     const anyLeaseService = this.accountLeaseService as any;
     const totalPoolAccounts = typeof anyLeaseService?.getAccountCount === 'function' ? anyLeaseService.getAccountCount() : (typeof anyLeaseService?.getUsableAccountCount === 'function' ? anyLeaseService.getUsableAccountCount() : (anyLeaseService?.getQuotaDiagnostics?.()?.accounts?.length ?? 5));
@@ -249,7 +252,7 @@ export class CloudCodeFailoverGateway {
       }
       migrationAuthorization = createMigrationAuthorization(reason, sessionKey, binding, requestId) ?? undefined;
     };
-    migrationAuthorization = this.accountLeaseService?.authorizeBoundSessionMigration?.(sessionKey, modelName, requestId);
+    migrationAuthorization = this.accountLeaseService?.authorizeBoundSessionMigration?.(sessionKey, requestedModel, requestId, true);
     let activeLease: {
       account: CloudAccount;
       sessionKey?: string;
@@ -303,32 +306,32 @@ export class CloudCodeFailoverGateway {
         if (this.accountLeaseService) {
           if (typeof this.accountLeaseService.acquireAttemptLease === 'function') {
             activeLease = await this.accountLeaseService.acquireAttemptLease({
-              model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey,
+              model: requestedModel, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, allowUnadvertisedModelFallback: true,
               deferSessionBinding: true, migrationAuthorization, signal: requestAbortController.signal, requestId, affinityOwnerTimeoutMs,
             });
             if (!activeLease && migrationAuthorization) {
               migrationAuthorization = undefined;
               activeLease = await this.accountLeaseService.acquireAttemptLease({
-                model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey,
+                model: requestedModel, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, allowUnadvertisedModelFallback: true,
                 deferSessionBinding: true, migrationAuthorization: undefined, signal: requestAbortController.signal, requestId, affinityOwnerTimeoutMs,
               });
             }
             if (!activeLease && sessionKey) {
               activeLease = await this.accountLeaseService.acquireAttemptLease({
-                model: modelName, excludeAccountIds: Array.from(attemptedAccountIds),
+                model: requestedModel, excludeAccountIds: Array.from(attemptedAccountIds), allowUnadvertisedModelFallback: true,
                 signal: requestAbortController.signal, requestId,
               });
             }
           } else {
             const acc = await this.accountLeaseService.getNextToken({
-              model: modelName, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, deferSessionBinding: true,
+              model: requestedModel, excludeAccountIds: Array.from(attemptedAccountIds), sessionKey, deferSessionBinding: true, allowUnadvertisedModelFallback: true,
             });
             if (acc) {
               activeLease = { account: acc, sessionKey, generation: 1, tableIncarnation: this.accountLeaseService.getTableIncarnation?.(), releaseReservation: acc.releaseReservation ?? (() => {}) };
             }
           }
         }
-        if (this.accountLeaseService && !activeLease) {
+        if (this.accountLeaseService && !activeLease) { if (clientAborted || res.destroyed) return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
           logger.warn(`[CloudCodeGateway] No account lease available in managed pool on attempt ${attempt}. Disallowing unreserved passthrough.`);
           if (!responseCommitted && !res.writableEnded) {
             const ambiguous = lastAmbiguousError as { statusCode: number; headers: http.IncomingHttpHeaders; bufferedBody?: Buffer } | null;
@@ -385,18 +388,16 @@ export class CloudCodeFailoverGateway {
           activeStopCandidateRenewal = () => { if (candidateRenewalTimer) { clearInterval(candidateRenewalTimer); candidateRenewalTimer = null; } };
         }
         leaseRetainedForSameAccount = false;
-
         if (clientAborted || res.destroyed) {
           releaseActiveLease();
           return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
         }
-
         const account = activeLease?.account ?? null;
         const effectiveModel =
           account && requestedModel && typeof this.accountLeaseService?.resolveDynamicModelForAccount === 'function'
             ? this.accountLeaseService.resolveDynamicModelForAccount(account.id, requestedModel)
             : requestedModel;
-        observeAttemptStart(account?.id, effectiveModel);
+        observeAttemptStart(account?.id, sentModel);
         const attemptStartedAt = performance.now();
         const { urlPath: attemptUrlPath, headers: upstreamHeaders, payloadToSend } = composeAttemptRequest({
           rawBody, reqHeaders: req.headers, targetHost, method, urlPath,
@@ -409,7 +410,7 @@ export class CloudCodeFailoverGateway {
         const handleFailureOutcome = async (
           failureEvidence: FailureEvidence, status: number, responseHeaders: http.IncomingHttpHeaders, responseBody?: Buffer,
         ): Promise<'continue' | 'terminal'> => {
-          if (account) observeAccountOutcome(account.id, effectiveModel, 'failure', undefined, status);
+          if (account) observeAccountOutcome(account.id, sentModel, 'failure', undefined, status);
           const hasAlternatives = resolveHasAlternativeAccounts(this.accountLeaseService, account, attemptedAccountIds, attempt, maxAttempts);
           const decision = evaluateRetryDecision({
             evidence: failureEvidence, attempt, maxAttempts, downstreamCommitted: responseCommitted,
@@ -486,10 +487,10 @@ export class CloudCodeFailoverGateway {
             writeDownstream('bad_gateway', lastAmbiguousError.statusCode, lastAmbiguousError.headers, lastAmbiguousError.bufferedBody);
             return 'terminal';
           }
-          const classification = (status === 503 || exhaustedByUnavailable) ? 'unavailable'
-            : status === 413 ? 'request_too_large'
-            : status === 429 ? 'rate_limited'
-            : 'bad_gateway';
+          if (exhaustedByUnavailable && failureEvidence.category === 'model-capability') {
+            writeDownstream('unavailable', 503, { 'content-type': 'application/json' }, JSON.stringify({ error: { code: 503, message: 'All upstream attempts are unavailable.', status: 'UNAVAILABLE' } })); return 'terminal';
+          }
+          const classification = (status === 503 || exhaustedByUnavailable) ? 'unavailable' : status === 413 ? 'request_too_large' : status === 429 ? 'rate_limited' : 'bad_gateway';
           writeDownstream(classification, status, responseHeaders, responseBody);
           return 'terminal';
         };
@@ -754,7 +755,7 @@ export class CloudCodeFailoverGateway {
             bodyStream.once('error', onError);
             req.once?.('close', onClientClose);
             res.once?.('close', onClientClose);
-            const firstChunkTimeoutMs = Math.min(20000, Math.max(2000, deadlineAt - Date.now()));
+            const firstChunkTimeoutMs = Math.min(60000, Math.max(2000, deadlineAt - Date.now()));
             firstChunkTimer = setTimeout(() => {
               if (!settled) { settled = true; cleanup(); reject(new Error(`Upstream first chunk timeout after ${firstChunkTimeoutMs}ms`)); }
             }, firstChunkTimeoutMs);
@@ -765,7 +766,7 @@ export class CloudCodeFailoverGateway {
           bodyStream.destroy();
           return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined;
         }
-        const firstChunk = firstChunkResult.buffer;
+        let firstChunk = firstChunkResult.buffer;
         const frameDecision = firstChunkResult.decision;
         switch (frameDecision.state) {
           case 'VALIDATED_ERROR': {
@@ -818,7 +819,7 @@ export class CloudCodeFailoverGateway {
             return;
           }
           case 'VALIDATED_RESPONSE': {
-            if (account) observeAccountOutcome(account.id, effectiveModel, 'success', performance.now() - attemptStartedAt);
+            if (account) observeAccountOutcome(account.id, sentModel, 'success', performance.now() - attemptStartedAt);
             if (sessionKey && account) {
               if (isHintSessionKey(sessionKey)) {
                 if (typeof this.accountLeaseService?.recordCacheHint === 'function') {
@@ -872,10 +873,14 @@ export class CloudCodeFailoverGateway {
                 }
               }
             }
-            activeCompleteAffinityPlacement?.('committed'); activeCompleteAffinityPlacement = undefined; upstreamResponseSelected = true;
-            receiptOwner.expectDownstreamCommit('validated_response'); activeStopCandidateRenewal?.();
-            writeDownstreamHeaders('validated_response', statusCode, headers);
-            break;
+            activeCompleteAffinityPlacement?.('committed'); activeCompleteAffinityPlacement = undefined; activeAbortMigration = undefined;
+            const projected = await tryBufferAndProjectQuotaResponse({ urlPath: attemptUrlPath, statusCode, headers, firstChunk, bodyStream, req, res, isClientAborted: () => clientAborted, getSnapshot: typeof this.accountLeaseService?.getPoolQuotaProjectionSnapshot === 'function' ? () => this.accountLeaseService!.getPoolQuotaProjectionSnapshot() : undefined, currentAccountId: account?.id });
+            if (projected.handled) {
+              if (projected.aborted) { releaseActiveLease(); return deadlineWriteFailure ? Promise.reject(deadlineWriteFailure) : undefined; }
+              upstreamResponseSelected = true; receiptOwner.expectDownstreamCommit('validated_response'); activeStopCandidateRenewal?.(); clearLogicalDeadline();
+              writeDownstream('validated_response', statusCode, projected.headers, projected.body); releaseActiveLease(); return;
+            }
+            firstChunk = projected.initialChunk; upstreamResponseSelected = true; receiptOwner.expectDownstreamCommit('validated_response'); activeStopCandidateRenewal?.(); writeDownstreamHeaders('validated_response', statusCode, headers); clearLogicalDeadline(); break;
           }
         }
         const { responseUsage, onStreamEnd } = createNativeRelayEnd(res, bodyStream, headers, endDownstream, rejectAndTerminateDownstream, clearLogicalDeadline);
@@ -891,7 +896,7 @@ export class CloudCodeFailoverGateway {
         });
         bodyStream.once('error', (err) => {
           if (downstreamClosed || (res as any).destroyed || res.writableEnded) return;
-          observeUpstreamStreamFailure(account?.id, effectiveModel);
+          observeUpstreamStreamFailure(account?.id, sentModel);
           logger.warn(
             '[CloudCodeGateway] Upstream streaming error: operation=upstream_stream reason=stream_error',
           );
@@ -1079,23 +1084,10 @@ export class CloudCodeFailoverGateway {
       }
     }
     if (errorText !== undefined) {
-      const isQuota =
-        code === 429 || code === 'RESOURCE_EXHAUSTED' ||
-        (!msg.includes('quota project') && (
-          msg.includes('individual quota reached') ||
-          msg.includes('exhausted your quota') ||
-          msg.includes('quota exceeded') ||
-          msg.includes('resource_exhausted') ||
-          (msg.includes('rate limit') && !msg.includes('project'))
-        ));
+      const isQuota = code === 429 || code === 'RESOURCE_EXHAUSTED' ||
+        (!msg.includes('quota project') && (msg.includes('quota reached') || msg.includes('baseline quota') || msg.includes('credit overages') || msg.includes('exhausted your quota') || msg.includes('quota exceeded') || msg.includes('resource_exhausted') || (msg.includes('rate limit') && !msg.includes('project'))));
       const isTransient = code === 503 || msg.includes('unavailable');
-      return {
-        state: 'VALIDATED_ERROR',
-        isQuota,
-        isTransient,
-        category: isQuota ? 'account-quota' : isTransient ? 'upstream-transient' : undefined,
-        errorText,
-      };
+      return { state: 'VALIDATED_ERROR', isQuota, isTransient, category: isQuota ? 'account-quota' : isTransient ? 'upstream-transient' : undefined, errorText };
     }
     return null;
   }
@@ -1416,7 +1408,7 @@ export class CloudCodeFailoverGateway {
       // When alternative accounts are available in the pool, fail fast on hanging upstream (20s)
       // to allow attempting other accounts before logical request deadline (120s) expires.
       // If no alternatives, allow slightly longer (35s) but still bounded.
-      const defaultAttemptTimeoutMs = hasAlternativeAccounts ? 20000 : 35000;
+      const defaultAttemptTimeoutMs = hasAlternativeAccounts ? 60000 : 90000;
       const attemptTimeoutMs = Math.min(defaultAttemptTimeoutMs, remainingDeadlineMs);
       const options: https.RequestOptions = {
         hostname: upstreamHost,
@@ -1424,7 +1416,7 @@ export class CloudCodeFailoverGateway {
         path: url,
         method,
         headers,
-        timeout: 60000, // Inactivity timeout on socket
+        timeout: 300000, // Inactivity timeout on socket
       };
       let settled = false, deadlineTimer: NodeJS.Timeout | null = null, upstreamResRef: http.IncomingMessage | null = null;
       const cleanupCall = () => { if (deadlineTimer) { clearTimeout(deadlineTimer); deadlineTimer = null; } };
@@ -1492,7 +1484,7 @@ export class CloudCodeFailoverGateway {
       onReqCreated?.(upstreamReq);
       // Inactivity timeout
       upstreamReq.on('timeout', () => {
-        upstreamReq.destroy(new Error('Upstream socket inactivity timeout after 60s'));
+        upstreamReq.destroy(new Error('Upstream socket inactivity timeout after 300s'));
       });
       // Overall attempt absolute deadline timer
       deadlineTimer = setTimeout(() => {

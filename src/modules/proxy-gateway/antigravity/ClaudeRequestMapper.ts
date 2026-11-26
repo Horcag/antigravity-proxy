@@ -4,6 +4,8 @@ import { mapClaudeModelToGemini, normalizeGeminiModelAlias } from './ModelMappin
 import { getMaxOutputTokens, getThinkingBudget } from './ModelSpecs';
 import { cleanJsonSchema, normalizeObjectJsonSchema } from './JsonSchemaUtils';
 import { SignatureContext, SignatureStore } from './SignatureStore';
+import { detectsNetworkingTool, isBuiltinServerSearchTool } from './server-search-tools';
+import { sanitizeUpstreamBlockedSystemText } from './system-instruction-sanitizer';
 import { logger } from '@/shared/logging/logger';
 import {
   ClaudeRequest,
@@ -144,8 +146,12 @@ export function transformClaudeRequestIn(
   signatureContext?: SignatureContext,
 ): GeminiInternalRequest {
   const lookupSignature = createSignatureLookup(signatureContext);
-  // Check for networking tools (server tool or built-in tool)
-  const hasWebSearchTool = detectsNetworkingTool(claudeReq.tools);
+  const hasFunctionDeclarations = (claudeReq.tools ?? []).some(
+    (tool) => Boolean(tool.name) && !isBuiltinServerSearchTool(tool),
+  );
+  // Server-side Google Search grounding cannot share v1internal requests with functionDeclarations,
+  // and custom client function tools (such as OpenClaw's `web_search`) must never override the target model.
+  const hasWebSearchTool = !hasFunctionDeclarations && detectsNetworkingTool(claudeReq.tools);
 
   // Map to store tool_use id -> name mapping
   const toolIdToName = new Map<string, string>();
@@ -379,7 +385,10 @@ function resolveRequestConfig(
     };
   }
 
-  const hasNetworkingTool = detectsNetworkingTool(tools);
+  const hasCustomFunctions = (tools ?? []).some(
+    (tool) => Boolean(tool.name) && !isBuiltinServerSearchTool(tool),
+  );
+  const hasNetworkingTool = !hasCustomFunctions && detectsNetworkingTool(tools);
 
   // Strip -online suffix
   const isOnlineSuffix = originalModel.endsWith('-online');
@@ -488,60 +497,6 @@ function toToolSchema(schema: unknown): Record<string, unknown> {
   return normalizeObjectJsonSchema(schema);
 }
 
-/**
- * Detects if networking tools are present
- * Checks tool list for web search related tools
- * Supports Claude Tool and Gemini GeminiToolDeclaration formats
- */
-function detectsNetworkingTool(tools?: (Tool | GeminiToolDeclaration)[]): boolean {
-  if (!tools) {
-    return false;
-  }
-  const keywords = [
-    'web_search',
-    'google_search',
-    'web_search_20250305',
-    'google_search_retrieval',
-    'builtin_web_search',
-  ];
-
-  for (const tool of tools) {
-    // Claude Tool format
-    const toolName = (tool as { name?: unknown }).name;
-    if (isString(toolName) && keywords.includes(toolName)) {
-      return true;
-    }
-    const toolType = (tool as { type?: unknown }).type;
-    if (isString(toolType) && keywords.includes(toolType)) {
-      return true;
-    }
-
-    // OpenAI nested format (runtime check)
-    const openaiTool = tool as { function?: { name?: string } };
-    if (isString(openaiTool.function?.name) && keywords.includes(openaiTool.function.name)) {
-      return true;
-    }
-
-    // Gemini GeminiToolDeclaration format
-    if ('functionDeclarations' in tool && tool.functionDeclarations) {
-      for (const decl of tool.functionDeclarations) {
-        if (decl.name && keywords.includes(decl.name)) {
-          return true;
-        }
-      }
-    }
-
-    // Gemini search tools
-    if ('googleSearch' in tool && tool.googleSearch) {
-      return true;
-    }
-    if ('googleSearchRetrieval' in tool && tool.googleSearchRetrieval) {
-      return true;
-    }
-  }
-  return false;
-}
-
 function injectGoogleSearchTool(body: { tools?: GeminiToolDeclaration[] }, mappedModel?: string) {
   if (!body.tools) {
     body.tools = [];
@@ -577,22 +532,10 @@ function buildSystemInstruction(
 
   const parts: { text: string }[] = [];
 
-  let hasIdentityDirective = false;
-
-  if (system) {
-    if (isString(system)) {
-      if (system.includes(identityMarker)) {
-        hasIdentityDirective = true;
-      }
-    } else if (Array.isArray(system)) {
-      for (const block of system) {
-        if (block.type === 'text' && block.text.includes(identityMarker)) {
-          hasIdentityDirective = true;
-          break;
-        }
-      }
-    }
-  }
+  const hasIdentityDirective = isString(system)
+    ? system.includes(identityMarker)
+    : Array.isArray(system) &&
+      system.some((block) => block.type === 'text' && block.text.includes(identityMarker));
 
   if (!hasIdentityDirective) {
     parts.push({ text: assistantIdentityDirective });
@@ -600,10 +543,12 @@ function buildSystemInstruction(
 
   if (system) {
     if (isString(system)) {
-      parts.push({ text: system });
+      parts.push({ text: sanitizeUpstreamBlockedSystemText(system) });
     } else if (Array.isArray(system)) {
       for (const block of system) {
-        if (block.type === 'text') parts.push({ text: block.text });
+        if (block.type === 'text') {
+          parts.push({ text: sanitizeUpstreamBlockedSystemText(block.text) });
+        }
       }
     }
   }
@@ -819,13 +764,7 @@ function buildTools(
   let hasGoogleSearch = hasWebSearch;
 
   for (const tool of tools) {
-    if (
-      tool.name === 'web_search' ||
-      tool.name === 'google_search' ||
-      tool.name === 'builtin_web_search' ||
-      tool.type === 'web_search_20250305' ||
-      tool.type === 'builtin_web_search'
-    ) {
+    if (isBuiltinServerSearchTool(tool)) {
       hasGoogleSearch = true;
       continue;
     }

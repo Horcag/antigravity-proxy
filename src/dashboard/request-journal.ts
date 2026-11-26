@@ -7,6 +7,8 @@ import { extractApiKeyToken, resolveApiProject } from '../modules/proxy-gateway/
 import { safeLabel, normalizedRoute } from '../observability/metadata';
 import { getRequestHistoryStore, closeRequestHistory, type HistoryInput } from '../observability/request-history';
 import { createRequestObservation, runWithRequestObservation, observeResponseUsage, type RequestObservation } from '../observability/request-context';
+import { attachHttpSseUsageTap, type HttpSseUsageTap } from '../observability/http-sse-usage';
+import { extractSessionKey } from '../modules/proxy-gateway/server/cloudcode-request-adapter';
 export { safeLabel, normalizedRoute };
 
 export type JournalInput = HistoryInput;
@@ -53,14 +55,21 @@ const installed = new WeakSet<FastifyInstance>();
 export function installDashboardHooks(server: FastifyInstance): void {
   if (installed.has(server)) return;
   installed.add(server);
-  const contexts = new WeakMap<FastifyRequest, { started: number; context: RequestObservation; project: { id: string; name: string } | null }>();
+  const contexts = new WeakMap<FastifyRequest, { started: number; context: RequestObservation; project: { id: string; name: string } | null; sseTap: HttpSseUsageTap }>();
   server.addHook('onRequest', (request, reply, done) => {
     const context = createRequestObservation();
     const started = performance.now();
     const project = resolveApiProject(getServerConfig(), extractApiKeyToken(request.headers));
-    contexts.set(request, { started, context, project });
+    const sseTap = attachHttpSseUsageTap(reply, context);
+    contexts.set(request, { started, context, project, sseTap });
+    reply.raw.once('finish', () => {
+      if (sseTap.isSse()) record(request, sseTap.statusCode() ?? reply.raw.statusCode ?? reply.statusCode);
+    });
     reply.raw.once('close', () => {
-      if (!reply.raw.writableFinished) record(request, context.upstream_failed ? 502 : 499);
+      if (!reply.raw.writableFinished) {
+        sseTap.discard();
+        record(request, context.upstream_failed ? 502 : 499);
+      }
     });
     runWithRequestObservation(context, done);
   });
@@ -73,13 +82,24 @@ export function installDashboardHooks(server: FastifyInstance): void {
   const record = (request: FastifyRequest, status: number) => {
     const state = contexts.get(request);
     if (!state || state.context.finished) return;
-    const { context, started, project } = state;
+    const { context, started, project, sseTap } = state;
+    if (sseTap.isSse()) {
+      status = status === 499 ? 499 : (sseTap.statusCode() ?? status);
+      sseTap.finalize(status < 400 && !context.upstream_failed);
+    }
     if (context.upstream_failed && status < 400) status = 502;
+    const body = request.body && typeof request.body === 'object' ? request.body as Record<string, unknown> : {};
+    if (!context.session_key) {
+      const extracted = extractSessionKey(request, body);
+      if (extracted) {
+        const safe = safeLabel(extracted.trim().slice(0, 100), '');
+        if (safe) context.session_key = safe;
+      }
+    }
     context.finished = true;
     contexts.delete(request);
     const route = normalizedRoute(request.url);
     if (route === 'other') return;
-    const body = request.body && typeof request.body === 'object' ? request.body as Record<string, unknown> : {};
     const model = body.model ?? request.url.split('?')[0].match(/\/models\/([^/:]+):/)?.[1];
     requestJournal.record({ ...context, protocol: 'http', route: request.url, model,
       project_id: project?.id, project_name: project?.name, status, duration_ms: performance.now() - started });

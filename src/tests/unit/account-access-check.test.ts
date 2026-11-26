@@ -48,6 +48,9 @@ describe('explicit account access checks', () => {
     const result = await service.check(account.id);
     expect(result).toMatchObject({ outcome: 'working', comparison: 'restored', previous_reason: 'tos_violation', reason: 'generation_succeeded', evidence: { stage: 'generation', model: 'gemini-2.5-flash', http_status: 200 } });
     expect(await CloudAccountRepo.getAccount(account.id)).toEqual(account);
+    expect(result.duration_ms).toEqual(expect.any(Number));
+    expect(result.duration_ms).toBeGreaterThanOrEqual(0);
+    expect(CloudAccountRepo.getAccessCheck(account.id)?.duration_ms).toBe(result.duration_ms);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, request] = fetchMock.mock.calls[0];
     expect(url).toBe('https://probe.example.test/v1internal:generateContent');

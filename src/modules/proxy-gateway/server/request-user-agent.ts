@@ -1,12 +1,18 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import axios from 'axios';
 import { isString } from 'lodash-es';
 import { logger } from '../../../shared/logging/logger';
 
 const REMOTE_VERSION_URL = 'https://antigravity-auto-updater-974169037036.us-central1.run.app';
 const CHANGELOG_URL = 'https://antigravity.google/changelog';
-export const FALLBACK_VERSION = '2.29.0';
+export const FALLBACK_VERSION = '2.33.0';
 const DEFAULT_REMOTE_TIMEOUT_MS = 2500;
+const SERVER_VERSION_CACHE_TTL_MS = 300_000;
 const VERSION_REGEX = /\d+\.\d+\.\d+/g;
+const SEMVER_EXACT_REGEX = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+const HUB_UA_VERSION_REGEX = /antigravity\/hub\/((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))/i;
 
 type UserAgentSource = 'local' | 'remote' | 'changelog' | 'fallback';
 
@@ -18,6 +24,8 @@ interface UserAgentResolution {
 
 let cachedUserAgentResolution: UserAgentResolution | null = null;
 let pendingUserAgentResolution: Promise<UserAgentResolution> | null = null;
+let observedHubVersion: string | null = null;
+let installedServerVersionCache: { value: string | null; checkedAt: number } | null = null;
 
 function normalizeNonEmptyString(value: string | null | undefined): string | null {
   if (!isString(value)) {
@@ -56,7 +64,7 @@ function getArchTag(): string {
 }
 
 export function buildUserAgent(version: string): string {
-  return `antigravity/${version} ${getPlatformTag()}/${getArchTag()}`;
+  return `antigravity/hub/${version} (aidev_client; os_type=${getPlatformTag()}; arch=${getArchTag()})`;
 }
 
 function compareSemverVersions(left: string, right: string): number {
@@ -104,15 +112,78 @@ export function resolveLocalInstalledVersion(): string | null {
   if (!configuredVersion) {
     return null;
   }
-  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(configuredVersion)) {
+  if (!SEMVER_EXACT_REGEX.test(configuredVersion)) {
     throw new Error('AG_PROXY_UPSTREAM_VERSION must be an exact major.minor.patch version');
   }
   return configuredVersion;
 }
 
+export function observeClientUserAgent(rawHeader: string | string[] | undefined): void {
+  const header = Array.isArray(rawHeader) ? rawHeader[0] : rawHeader;
+  if (!isString(header) || !header.trim()) {
+    return;
+  }
+  const match = HUB_UA_VERSION_REGEX.exec(header);
+  if (!match) {
+    return;
+  }
+  const version = match[1];
+  if (!observedHubVersion || compareSemverVersions(version, observedHubVersion) > 0) {
+    observedHubVersion = version;
+    cachedUserAgentResolution = null;
+  }
+}
+
+export function resetObservedClientUserAgentForTesting(): void {
+  observedHubVersion = null;
+  installedServerVersionCache = null;
+}
+
+function resolveInstalledAntigravityServerVersion(): string | null {
+  if (shouldSkipRemoteVersionLookup()) {
+    return null;
+  }
+  const now = Date.now();
+  if (installedServerVersionCache && now - installedServerVersionCache.checkedAt < SERVER_VERSION_CACHE_TTL_MS) {
+    return installedServerVersionCache.value;
+  }
+  let best: string | null = null;
+  try {
+    const serverBinDir = path.join(os.homedir(), '.antigravity-server', 'bin');
+    for (const entry of fs.readdirSync(serverBinDir)) {
+      if (!SEMVER_EXACT_REGEX.test(entry)) {
+        continue;
+      }
+      if (!best || compareSemverVersions(entry, best) > 0) {
+        best = entry;
+      }
+    }
+  } catch {
+    best = null;
+  }
+  installedServerVersionCache = { value: best, checkedAt: now };
+  return best;
+}
+
+export function resolveEffectiveUpstreamVersion(): string {
+  const localPin = resolveLocalInstalledVersion();
+  if (localPin) {
+    return localPin;
+  }
+  let best = FALLBACK_VERSION;
+  if (observedHubVersion && compareSemverVersions(observedHubVersion, best) > 0) {
+    best = observedHubVersion;
+  }
+  const installed = resolveInstalledAntigravityServerVersion();
+  if (installed && compareSemverVersions(installed, best) > 0) {
+    best = installed;
+  }
+  return best;
+}
+
 async function fetchTextPayload(url: string): Promise<string | null> {
   try {
-    const discoveryVersion = resolveLocalInstalledVersion() ?? FALLBACK_VERSION;
+    const discoveryVersion = resolveEffectiveUpstreamVersion();
     const response = await axios.get<string>(url, {
       timeout: DEFAULT_REMOTE_TIMEOUT_MS,
       responseType: 'text',
@@ -176,7 +247,7 @@ async function resolveDefaultUserAgentResolution(): Promise<UserAgentResolution>
     };
   }
 
-  let bestVersion = FALLBACK_VERSION;
+  let bestVersion = resolveEffectiveUpstreamVersion();
   let bestSource: UserAgentSource = 'fallback';
 
   const remoteVersion = await resolveRemoteVersion();

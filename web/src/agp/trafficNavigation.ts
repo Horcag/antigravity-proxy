@@ -3,6 +3,7 @@ import type { StatisticsBucket } from './types';
 export const historyFilterKeys = [
   'accountId',
   'finalAccountId',
+  'sessionKey',
   'projectId',
   'model',
   'missingModel',

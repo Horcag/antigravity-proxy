@@ -22,3 +22,11 @@ export function authorizeBoundSessionMigration(
   const authorizedReason = reason ?? (isTemporarilyUnavailable(binding.accountId) ? 'account-cooldown' : undefined);
   return authorizedReason ? createMigrationAuthorization(authorizedReason, sessionKey, binding, ownerRequestId) ?? undefined : undefined;
 }
+
+export function selectUnadvertisedFallbackCandidates<T extends [string, unknown]>(
+  activeTokens: T[],
+  model: string,
+  hasHardCapabilityFailure: (accountId: string, modelId: string) => boolean,
+): T[] {
+  return activeTokens.filter(([accountId]) => !hasHardCapabilityFailure(accountId, model));
+}

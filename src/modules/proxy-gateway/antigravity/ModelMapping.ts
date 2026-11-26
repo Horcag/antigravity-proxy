@@ -31,6 +31,33 @@ const PUBLIC_SUPPORTED_MODELS = [
 
 const CLAUDE_TO_GEMINI: Record<string, string> = {
   // Directly supported models
+  'gemini-4-neon-low': 'gemini-4-neon-low',
+  'gemini-4-neon-medium': 'gemini-4-neon-medium',
+  'gemini-4-neon-high': 'gemini-4-neon-high',
+  'gemini-4-neon-xhigh': 'gemini-4-neon-xhigh',
+  'gemini-pro-orchestrator-neon': 'gemini-pro-orchestrator-neon',
+  'gemini-pro-orchestrator-argon': 'gemini-pro-orchestrator-argon',
+  'gemini-pro-orchestrator': 'gemini-pro-orchestrator',
+  'gemini-flash-worker-agy': 'gemini-flash-worker-agy',
+  'gemini-4-argon-low': 'gemini-4-argon-low',
+  'gemini-4-argon-medium': 'gemini-4-argon-medium',
+  'gemini-4-argon-high': 'gemini-4-argon-high',
+  'gemini-4-hydrogen-low': 'gemini-4-hydrogen-low',
+  'gemini-4-hydrogen-medium': 'gemini-4-hydrogen-medium',
+  'gemini-4-hydrogen-high': 'gemini-4-hydrogen-high',
+  'gemini-4-hydrogen-xhigh': 'gemini-4-hydrogen-xhigh',
+  'gemini-4-hydrogen-tiered-high': 'gemini-4-hydrogen-tiered-high',
+  'gemini-4-hydrogen-tiered-xhigh': 'gemini-4-hydrogen-tiered-xhigh',
+  'gemini-3.8-flash-low': 'gemini-3.8-flash-low',
+  'gemini-3.8-flash-medium': 'gemini-3.8-flash-medium',
+  'gemini-3.8-flash-high': 'gemini-3.8-flash-high',
+  'gemini-3.8-flash-tiered': 'gemini-3.8-flash-tiered',
+  'claude-opus-5-5-low': 'claude-opus-5-5-low',
+  'claude-opus-5-5-medium': 'claude-opus-5-5-medium',
+  'claude-opus-5-5-high': 'claude-opus-5-5-high',
+  'claude-sonnet-5-5-low': 'claude-sonnet-5-5-low',
+  'claude-sonnet-5-5-medium': 'claude-sonnet-5-5-medium',
+  'claude-sonnet-5-5-high': 'claude-sonnet-5-5-high',
   'claude-sonnet-4-6-thinking': 'claude-sonnet-4-6-thinking',
   'claude-opus-4-6-thinking': 'claude-opus-4-6-thinking',
   'gemini-3.5-flash-high': 'gemini-3.5-flash-high',
@@ -80,6 +107,12 @@ const CLAUDE_TO_GEMINI: Record<string, string> = {
   'gpt-3.5-turbo-0613': 'gemini-3-flash',
 
   // Gemini Protocol Mapping
+  'gemini-4-neon': 'gemini-4-neon-high',
+  'gemini-4-argon': 'gemini-4-argon-medium',
+  'gemini-4-hydrogen': 'gemini-4-hydrogen-medium',
+  'gemini-3.8-flash': 'gemini-3.8-flash-high',
+  'claude-opus-5-5': 'claude-opus-5-5-high',
+  'claude-sonnet-5-5': 'claude-sonnet-5-5-high',
   'gemini-3.1-pro-preview': 'gemini-3.1-pro-high',
   'gemini-3.1-pro': 'gemini-3.1-pro-high',
   'gemini-3.0-pro': 'gemini-3.1-pro-high',
@@ -97,6 +130,7 @@ export const NON_CHAT_CATALOG_MODEL_IDS: ReadonlySet<string> = new Set([
   'tab_flash_lite_preview',
   'tab_jump_flash_lite_preview',
   'internal-background-task',
+  'gemini-4-hydrogen-sonar',
 ]);
 
 export function isNonChatCatalogModelId(modelId: string): boolean {

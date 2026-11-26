@@ -3,16 +3,23 @@ import { randomUUID } from 'node:crypto';
 import type { AttemptRecord } from './request-history';
 import { safeLabel, nullableCount, errorCategory } from './metadata';
 
+export type UsageSchema = 'gemini' | 'anthropic' | 'openai';
+
 export interface RequestObservation {
   request_id: string;
   requested_model?: string;
   effective_model?: string;
   account_id?: string;
+  grpc_status?: string;
+  session_key?: string | null;
   attempts: AttemptRecord[];
   ttft_ms?: number | null;
   input_tokens?: number | null;
   output_tokens?: number | null;
+  thought_tokens?: number | null;
   cache_tokens?: number | null;
+  cache_write_tokens?: number | null;
+  usage_schema?: UsageSchema | null;
   upstream_failed?: boolean;
   finished: boolean;
 }
@@ -20,6 +27,29 @@ const observations = new AsyncLocalStorage<RequestObservation>();
 export function createRequestObservation(): RequestObservation { return { request_id: randomUUID(), attempts: [], finished: false }; }
 export function runWithRequestObservation<T>(observation: RequestObservation, work: () => T): T { return observations.run(observation, work); }
 export function getRequestObservation(): RequestObservation | undefined { return observations.getStore(); }
+
+export function observeGrpcStatus(value: unknown): void {
+  const context = observations.getStore();
+  if (context && !context.finished && typeof value === 'string' && /^(?:[0-9]|1[0-6])$/.test(value)) {
+    context.grpc_status = value;
+    const attempt = context.attempts.at(-1);
+    if (attempt && value !== '0') {
+      attempt.outcome = 'failure';
+      attempt.error_category ??= 'upstream_error';
+    }
+  }
+}
+
+export function observeSessionKey(sessionKey: string | undefined): string | undefined {
+  if (!sessionKey) return sessionKey;
+  const context = observations.getStore();
+  if (!context || context.finished) return sessionKey;
+  const trimmed = sessionKey.trim();
+  if (!trimmed) return sessionKey;
+  const safe = safeLabel(trimmed.slice(0, 100), '');
+  if (safe) context.session_key = safe;
+  return sessionKey;
+}
 
 export function observeSelectedAccount(accountId: string): void {
   const context = observations.getStore();
@@ -29,10 +59,11 @@ export function observeSelectedAccount(accountId: string): void {
 }
 export function observeAttemptStart(accountId: string | undefined, model: string | undefined): void {
   const context = observations.getStore();
-  if (!context || context.finished || !accountId) return;
+  if (!context || context.finished) return;
+  context.effective_model = safeLabel(model, '') || undefined;
+  if (!accountId) return;
   const current = context.attempts.at(-1);
   if (!current || current.account_id !== accountId || current.outcome !== 'unknown') observeSelectedAccount(accountId);
-  context.effective_model = safeLabel(model, '') || undefined;
   const attempt = context.attempts.at(-1);
   if (attempt) attempt.effective_model = context.effective_model;
 }
@@ -52,28 +83,56 @@ export function observeAccountOutcome(accountId: string, model: string | undefin
   if (outcome === 'success') context.ttft_ms = selected.ttft_ms;
 }
 
-export type ResponseUsage = Partial<Pick<RequestObservation, 'input_tokens' | 'output_tokens' | 'cache_tokens'>>;
+export type ResponseUsage = Partial<
+  Pick<
+    RequestObservation,
+    'input_tokens' | 'output_tokens' | 'thought_tokens' | 'cache_tokens' | 'cache_write_tokens' | 'usage_schema'
+  >
+>;
 
 /** Read numeric usage fields only, retaining no payload text or response structure. */
 export function extractResponseUsage(payload: unknown): ResponseUsage {
   if (!payload || typeof payload !== 'object') return {};
   const object = payload as Record<string, unknown>;
   if (object.error) return {};
-  const nested = object.response && typeof object.response === 'object' ? object.response as Record<string, unknown> : object;
+  const nested = object.response && typeof object.response === 'object'
+    ? object.response as Record<string, unknown>
+    : object.message && typeof object.message === 'object'
+      ? object.message as Record<string, unknown>
+      : object;
   if (nested.error) return {};
-  const usage = (nested.usageMetadata ?? nested.usage) as Record<string, unknown> | undefined;
+  const isGeminiMeta = Boolean(nested.usageMetadata && typeof nested.usageMetadata === 'object');
+  const usage = (isGeminiMeta ? nested.usageMetadata : nested.usage) as Record<string, unknown> | undefined;
   if (!usage || typeof usage !== 'object') return {};
-  const details = usage.prompt_tokens_details && typeof usage.prompt_tokens_details === 'object' ? usage.prompt_tokens_details as Record<string, unknown> : undefined;
+  const promptDetails = (usage.prompt_tokens_details ?? usage.input_tokens_details) as Record<string, unknown> | undefined;
+  const completionDetails = (usage.completion_tokens_details ?? usage.output_tokens_details) as Record<string, unknown> | undefined;
+  const isAnthropic = !isGeminiMeta && (
+    object.type === 'message' || object.type === 'message_start' || object.type === 'message_delta'
+    || 'cache_read_input_tokens' in usage || 'cache_creation_input_tokens' in usage
+  );
+  const schema: UsageSchema = isGeminiMeta ? 'gemini' : isAnthropic ? 'anthropic' : 'openai';
   const result: ResponseUsage = {};
   for (const [key, value] of [
     ['input_tokens', usage.promptTokenCount ?? usage.input_tokens ?? usage.prompt_tokens],
     ['output_tokens', usage.candidatesTokenCount ?? usage.output_tokens ?? usage.completion_tokens],
-    ['cache_tokens', usage.cachedContentTokenCount ?? usage.cache_read_input_tokens ?? details?.cached_tokens],
+    ['thought_tokens', usage.thoughtsTokenCount ?? completionDetails?.reasoning_tokens],
+    ['cache_tokens', usage.cachedContentTokenCount ?? usage.cache_read_input_tokens ?? promptDetails?.cached_tokens],
+    ['cache_write_tokens', usage.cache_creation_input_tokens],
   ] as const) {
     const count = nullableCount(value);
     if (count !== null) result[key] = count;
   }
+  if (Object.keys(result).length > 0) result.usage_schema = schema;
   return result;
+}
+export function mergeStreamResponseUsage(target: ResponseUsage, incoming: ResponseUsage): void {
+  for (const key of ['input_tokens', 'output_tokens', 'thought_tokens', 'cache_tokens', 'cache_write_tokens'] as const) {
+    const next = incoming[key];
+    if (typeof next !== 'number') continue;
+    const prev = target[key];
+    target[key] = typeof prev === 'number' ? Math.max(prev, next) : next;
+  }
+  if (incoming.usage_schema) target.usage_schema = incoming.usage_schema;
 }
 export function observeResponseUsage(payload: unknown): void {
   const context = observations.getStore();

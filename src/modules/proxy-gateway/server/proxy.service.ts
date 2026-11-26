@@ -1319,7 +1319,7 @@ export class ProxyService {
           const projectId = token.token.project_id ?? '';
           const requestUserAgent = await resolveRequestUserAgent();
           const geminiBody = transformClaudeRequestIn(
-            claudeRequest,
+            effectiveTargetModel === claudeRequest.model ? claudeRequest : { ...claudeRequest, model: effectiveTargetModel },
             projectId,
             requestUserAgent,
             signatureContext,

@@ -2,6 +2,7 @@ export interface AccessCheck {
   account_id: string;
   outcome: 'working' | 'banned' | 'inconclusive';
   checked_at: string;
+  duration_ms?: number;
   reason: string;
   message: string;
   comparison: 'restored' | 'same' | 'changed' | 'first';
@@ -20,9 +21,21 @@ export interface Account {
   review_required: boolean;
   access_check?: AccessCheck | null;
   quota?: {
-    models: Record<string, { percentage: number; resetTime: string }>;
+    models: Record<string, { percentage: number; resetTime: string; display_name?: string }>;
     last_successful_refresh_at?: number;
     subscription_tier?: string;
+    quota_groups?: Array<{
+      display_name: string;
+      description?: string;
+      buckets: Array<{
+        bucket_id: string;
+        window: string;
+        remaining_fraction: number;
+        reset_time: string;
+        display_name?: string;
+        description?: string;
+      }>;
+    }>;
   };
   created_at?: string;
   last_used?: string;
@@ -60,6 +73,7 @@ export interface RequestEntry {
   project_id: string;
   project_name: string;
   account_id: string | null;
+  session_key?: string | null;
   status: number;
   grpc_status: string | null;
   error_category: string | null;
@@ -67,7 +81,10 @@ export interface RequestEntry {
   ttft_ms: number | null;
   input_tokens: number | null;
   output_tokens: number | null;
+  thought_tokens?: number | null;
   cache_tokens: number | null;
+  cache_write_tokens?: number | null;
+  usage_schema?: string | null;
   attempts: Array<{
     account_id: string;
     effective_model?: string | null;

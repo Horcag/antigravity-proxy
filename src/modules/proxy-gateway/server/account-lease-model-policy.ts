@@ -20,14 +20,11 @@ interface AccountLeaseModelPolicyOptions {
  * sibling variant that is still advertised, preferring the self-routing
  * "tiered" preset over explicit effort levels.
  */
-const MODEL_VARIANT_SUFFIX_PATTERN = /^(?<base>.+)-(?<variant>tiered|extra-low|low|medium|high)$/;
+const MODEL_VARIANT_SUFFIX_PATTERN = /^(?<base>.+)-(?<variant>tiered-xhigh|tiered-high|tiered|xhigh|extra-low|low|medium|high)$/;
 
 const MODEL_VARIANT_PRIORITY: Record<string, number> = {
-  tiered: 5,
-  high: 4,
-  medium: 3,
-  low: 2,
-  'extra-low': 1,
+  'tiered-xhigh': 8, 'tiered-high': 7, tiered: 6, xhigh: 5,
+  high: 4, medium: 3, low: 2, 'extra-low': 1,
 };
 
 const GEMINI_PRO_FAMILY = new Set([
@@ -46,8 +43,8 @@ const GEMINI_FLASH_IMAGE_FAMILY = new Set(['gemini-3-flash-image', 'gemini-3.1-f
 
 const IMAGE_MODEL_CAPABILITY_PATTERN = /(?:^|-)image(?:-|$)/;
 
-const TIERED_MODEL_SUFFIXES = ['tiered', 'extra-low', 'high', 'medium', 'low'] as const;
-const TIER_PREFERENCE = ['tiered', 'high', 'medium', 'low', 'extra-low'] as const;
+const TIERED_MODEL_SUFFIXES = ['tiered-xhigh', 'tiered-high', 'tiered', 'xhigh', 'extra-low', 'high', 'medium', 'low'] as const;
+const TIER_PREFERENCE = ['tiered-xhigh', 'tiered-high', 'tiered', 'xhigh', 'high', 'medium', 'low', 'extra-low'] as const;
 type TieredModelSuffix = (typeof TIER_PREFERENCE)[number];
 export type AccountModelAvailability = 'unknown' | 'available' | 'unavailable';
 

@@ -1,10 +1,8 @@
 import type { AccountLeaseAccountStore, AccountLeaseUpstream } from './account-lease-adapters';
 import type { CloudQuotaData } from '@/modules/cloud-account/types';
+import { tryRecordQuotaSnapshot } from '@/observability/request-history';
 import { isAICreditsAuthenticationError } from '@/modules/cloud-account/services/ai-credits-authentication-error';
-import {
-  buildAccountLeaseQuotaSnapshot,
-  findEarliestQuotaResetTime,
-} from './account-lease-quota-policy';
+import { buildAccountLeaseQuotaSnapshot } from './account-lease-quota-policy';
 import type { AccountLeaseTokenData } from './account-lease-token-types';
 import { RateLimitReason } from './rate-limit-tracker';
 import { proxyModelAvailabilityStore } from './proxy-model-availability-store';
@@ -100,16 +98,14 @@ export class AccountLeaseQuotaRefreshPolicy {
     model?: string,
   ): boolean {
     const tokenData = this.options.getTokenCache().get(accountId);
-    if (!tokenData) {
+    // A scheduled reset by itself says nothing about exhaustion.
+    if (!model || tokenData?.model_quotas[model] !== 0) {
       return false;
     }
 
-    const resetTime = findEarliestQuotaResetTime(tokenData.model_reset_times);
-    if (!resetTime) {
-      return false;
-    }
-
-    return this.options.setLockoutUntilIso(accountId, resetTime, reason, model);
+    const resetTime = tokenData.model_reset_times[model];
+    return Date.parse(resetTime) > Date.now() &&
+      this.options.setLockoutUntilIso(accountId, resetTime, reason, model);
   }
 
   async refreshQuotaCatalog(options: {
@@ -368,6 +364,7 @@ export class AccountLeaseQuotaRefreshPolicy {
       accountId,
       Object.keys(extractedState.modelQuotas),
     );
+    tryRecordQuotaSnapshot(accountId, quotaSnapshot, refreshedAt);
     return true;
   }
 

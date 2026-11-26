@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { CloudCodeFailoverGateway } from '../../modules/proxy-gateway/server/cloudcode-failover-gateway.js';
+import { classifyUpstreamFailure } from '../../modules/proxy-gateway/server/upstream-failure.js';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import type { CloudAccount } from '../../modules/cloud-account/types.js';
@@ -332,5 +333,139 @@ describe('CloudCodeFailoverGateway Error Policy and Ambiguity Probe', () => {
     const secondCallHeaders = executeSpy.mock.calls[1][2] as Record<string, string>;
     expect(secondCallHeaders['x-goog-user-project']).toBe('old-proj');
     expect(res.statusCode).toBe(200);
+  });
+
+  it('Scenario 7: Generic Cloud Code 404 NOT_FOUND on model inference rotates past incompatible account', async () => {
+    const account1 = createMockAccount('acc-1', 'acc1@test.com');
+    const account2 = createMockAccount('acc-2', 'acc2@test.com');
+    const account3 = createMockAccount('acc-3', 'acc3@test.com');
+    mockAccountLeaseService.getUsableAccountCount = vi.fn(() => 3);
+    mockAccountLeaseService.getNextToken
+      .mockResolvedValueOnce(account1)
+      .mockResolvedValueOnce(account2)
+      .mockResolvedValueOnce(account3);
+
+    const unavailableBody = Buffer.from(
+      JSON.stringify({ error: { code: 503, message: 'No capacity available.', status: 'UNAVAILABLE' } }),
+      'utf-8',
+    );
+    const notFoundBody = Buffer.from(
+      JSON.stringify({ error: { code: 404, message: 'Requested entity was not found.', status: 'NOT_FOUND' } }),
+      'utf-8',
+    );
+
+    const executeSpy = vi.spyOn(gateway as any, 'executeUpstreamCall')
+      .mockResolvedValueOnce({ statusCode: 503, headers: { 'content-type': 'application/json' }, bufferedBody: unavailableBody, bodyStream: createMockStream() })
+      .mockResolvedValueOnce({ statusCode: 503, headers: { 'content-type': 'application/json' }, bufferedBody: unavailableBody, bodyStream: createMockStream() })
+      .mockResolvedValueOnce({ statusCode: 404, headers: { 'content-type': 'application/json' }, bufferedBody: notFoundBody, bodyStream: createMockStream() })
+      .mockResolvedValueOnce({ statusCode: 200, headers: { 'content-type': 'application/json' }, bufferedBody: Buffer.from('{"candidates":[]}'), bodyStream: createMockStream() });
+
+    const req = createMockRequest({
+      url: '/v1internal:streamGenerateContent?alt=sse',
+      body: JSON.stringify({ model: 'gemini-flash-worker-agy', contents: [{ parts: [{ text: 'Hi' }] }] }),
+    });
+    const res = createMockResponse();
+
+    await gateway.handleRequest(req, res);
+
+    expect(executeSpy).toHaveBeenCalledTimes(4);
+    expect(mockAccountLeaseService.markModelUnrequestable).toHaveBeenCalledWith('acc-2', 'gemini-flash-worker-agy');
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('Scenario 8: Terminal incompatible 404 after prior 503 returns 503 instead of leaking 404', async () => {
+    const account1 = createMockAccount('acc-1', 'acc1@test.com');
+    const account2 = createMockAccount('acc-2', 'acc2@test.com');
+    mockAccountLeaseService.getUsableAccountCount = vi.fn(() => 2);
+    mockAccountLeaseService.getNextToken
+      .mockResolvedValueOnce(account1)
+      .mockResolvedValueOnce(account2);
+
+    const unavailableBody = Buffer.from(
+      JSON.stringify({ error: { code: 503, message: 'No capacity available.', status: 'UNAVAILABLE' } }),
+      'utf-8',
+    );
+    const notFoundBody = Buffer.from(
+      JSON.stringify({ error: { code: 404, message: 'Requested entity was not found.', status: 'NOT_FOUND' } }),
+      'utf-8',
+    );
+
+    const executeSpy = vi.spyOn(gateway as any, 'executeUpstreamCall')
+      .mockResolvedValueOnce({ statusCode: 503, headers: { 'content-type': 'application/json' }, bufferedBody: unavailableBody, bodyStream: createMockStream() })
+      .mockResolvedValueOnce({ statusCode: 503, headers: { 'content-type': 'application/json' }, bufferedBody: unavailableBody, bodyStream: createMockStream() })
+      .mockResolvedValueOnce({ statusCode: 404, headers: { 'content-type': 'application/json' }, bufferedBody: notFoundBody, bodyStream: createMockStream() });
+
+    const req = createMockRequest({
+      url: '/v1internal:streamGenerateContent?alt=sse',
+      body: JSON.stringify({ model: 'gemini-flash-worker-agy', contents: [{ parts: [{ text: 'Hi' }] }] }),
+    });
+    const res = createMockResponse();
+
+    await gateway.handleRequest(req, res);
+
+    expect(executeSpy).toHaveBeenCalledTimes(3);
+    expect(mockAccountLeaseService.markModelUnrequestable).toHaveBeenCalledWith('acc-2', 'gemini-flash-worker-agy');
+    expect(res.statusCode).toBe(503);
+  });
+});
+
+describe('classifyUpstreamFailure generic Cloud Code 404 NOT_FOUND policy', () => {
+  it('classifies HTTP 404 Requested entity was not found on streamGenerateContent as model-capability', () => {
+    const ev = classifyUpstreamFailure({
+      statusCode: 404,
+      headers: { 'content-type': 'application/json' },
+      errorText: JSON.stringify({ error: { code: 404, message: 'Requested entity was not found.', status: 'NOT_FOUND' } }),
+      modelName: 'gemini-flash-worker-agy',
+      urlPath: '/v1internal:streamGenerateContent?alt=sse',
+      source: 'json',
+    });
+    expect(ev.category).toBe('model-capability');
+    expect(ev.ruleId).toBe('google.model.incompatible');
+  });
+
+  it('classifies SSE-framed 404 Requested entity was not found as model-capability', () => {
+    const ev = classifyUpstreamFailure({
+      statusCode: 200,
+      headers: { 'content-type': 'text/event-stream' },
+      errorText: 'data: {"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}',
+      modelName: 'gemini-flash-worker-agy',
+      urlPath: '/v1internal:streamGenerateContent?alt=sse',
+      source: 'sse',
+    });
+    expect(ev.category).toBe('model-capability');
+    expect(ev.ruleId).toBe('google.model.incompatible');
+  });
+
+  it('classifies gRPC status 5 Requested entity was not found on inference path as model-capability', () => {
+    const ev = classifyUpstreamFailure({
+      statusCode: 200,
+      headers: { 'grpc-status': '5', 'grpc-message': 'Requested entity was not found.' },
+      modelName: 'gemini-flash-worker-agy',
+      urlPath: '/v1internal:streamGenerateContent',
+      source: 'grpc',
+    });
+    expect(ev.category).toBe('model-capability');
+    expect(ev.ruleId).toBe('google.grpc.not-found');
+  });
+
+  it('does not classify Requested entity was not found as model-capability without modelName or on non-inference paths', () => {
+    const noModel = classifyUpstreamFailure({
+      statusCode: 404,
+      headers: {},
+      errorText: JSON.stringify({ error: { code: 404, message: 'Requested entity was not found.', status: 'NOT_FOUND' } }),
+      urlPath: '/v1internal:streamGenerateContent',
+      source: 'json',
+    });
+    expect(noModel.category).not.toBe('model-capability');
+
+    const nonInferencePath = classifyUpstreamFailure({
+      statusCode: 404,
+      headers: {},
+      errorText: JSON.stringify({ error: { code: 404, message: 'Requested entity was not found.', status: 'NOT_FOUND' } }),
+      modelName: 'gemini-flash-worker-agy',
+      urlPath: '/v1internal:loadCodeAssist',
+      source: 'json',
+    });
+    expect(nonInferencePath.category).not.toBe('model-capability');
   });
 });

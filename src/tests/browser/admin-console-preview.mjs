@@ -13,14 +13,15 @@ process.env.AG_PROXY_DATA_DIR = path.join(scratch, 'console-fixture');
 fs.mkdirSync(process.env.AG_PROXY_DATA_DIR, { recursive: true, mode: 0o700 });
 const load = (name) => import(new URL(`../../../dist/${name}.js`, import.meta.url));
 const [{ CloudAccountRepo }, { ConfigManager }, { ProxyConfigSchema }, { setServerConfig }, history,
-  { ConsoleController }, { ConsoleObservationController }, sessions, { ConsoleAccountsService },
-  { ConsoleConfigService }, { ConsoleOAuthService }, { DashboardController }, { DashboardService },
+  { ConsoleController }, { ConsoleObservationController }, { ConsoleQuotaController }, sessions, { ConsoleAccountsService },
+  { ConsoleConfigService }, { ConsoleOAuthService }, { ConsoleQuotaService }, { DashboardController }, { DashboardService },
   { AdminService }, { AdminGuard }, { AccountLeaseService }] = await Promise.all([
   load('modules/cloud-account/persistence/cloudHandler'), load('modules/config/ipc/manager'),
   load('modules/config/types'), load('server/server-config'), load('observability/request-history'),
   load('admin-console/console.controller'), load('admin-console/console-observation.controller'),
-  load('admin-console/session.service'), load('admin-console/console-accounts.service'),
-  load('admin-console/console-config.service'), load('admin-console/console-oauth.service'),
+  load('admin-console/console-quota.controller'), load('admin-console/session.service'),
+  load('admin-console/console-accounts.service'), load('admin-console/console-config.service'),
+  load('admin-console/console-oauth.service'), load('admin-console/console-quota.service'),
   load('dashboard/dashboard.controller'), load('dashboard/dashboard.service'), load('admin/admin.service'),
   load('modules/proxy-gateway/server/guards/admin.guard'), load('modules/proxy-gateway/server/account-lease.service'),
 ]);
@@ -53,9 +54,9 @@ const leases = {
       requestable: true, remaining_percentage: 80 }] }] }),
 };
 class PreviewModule {}
-Module({ controllers: [ConsoleController, ConsoleObservationController, sessions.ConsoleSessionController, DashboardController],
+Module({ controllers: [ConsoleController, ConsoleObservationController, ConsoleQuotaController, sessions.ConsoleSessionController, DashboardController],
   providers: [sessions.ConsoleSessionService, sessions.ConsoleGuard, ConsoleAccountsService, ConsoleConfigService,
-    ConsoleOAuthService, DashboardService, AdminService, AdminGuard, { provide: AccountLeaseService, useValue: leases }] })(PreviewModule);
+    ConsoleOAuthService, ConsoleQuotaService, DashboardService, AdminService, AdminGuard, { provide: AccountLeaseService, useValue: leases }] })(PreviewModule);
 const app = await NestFactory.create(PreviewModule, new FastifyAdapter(), { logger: false });
 await app.listen(0, '127.0.0.1');
 const port = app.getHttpServer().address().port;

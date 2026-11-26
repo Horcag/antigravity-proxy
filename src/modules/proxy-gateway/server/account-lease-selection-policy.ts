@@ -114,7 +114,7 @@ export class AccountLeaseSelectionPolicy {
     this.cacheHintBindings.clear();
   }
 
-  recordCacheHint(hintKey: string, accountId: string, ttlMs = 300000): void {
+  recordCacheHint(hintKey: string, accountId: string, ttlMs = 3600000): void {
     const now = Date.now();
     if (this.cacheHintBindings.size >= 5000) {
       for (const [k, v] of this.cacheHintBindings.entries()) {

@@ -5,6 +5,7 @@ import { Modal } from '@/components/ui/Modal';
 import { consoleApi } from './api';
 import type { Account } from './types';
 import { formatConsoleValue, formatSamaraDateTime } from './time';
+import { summarizeAccountQuota } from './quotaSummary';
 import { AccessCheckProgress, AccessCheckStatus } from './AccountAccessCheck';
 import { useAccessChecks } from './useAccessChecks';
 import {
@@ -146,34 +147,28 @@ export function Accounts() {
                   <small>{a.status_reason}</small>
                 </>,
                 <AccessCheckStatus result={accessCheck} />,
-                a.quota ? (
-                  <>
-                    <span>{a.quota.subscription_tier ?? 'Квота по моделям'}</span>
-                    {Object.entries(a.quota.models)
-                      .slice(0, 3)
-                      .map(([model, quota]) => (
-                        <small key={model}>
+                (() => {
+                  const summary = summarizeAccountQuota(a.quota);
+                  return summary ? (
+                    <>
+                      <span>{summary.tierLabel}</span>
+                      {summary.groups.map((group) => (
+                        <small key={group.id}>
                           <Button
                             size="sm"
                             variant="secondary"
                             onClick={() => setSelected(a)}
-                            aria-label={`Снимок квоты ${model} аккаунта ${a.name || a.email}: ${quota.percentage}%`}
+                            aria-label={`Снимок квоты ${group.label} аккаунта ${a.name || a.email}: ${group.compactText}`}
                           >
-                            {model}: {quota.percentage}%
+                            {group.compactText}
                           </Button>
                         </small>
                       ))}
-                    {Object.keys(a.quota.models).length > 3 && (
-                      <small>
-                        <Button size="sm" variant="secondary" onClick={() => setSelected(a)}>
-                          Ещё {Object.keys(a.quota.models).length - 3} — в подробностях
-                        </Button>
-                      </small>
-                    )}
-                  </>
-                ) : (
-                  'Неизвестно'
-                ),
+                    </>
+                  ) : (
+                    'Неизвестно'
+                  );
+                })(),
                 <>
                   {stats.data ? (
                     <>
@@ -249,29 +244,51 @@ export function Accounts() {
                   </div>
                 ))}
             </dl>
-            {selected.quota && (
-              <>
-                <p>
-                  Источник: сохранённый сервером снимок квоты Google. Последнее успешное обновление:{' '}
-                  {formatSamaraDateTime(selected.quota.last_successful_refresh_at)}. Проценты
-                  отражают снимок провайдера, а не сумму записанных запросов.
-                </p>
-                <DataTable
-                  headers={['Модель', 'Осталось, %', 'Сброс квоты']}
-                  rows={Object.entries(selected.quota.models).map(([model, quota]) => [
-                    model,
-                    quota.percentage,
-                    formatSamaraDateTime(quota.resetTime),
-                  ])}
-                />
-              </>
-            )}
-            <Link
-              className="btn btn-secondary"
-              to={`/requests?accountId=${encodeURIComponent(selected.id)}`}
-            >
-              История запросов аккаунта
-            </Link>
+            {selected.quota && (() => {
+              const summary = summarizeAccountQuota(selected.quota);
+              return (
+                <>
+                  <p>
+                    Источник: сохранённый сервером снимок квоты Google. Последнее успешное обновление:{' '}
+                    {formatSamaraDateTime(selected.quota.last_successful_refresh_at)}.
+                  </p>
+                  {summary && summary.groups.length > 0 && (
+                    <DataTable
+                      headers={['Группа лимита', '5 часов', 'Неделя', 'Модели']}
+                      rows={summary.groups.map((g) => [
+                        g.label,
+                        g.fiveHour ? `${g.fiveHour.percentage}% (до ${formatSamaraDateTime(g.fiveHour.resetTime)})` : '—',
+                        g.weekly ? `${g.weekly.percentage}% (до ${formatSamaraDateTime(g.weekly.resetTime)})` : '—',
+                        g.modelsHint,
+                      ])}
+                    />
+                  )}
+                  <DataTable
+                    headers={['Модель', 'ID', 'Осталось, %', 'Сброс квоты']}
+                    rows={(summary?.models ?? []).map((m) => [
+                      m.displayName,
+                      m.modelId,
+                      m.percentage,
+                      formatSamaraDateTime(m.resetTime),
+                    ])}
+                  />
+                </>
+              );
+            })()}
+            <div className="agp-actions">
+              <Link
+                className="btn btn-secondary"
+                to={`/requests?accountId=${encodeURIComponent(selected.id)}`}
+              >
+                История запросов аккаунта
+              </Link>
+              <Link
+                className="btn btn-secondary"
+                to={`/quota?accountId=${encodeURIComponent(selected.id)}`}
+              >
+                Динамика квоты и API-эквивалент
+              </Link>
+            </div>
           </>
         )}
       </Modal>
